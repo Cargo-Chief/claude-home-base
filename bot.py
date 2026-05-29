@@ -722,11 +722,29 @@ def process_message_async(event: dict) -> None:
         thread_context = _fetch_thread_context(channel, thread_ts, msg_ts)
 
     is_public_channel = event.get("channel_type") == "channel"
-    if is_public_channel and not has_existing_session and not has_live_process:
+
+    raw_text = event.get("text", "")
+    mentions_claudie = (
+        "claudie" in raw_text.lower()
+        or (BOT_USER_ID and f"<@{BOT_USER_ID}>" in raw_text)
+    )
+
+    # Apply the SKIP-or-respond instruction whenever a public-channel message
+    # is not directly addressed to Claudie — INCLUDING in-thread chatter on
+    # threads where a session already exists. Without this, once Claudie is
+    # in a thread, subsequent teammate-to-teammate messages arrive with no
+    # "stay silent unless addressed" guidance, and the model tends to emit
+    # "No response needed" prose that gets streamed to Slack as noise.
+    needs_skip_prompt = is_public_channel and not mentions_claudie
+    if needs_skip_prompt:
         prefix = (
             f"You received this message in a public channel from {sender_name} (<@{user_id}>). "
-            "Only respond if you are directly addressed by name, asked a question, or given an explicit task. "
-            "If the message is general discussion, status updates, or chatter — even if it relates to your work — respond with exactly: SKIP\n\n"
+            "You are NOT directly addressed in this message (no \"Claudie\" mention, no @tag at you). "
+            "Respond with the single literal token: SKIP — nothing else, no prose, no preamble. "
+            "Do NOT say \"No response needed\", \"Skipping this\", \"Nothing for me here\", "
+            "\"Staying out of this thread\", or any variant. Those phrases still get streamed "
+            "to Slack as visible noise. Only break silence and respond with content if you are "
+            "directly addressed by name or tagged in THIS specific message.\n\n"
         )
         if thread_context:
             text = prefix + f"Here is the conversation so far in this thread:\n\n{thread_context}\n\n[{sender_name}] now says:\n{text}"
@@ -749,14 +767,43 @@ def process_message_async(event: dict) -> None:
     first_text_sent = False
     skip_detected = False
 
+    # Soft-skip phrases: when the model writes one of these as its entire
+    # first text block, treat it as SKIP. The model sometimes emits these
+    # when it means SKIP but doesn't follow the exact-token instruction.
+    # Without this safety net, the prose lands in Slack as visible noise.
+    # Mike escalated on 2026-05-28 after 7 "No response needed" posts.
+    SOFT_SKIP_PHRASES = (
+        "no response needed",
+        "nothing for me to do",
+        "nothing for me here",
+        "skipping this",
+        "skipping that",
+        "staying out of this thread",
+        "staying out of it",
+        "staying silent",
+        "not addressed to me",
+        "not for me",
+        "not relevant to me",
+        "i'll stay out",
+        "i'll skip this",
+        "no action needed from me",
+    )
+
     def on_text(text_block: str):
         """Called for each text block Claude produces — post it to Slack immediately."""
         nonlocal first_text_sent, skip_detected
 
         # Check for SKIP on the very first text block (channel relevance filter)
-        if not first_text_sent and text_block.strip() == "SKIP":
-            skip_detected = True
-            return
+        if not first_text_sent:
+            stripped = text_block.strip()
+            if stripped == "SKIP":
+                skip_detected = True
+                return
+            normalized = stripped.lower().rstrip(".!? ")
+            if len(stripped) <= 80 and normalized in SOFT_SKIP_PHRASES:
+                logger.info(f"Soft-SKIP detected (suppressed prose): {stripped!r}")
+                skip_detected = True
+                return
 
         all_texts.append(text_block)
 
