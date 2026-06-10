@@ -9,10 +9,12 @@ Key difference from Socket Mode: Slack requires a 200 response within 3 seconds.
 Claude Code calls take minutes, so we respond immediately and process in a
 background thread, posting the result when ready.
 
-Also supports proactive messaging via CLI:
+Also supports proactive messaging and read access via CLI:
     python bot.py --send USER_ID "message"
     python bot.py --channel "#general" "message"
     echo '{"result":"..."}' | python bot.py --send-result USER_ID
+    python bot.py --history CHANNEL_ID [--limit 50] [--thread THREAD_TS]
+    python bot.py --find-channel SUBSTRING
 """
 
 from __future__ import annotations
@@ -29,8 +31,10 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -110,10 +114,11 @@ RESTRICTED_DISALLOWED_TOOLS = [
     t.strip() for t in os.environ.get("RESTRICTED_DISALLOWED_TOOLS", "").split(",") if t.strip()
 ]
 
-# Channel filtering — only respond in channels whose names start with one of these prefixes.
-# Leave empty to respond in all channels.
-ALLOWED_CHANNEL_PREFIXES = tuple(
-    p.strip() for p in os.environ.get("ALLOWED_CHANNELS", "").split(",") if p.strip()
+# Channel filtering — only respond in channels whose names contain one of these substrings.
+# Applies to both public and private channels. DMs/MPIMs are unaffected — those are
+# governed by AUTHORIZED_USERS. Leave empty to respond in all channels.
+ALLOWED_CHANNEL_SUBSTRINGS = tuple(
+    p.strip().lower() for p in os.environ.get("ALLOWED_CHANNELS", "").split(",") if p.strip()
 )
 
 # Trust battery — optional. Set to a directory containing per-user JSON battery files.
@@ -121,6 +126,8 @@ TRUST_BATTERY_DIR = os.environ.get("TRUST_BATTERY_DIR", "")
 
 MAX_SLACK_MSG_LEN = 3900
 PORT = int(os.environ.get("PORT", "3000"))
+
+VOTES_FILE = Path(__file__).parent / "votes.json"
 
 # The Slack user ID of this bot — set via BOT_USER_ID env var.
 # Used to identify the bot's own messages in thread history and to prevent
@@ -160,6 +167,49 @@ def _get_channel_name(channel_id: str) -> str:
         name = channel_id
         _channel_name_cache[channel_id] = name
     return name
+
+
+_channel_private_cache: dict[str, bool] = {}
+
+
+def _is_channel_private(channel_id: str) -> bool:
+    """Check whether a Slack channel is private, with caching.
+
+    Modern Slack reports `channel_type: "channel"` in events for both public
+    and private channels — the only reliable signal is the `is_private` flag
+    on the channel object.
+    """
+    if channel_id in _channel_private_cache:
+        return _channel_private_cache[channel_id]
+    try:
+        info = slack_client.conversations_info(channel=channel_id)
+        priv = bool(info["channel"].get("is_private", False))
+    except Exception:
+        priv = False
+    _channel_private_cache[channel_id] = priv
+    return priv
+
+
+def _channel_allowed(channel_id: str, channel_type: str) -> bool:
+    """True if Andy should respond in this channel.
+
+    - DMs (im) and group DMs (mpim): always pass; gated by AUTHORIZED_USERS elsewhere.
+    - Private channels: always pass — Slack only delivers events for channels
+      Andy's a member of, so receiving an event implies she's been explicitly
+      invited. Membership = consent to participate. Note: modern private
+      channels report `channel_type: "channel"` (not "group"), so we check
+      `is_private` via the channel object.
+    - Public channels: must contain at least one of ALLOWED_CHANNEL_SUBSTRINGS
+      in the name (case-insensitive). Empty list = all pass.
+    """
+    if channel_type in ("im", "mpim", "group"):
+        return True
+    if _is_channel_private(channel_id):
+        return True
+    if not ALLOWED_CHANNEL_SUBSTRINGS:
+        return True
+    name = _get_channel_name(channel_id).lower()
+    return any(sub in name for sub in ALLOWED_CHANNEL_SUBSTRINGS)
 
 
 def _get_user_name(user_id: str) -> str:
@@ -258,6 +308,72 @@ def _get_session(thread_ts: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-thread forward map: when Claude DMs someone in a side thread to ask a
+# question, register a forward so that any reply in that side thread routes
+# back into the original conversation thread instead of starting a new one.
+# Single-shot — the entry is removed once the first reply has been forwarded.
+# ---------------------------------------------------------------------------
+
+FORWARDS_FILE = LOG_DIR / ".forwards.json"
+FORWARDS_MAX_AGE_SECONDS = 14 * 24 * 3600
+_forwards_lock = threading.Lock()
+
+
+def _load_forwards() -> dict:
+    try:
+        return json.loads(FORWARDS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_forwards(fwds: dict) -> None:
+    FORWARDS_FILE.write_text(json.dumps(fwds))
+
+
+def _add_forward(
+    from_thread: str,
+    to_thread: str,
+    to_channel: str,
+    session_id: str | None,
+    user_id: str,
+) -> None:
+    with _forwards_lock:
+        fwds = _load_forwards()
+        fwds[from_thread] = {
+            "thread": to_thread,
+            "channel": to_channel,
+            "session_id": session_id,
+            "user_id": user_id,
+            "registered_at": time.time(),
+        }
+        _write_forwards(fwds)
+
+
+def _get_forward(from_thread: str) -> dict | None:
+    return _load_forwards().get(from_thread)
+
+
+def _remove_forward(from_thread: str) -> None:
+    with _forwards_lock:
+        fwds = _load_forwards()
+        if fwds.pop(from_thread, None) is not None:
+            _write_forwards(fwds)
+
+
+def _gc_forwards() -> None:
+    cutoff = time.time() - FORWARDS_MAX_AGE_SECONDS
+    with _forwards_lock:
+        fwds = _load_forwards()
+        stale = [k for k, v in fwds.items() if v.get("registered_at", 0) < cutoff]
+        if not stale:
+            return
+        for k in stale:
+            del fwds[k]
+        _write_forwards(fwds)
+        logger.info(f"Garbage-collected {len(stale)} stale forward entries")
+
+
+# ---------------------------------------------------------------------------
 # Live session management: long-lived Claude processes with stream-json I/O
 #
 # Instead of spawning a new `claude -p` subprocess for every message (which
@@ -279,6 +395,7 @@ class LiveSession:
     last_activity: float = field(default_factory=time.time)
     channel: str = ""
     thread_ts: str = ""
+    user_id: str = ""
     # Serializes the full send→wait cycle so only one message at a time
     # is being actively processed. Other messages queue in our Python code.
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -291,6 +408,62 @@ class LiveSession:
 # thread_ts → LiveSession
 _live_sessions: dict[str, LiveSession] = {}
 _live_sessions_lock = threading.Lock()
+
+# thread_ts → count of inbound messages seen in multi-person spaces (public
+# channels + group DMs). Used to re-inject the relevance reminder every
+# REMINDER_EVERY messages, since Claude drifts back to over-responding once a
+# thread gets long. Guarded by _live_sessions_lock. Not GC'd — grows slowly.
+_thread_msg_counts: dict[str, int] = {}
+REMINDER_EVERY = 10
+
+# Usage-limit pause: when the account is out of usage, the Claude CLI itself
+# synthesizes an assistant message like "You've hit your limit · resets 4pm
+# (UTC)" — the model never runs, so the SKIP relevance filter can't suppress
+# it. We intercept that text before it reaches Slack, announce the outage
+# once, and stop forwarding inbound messages until the reset time. Limits are
+# account-wide, so the pause is a single global, not per-thread.
+LIMIT_RE = re.compile(r"You've hit your (usage )?limit", re.I)
+LIMIT_RESET_RE = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)", re.I)
+LIMIT_PAUSE_FALLBACK = 1800  # seconds, if the reset time can't be parsed
+_limit_pause_lock = threading.Lock()
+_limit_pause = {"until": 0.0, "announced": False}
+
+
+def _parse_limit_reset(text: str) -> float:
+    """Parse 'resets 4pm (UTC)' into an epoch timestamp (next occurrence)."""
+    m = LIMIT_RESET_RE.search(text)
+    if not m:
+        return time.time() + LIMIT_PAUSE_FALLBACK
+    hour = int(m.group(1)) % 12
+    if m.group(3).lower() == "pm":
+        hour += 12
+    minute = int(m.group(2) or 0)
+    now = datetime.now(timezone.utc)
+    reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset <= now:
+        reset += timedelta(days=1)
+    # Small buffer so we don't resume a minute before the limit actually lifts
+    return reset.timestamp() + 120
+
+
+def _limit_paused() -> bool:
+    """True while the usage-limit pause is active. Self-resets on expiry."""
+    with _limit_pause_lock:
+        if _limit_pause["until"] and time.time() >= _limit_pause["until"]:
+            _limit_pause["until"] = 0.0
+            _limit_pause["announced"] = False
+        return _limit_pause["until"] > 0.0
+
+
+def _enter_limit_pause(text: str) -> float | None:
+    """Record a usage-limit notice. Returns the pause-end epoch if this call
+    is the one that should announce the outage in Slack, else None."""
+    with _limit_pause_lock:
+        _limit_pause["until"] = max(_limit_pause["until"], _parse_limit_reset(text))
+        if _limit_pause["announced"]:
+            return None
+        _limit_pause["announced"] = True
+        return _limit_pause["until"]
 
 
 def _get_trust_battery_context() -> str:
@@ -336,8 +509,18 @@ def _get_trust_battery_context() -> str:
     return "\n".join(lines)
 
 
-def _spawn_claude_process(session_id: str | None = None, user_id: str = "") -> subprocess.Popen:
-    """Spawn a long-lived Claude CLI process with stream-json I/O."""
+def _spawn_claude_process(
+    session_id: str | None = None,
+    user_id: str = "",
+    thread_ts: str = "",
+    channel: str = "",
+) -> subprocess.Popen:
+    """Spawn a long-lived Claude CLI process with stream-json I/O.
+
+    Injects CLAUDE_THREAD_TS / CLAUDE_CHANNEL_ID / CLAUDE_SESSION_ID env vars
+    so the spawned Claude can read its own routing context (mainly for the
+    cross-thread DM pattern — passing `--forward-to $CLAUDE_THREAD_TS`).
+    """
     battery_context = _get_trust_battery_context()
     cmd = [
         "claude",
@@ -345,7 +528,7 @@ def _spawn_claude_process(session_id: str | None = None, user_id: str = "") -> s
         "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
-        "--model", "claude-opus-4-6[1m]",
+        "--model", "claude-opus-4-8[1m]",
         "--effort", "medium",
     ]
     if user_id in SUPERVISOR_USERS:
@@ -365,6 +548,14 @@ def _spawn_claude_process(session_id: str | None = None, user_id: str = "") -> s
         mode="w+", suffix=".stderr", delete=False
     )
 
+    proc_env = {**os.environ}
+    if thread_ts:
+        proc_env["CLAUDE_THREAD_TS"] = thread_ts
+    if channel:
+        proc_env["CLAUDE_CHANNEL_ID"] = channel
+    if session_id:
+        proc_env["CLAUDE_SESSION_ID"] = session_id
+
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -372,6 +563,7 @@ def _spawn_claude_process(session_id: str | None = None, user_id: str = "") -> s
         stderr=stderr_tmp,
         text=True,
         cwd=PROJECT_DIR,
+        env=proc_env,
     )
     perm_mode = "bypassPermissions" if user_id in SUPERVISOR_USERS else "dontAsk"
     logger.info(f"Spawned Claude process pid={proc.pid} (resume={session_id or 'none'}, user={user_id}, permissions={perm_mode})")
@@ -445,12 +637,18 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
                 oldest.proc.kill()
 
         saved_session_id = _get_session(thread_ts)
-        proc = _spawn_claude_process(session_id=saved_session_id, user_id=user_id)
+        proc = _spawn_claude_process(
+            session_id=saved_session_id,
+            user_id=user_id,
+            thread_ts=thread_ts,
+            channel=channel,
+        )
         session = LiveSession(
             proc=proc,
             session_id=saved_session_id,
             channel=channel,
             thread_ts=thread_ts,
+            user_id=user_id,
         )
         _live_sessions[thread_ts] = session
 
@@ -565,6 +763,137 @@ def chunk_message(text: str) -> list:
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Voting (Block Kit interactive buttons)
+# ---------------------------------------------------------------------------
+
+_votes_lock = threading.Lock()
+
+
+def _load_votes() -> dict:
+    if VOTES_FILE.exists():
+        try:
+            return json.loads(VOTES_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_votes(votes: dict) -> None:
+    VOTES_FILE.write_text(json.dumps(votes, indent=2))
+
+
+def _vote_key(channel: str, ts: str) -> str:
+    return f"{channel}:{ts}"
+
+
+def _build_vote_blocks(text: str, vote_key: str, votes: dict | None = None) -> list[dict]:
+    """Build Block Kit blocks: message text + voting buttons with current tallies."""
+    entry = (votes or {}).get(vote_key, {})
+    strong_users = entry.get("strong", [])
+    pass_users = entry.get("pass", [])
+
+    strong_names = [_get_user_name(u) for u in strong_users]
+    pass_names = [_get_user_name(u) for u in pass_users]
+
+    strong_label = f":+1: strong ({len(strong_users)})" if strong_users else ":+1: strong"
+    pass_label = f":-1: pass ({len(pass_users)})" if pass_users else ":-1: pass"
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "block_id": f"votes_{vote_key}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": strong_label, "emoji": True},
+                    "action_id": "vote_strong",
+                    "value": vote_key,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": pass_label, "emoji": True},
+                    "action_id": "vote_pass",
+                    "value": vote_key,
+                },
+            ],
+        },
+    ]
+
+    if strong_names or pass_names:
+        parts = []
+        if strong_names:
+            parts.append(f":+1: {', '.join(strong_names)}")
+        if pass_names:
+            parts.append(f":-1: {', '.join(pass_names)}")
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "  ·  ".join(parts)}],
+        })
+
+    return blocks
+
+
+def _handle_vote(action_id: str, vote_key: str, user_id: str) -> None:
+    """Record a vote and update the Slack message."""
+    vote_type = "strong" if action_id == "vote_strong" else "pass"
+    other_type = "pass" if vote_type == "strong" else "strong"
+
+    with _votes_lock:
+        votes = _load_votes()
+        entry = votes.setdefault(vote_key, {"strong": [], "pass": [], "text": "", "channel": ""})
+
+        if user_id in entry.get(vote_type, []):
+            entry[vote_type].remove(user_id)
+        else:
+            if user_id in entry.get(other_type, []):
+                entry[other_type].remove(user_id)
+            entry.setdefault(vote_type, []).append(user_id)
+
+        _save_votes(votes)
+
+    channel, ts = vote_key.split(":", 1)
+    text = entry.get("text", "")
+    blocks = _build_vote_blocks(text, vote_key, votes)
+
+    try:
+        slack_client.chat_update(
+            channel=channel,
+            ts=ts,
+            blocks=blocks,
+            text=text,
+        )
+    except Exception as e:
+        logger.error(f"Failed to update vote message: {e}")
+
+
+def post_with_votes(channel: str, text: str, thread_ts: str | None = None) -> str | None:
+    """Post a message with voting buttons. Returns the message ts."""
+    slack_text = md_to_slack(text)
+    placeholder_key = "pending"
+    blocks = _build_vote_blocks(slack_text, placeholder_key)
+
+    result = slack_client.chat_postMessage(
+        channel=channel,
+        blocks=blocks,
+        text=slack_text,
+        thread_ts=thread_ts,
+    )
+    ts = result["ts"]
+
+    vote_key = _vote_key(channel, ts)
+    blocks = _build_vote_blocks(slack_text, vote_key)
+    slack_client.chat_update(channel=channel, ts=ts, blocks=blocks, text=slack_text)
+
+    with _votes_lock:
+        votes = _load_votes()
+        votes[vote_key] = {"strong": [], "pass": [], "text": slack_text, "channel": channel}
+        _save_votes(votes)
+
+    return ts
 
 
 # ---------------------------------------------------------------------------
@@ -706,8 +1035,15 @@ def send_dm(
     message: str,
     session_id: str | None = None,
     thread_ts: str | None = None,
+    forward_to: str | None = None,
 ) -> str | None:
-    """Send a proactive DM. Returns thread_ts."""
+    """Send a proactive DM. Returns thread_ts.
+
+    If `forward_to` is set, registers a cross-thread forward: any reply in
+    this new DM thread will be routed into the live session for `forward_to`
+    instead of starting a new conversation here. Requires the running bot
+    server to have a live session for `forward_to`.
+    """
     response = slack_client.conversations_open(users=[user_id])
     channel_id = response["channel"]["id"]
 
@@ -730,12 +1066,40 @@ def send_dm(
     if session_id and effective_thread_ts:
         _save_session(effective_thread_ts, session_id)
 
+    if forward_to and effective_thread_ts:
+        _register_forward_via_server(effective_thread_ts, forward_to)
+
     audit_logger.info(
         f"PROACTIVE_DM | USER:{user_id} | CHANNEL:{channel_id} "
         f"| THREAD:{effective_thread_ts} | SESSION:{session_id or 'none'} "
-        f"| MSG_LEN:{len(message)}"
+        f"| FORWARD_TO:{forward_to or 'none'} | MSG_LEN:{len(message)}"
     )
     return effective_thread_ts
+
+
+def _register_forward_via_server(from_thread: str, to_thread: str) -> None:
+    """Call the running bot server to register a forward.
+
+    The server has the in-memory live-session map and can resolve channel,
+    session_id, and user_id for the target thread. This CLI invocation can't.
+    """
+    url = f"http://127.0.0.1:{PORT}/internal/forward"
+    payload = json.dumps({"from_thread": from_thread, "to_thread": to_thread}).encode()
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status != 200:
+                body = resp.read().decode(errors="replace")
+                logger.error(f"Forward registration failed: {resp.status} {body}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        logger.error(f"Forward registration failed: {e.code} {body}")
+        raise
+    except Exception as e:
+        logger.error(f"Forward registration error: {e}")
+        raise
 
 
 def send_to_channel(
@@ -773,6 +1137,70 @@ def send_to_channel(
 
 
 # ---------------------------------------------------------------------------
+# Read access (CLI mode) — read messages from any channel Andy has scope for
+# ---------------------------------------------------------------------------
+
+
+def fetch_channel_history(
+    channel: str,
+    limit: int = 50,
+    thread_ts: str | None = None,
+) -> str:
+    """Return formatted message history for a channel, or a single thread.
+
+    Works for any channel type Andy's token has scope for. Private channels
+    require Andy to be a member. Public channels do not — `channels:history`
+    scope is sufficient. If she gets `not_in_channel`, she can self-join via
+    `slack_client.conversations_join(channel=...)` for public channels.
+    """
+    if thread_ts:
+        result = slack_client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=limit,
+        )
+    else:
+        result = slack_client.conversations_history(channel=channel, limit=limit)
+    msgs = result.get("messages", [])
+    if not msgs:
+        return "(no messages)"
+    if not thread_ts:
+        msgs = list(reversed(msgs))  # history returns newest-first; flip to chronological
+    lines = []
+    for m in msgs:
+        ts = m.get("ts", "")
+        u = m.get("user", "") or m.get("bot_id", "")
+        name = _get_user_name(m["user"]) if m.get("user") else (m.get("username") or m.get("bot_id") or "(system)")
+        text = (m.get("text") or "").strip()
+        lines.append(f"[{ts}] {name} ({u}): {text}")
+    return "\n".join(lines)
+
+
+def find_channel(query: str, limit: int = 25) -> str:
+    """List public + private channels whose name contains `query` (case-insensitive)."""
+    q = query.lower()
+    out = []
+    cursor = None
+    while True:
+        resp = slack_client.conversations_list(
+            types="public_channel,private_channel",
+            limit=200,
+            cursor=cursor,
+            exclude_archived=True,
+        )
+        for c in resp.get("channels", []):
+            name = c.get("name", "")
+            if q in name.lower():
+                kind = "private" if c.get("is_private") else "public"
+                member = " [member]" if c.get("is_member") else ""
+                out.append(f"{c['id']}\t#{name}\t{kind}{member}")
+                if len(out) >= limit:
+                    return "\n".join(out)
+        cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor:
+            break
+    return "\n".join(out) if out else f"(no channels matching '{query}')"
+
+
+# ---------------------------------------------------------------------------
 # Async message processing (handles Slack's 3-second deadline)
 #
 # Slack requires HTTP 200 within 3 seconds. Claude takes minutes.
@@ -792,6 +1220,12 @@ def process_message_async(event: dict) -> None:
     text = event.get("text", "").strip()
     channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts")
+
+    # While out of usage credits, stay completely silent — the outage was
+    # already announced once when the limit was first hit.
+    if _limit_paused():
+        logger.info(f"Usage-limit pause active — ignoring message in {channel} (thread {thread_ts})")
+        return
 
     # Replace user mentions with readable names
     text = re.sub(
@@ -815,6 +1249,29 @@ def process_message_async(event: dict) -> None:
     sender_name = _get_user_name(user_id)
     msg_ts = event.get("ts")
 
+    # Cross-thread forwarding: if a reply landed in a thread that's been
+    # registered as a forward (e.g., a DM Claude opened mid-task to ask
+    # someone a question), rewrite the routing so the reply is delivered
+    # into the original conversation with attribution. The eyes reaction
+    # below still goes on the original message in its original channel.
+    reaction_channel = channel
+    reaction_msg_ts = msg_ts
+    forward = _get_forward(thread_ts)
+    if forward:
+        original_thread = thread_ts
+        text = (
+            f"[{sender_name} ({user_id}) replied in DM thread {original_thread}]:\n"
+            f"{text}"
+        )
+        thread_ts = forward["thread"]
+        channel = forward["channel"]
+        if forward.get("user_id"):
+            user_id = forward["user_id"]
+        _remove_forward(original_thread)
+        logger.info(
+            f"Forwarded reply from {sender_name} in {original_thread} -> {thread_ts}"
+        )
+
     # For channel messages (not DMs), let Claude decide if it should respond
     is_channel = event.get("channel_type") not in ("im", "mpim")
     has_existing_session = _get_session(thread_ts) is not None
@@ -829,33 +1286,60 @@ def process_message_async(event: dict) -> None:
     if not has_existing_session and not has_live_process and is_thread_reply:
         thread_context = _fetch_thread_context(channel, thread_ts, msg_ts)
 
-    is_public_channel = event.get("channel_type") == "channel"
-    if is_public_channel and ALLOWED_CHANNEL_PREFIXES:
-        if not _get_channel_name(channel).startswith(ALLOWED_CHANNEL_PREFIXES):
-            logger.info(f"Ignoring message in non-allowed public channel {channel} ({_get_channel_name(channel)})")
-            return
+    channel_type = event.get("channel_type", "")
+    if not _channel_allowed(channel, channel_type):
+        logger.info(f"Ignoring message in non-allowed channel {channel} ({_get_channel_name(channel)})")
+        return
 
-    if is_public_channel and not has_existing_session and not has_live_process:
+    # Inject the SKIP relevance filter for every message except 1:1 DMs.
+    # 1:1 DM = always respond; any multi-person space (group DM, private or
+    # public channel) = only respond when directly addressed.
+    is_dm = channel_type == "im"
+
+    # In public channels, private channels, and group DMs, count inbound messages
+    # per thread so we can re-inject a shorter relevance reminder every
+    # REMINDER_EVERY messages — Claude forgets the "only respond when addressed"
+    # rule once a thread is long.
+    is_reminder_space = channel_type in ("channel", "group", "mpim")
+    show_reminder = False
+    if is_reminder_space:
+        with _live_sessions_lock:
+            _thread_msg_counts[thread_ts] = _thread_msg_counts.get(thread_ts, 0) + 1
+            count = _thread_msg_counts[thread_ts]
+        # Only inside an ongoing thread — cold contact already gets the full filter.
+        if (has_existing_session or has_live_process) and count % REMINDER_EVERY == 0:
+            show_reminder = True
+
+    prefix = ""
+    if not is_dm and not has_existing_session and not has_live_process:
         channel_name = _get_channel_name(channel)
         prefix = (
-            f"A new message in public channel #{channel_name}. "
-            "Only respond if you're directly addressed by name or tagged "
+            f"A new message in #{channel_name}. "
+            "Only respond if you're directly addressed by your name 'Andy' or tagged "
             "or if you're already part of the conversation thread. "
-            "Respond with exactly \"SKIP\" in ALL other cases.\n\n"
+            "Respond with exactly \"SKIP\" in ALL other cases. "
+            "Don't say 'Skipping this as it's not relevant' or 'Nothing for me to do here' "
+            "or anything like it. Just be precise and say exactly \"SKIP\" — "
+            "because that will result in the harness not showing your msg "
+            "at all in Slack, which is the correct behaviour.\n\n"
         )
-        if thread_context:
-            text = prefix + f"{thread_context}\n\n[{sender_name}]({user_id}):\n{text}"
-        else:
-            text = prefix + f"[{sender_name}]({user_id}):\n{text}"
+    elif show_reminder:
+        channel_name = _get_channel_name(channel)
+        prefix = (
+            f"[Reminder: #{channel_name} is a shared, multi-person space.] "
+            "Only respond if you're directly addressed by name 'Andy', tagged, or "
+            "actively part of this exchange. In all other cases respond with exactly "
+            "\"SKIP\" and nothing else — that suppresses the message in Slack.\n\n"
+        )
+
+    if thread_context:
+        text = prefix + f"{thread_context}\n\n[{sender_name}]({user_id}):\n{text}"
     else:
-        if thread_context:
-            text = f"{thread_context}\n\n[{sender_name}]({user_id}):\n{text}"
-        else:
-            text = f"[{sender_name}]({user_id}):\n{text}"
+        text = prefix + f"[{sender_name}]({user_id}):\n{text}"
 
     # Add eyes reaction as thinking indicator
     try:
-        slack_client.reactions_add(channel=channel, name="eyes", timestamp=msg_ts)
+        slack_client.reactions_add(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
     except Exception:
         pass
 
@@ -867,6 +1351,20 @@ def process_message_async(event: dict) -> None:
     def on_text(text_block: str):
         """Called for each text block Claude produces — post it to Slack immediately."""
         nonlocal first_text_sent, skip_detected
+
+        # Usage-limit notices are synthesized by the CLI, not the model.
+        # Suppress them; announce the outage once and pause inbound handling.
+        if LIMIT_RE.search(text_block):
+            until_epoch = _enter_limit_pause(text_block)
+            logger.warning(f"Usage limit hit in thread {thread_ts}: {text_block!r}")
+            if until_epoch:
+                until = datetime.fromtimestamp(until_epoch, timezone.utc)
+                slack_client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=(f"I've run out of usage credits — I'll be back around "
+                          f"{until:%-I:%M%p} UTC. Anything sent before then won't get a reply."),
+                )
+            return
 
         # Check for SKIP on the very first text block (channel relevance filter)
         if not first_text_sent and text_block.strip() == "SKIP":
@@ -899,7 +1397,7 @@ def process_message_async(event: dict) -> None:
             _send_to_claude(session, text)
 
             if not session._turn_done.wait(timeout=CLAUDE_TIMEOUT):
-                try: slack_client.reactions_remove(channel=channel, name="eyes", timestamp=msg_ts)
+                try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                 except Exception: pass
                 minutes = CLAUDE_TIMEOUT // 60
                 slack_client.chat_postMessage(
@@ -910,7 +1408,7 @@ def process_message_async(event: dict) -> None:
 
             # Check if the process died without producing a response
             if not all_texts and not skip_detected and session.proc.poll() is not None:
-                try: slack_client.reactions_remove(channel=channel, name="eyes", timestamp=msg_ts)
+                try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                 except Exception: pass
                 logger.error(f"Claude process died without responding in thread {thread_ts}")
                 slack_client.chat_postMessage(
@@ -920,7 +1418,7 @@ def process_message_async(event: dict) -> None:
                 return
 
     except Exception as e:
-        try: slack_client.reactions_remove(channel=channel, name="eyes", timestamp=msg_ts)
+        try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
         except Exception: pass
         logger.error(f"Error processing message in thread {thread_ts}: {e}")
         slack_client.chat_postMessage(
@@ -933,14 +1431,14 @@ def process_message_async(event: dict) -> None:
 
     # If Claude decided not to respond (channel messages only), stay silent
     if skip_detected:
-        try: slack_client.reactions_remove(channel=channel, name="eyes", timestamp=msg_ts)
+        try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
         except Exception: pass
         logger.info(f"Skipped message from {user_id} in {channel} (not relevant)")
         return
 
     # Remove eyes reaction
     try:
-        slack_client.reactions_remove(channel=channel, name="eyes", timestamp=msg_ts)
+        slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
     except Exception:
         pass
 
@@ -970,7 +1468,13 @@ def handle_message(event, say):
             return
 
     user_id = event.get("user", "")
-    if not is_authorized(user_id):
+    # Forwarded replies bypass the AUTHORIZED_USERS check: the bot itself
+    # opened the DM, and the supervisor who authorized that DM is implicitly
+    # authorizing the reply. Without this, replies from teammates who aren't
+    # in AUTHORIZED_USERS would be rejected with a generic refusal.
+    event_thread_ts = event.get("thread_ts") or event.get("ts")
+    is_forwarded = _get_forward(event_thread_ts) is not None
+    if not is_authorized(user_id) and not is_forwarded:
         # In DMs, block unauthorized users. In channels, let them through —
         # Claude will talk to anyone in public but respects info boundaries.
         if event.get("channel_type") in ("im", "mpim"):
@@ -989,13 +1493,13 @@ def handle_mention(event, say):
     user_id = event.get("user", "")
     channel = event.get("channel", "")
 
-    is_public_channel = event.get("channel_type") == "channel"
-    if is_public_channel and ALLOWED_CHANNEL_PREFIXES:
-        if not _get_channel_name(channel).startswith(ALLOWED_CHANNEL_PREFIXES):
-            logger.info(f"Ignoring mention in non-allowed public channel {channel}")
-            return
+    if not _channel_allowed(channel, event.get("channel_type", "")):
+        logger.info(f"Ignoring mention in non-allowed channel {channel} ({_get_channel_name(channel)})")
+        return
 
-    if not is_authorized(user_id):
+    event_thread_ts = event.get("thread_ts") or event.get("ts")
+    is_forwarded = _get_forward(event_thread_ts) is not None
+    if not is_authorized(user_id) and not is_forwarded:
         # In DMs, block. In channels, let through (Claude respects info boundaries).
         if event.get("channel_type") in ("im", "mpim"):
             log_unauthorized(event)
@@ -1023,6 +1527,27 @@ def handle_file_shared(event):
 
 
 # ---------------------------------------------------------------------------
+# Interactive actions (Block Kit buttons)
+# ---------------------------------------------------------------------------
+
+
+@app.action("vote_strong")
+def handle_vote_strong(ack, body):
+    ack()
+    user_id = body["user"]["id"]
+    vote_key = body["actions"][0]["value"]
+    threading.Thread(target=_handle_vote, args=("vote_strong", vote_key, user_id), daemon=True).start()
+
+
+@app.action("vote_pass")
+def handle_vote_pass(ack, body):
+    ack()
+    user_id = body["user"]["id"]
+    vote_key = body["actions"][0]["value"]
+    threading.Thread(target=_handle_vote, args=("vote_pass", vote_key, user_id), daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Flask app (HTTP Events API)
 # ---------------------------------------------------------------------------
 
@@ -1035,9 +1560,60 @@ def slack_events():
     return handler.handle(request)
 
 
+@flask_app.route("/slack/actions", methods=["POST"])
+def slack_actions():
+    return handler.handle(request)
+
+
 @flask_app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "bot": "ai-employee"})
+
+
+@flask_app.route("/internal/forward", methods=["POST"])
+def register_forward_endpoint():
+    """Register a cross-thread forward. Called by `bot.py --send --forward-to`.
+
+    Localhost-only — same-machine CLI talking to the running server. Looks up
+    the target thread's live session for channel + session_id + user_id and
+    persists the forward to .forwards.json.
+    """
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    from_thread = data.get("from_thread")
+    to_thread = data.get("to_thread")
+    if not from_thread or not to_thread:
+        return jsonify({"error": "from_thread and to_thread required"}), 400
+    with _live_sessions_lock:
+        target = _live_sessions.get(to_thread)
+        target_channel = target.channel if target else ""
+        target_session_id = target.session_id if target else _get_session(to_thread)
+        target_user_id = target.user_id if target else ""
+    if not target_channel:
+        return jsonify({
+            "error": "no_live_session",
+            "detail": f"no live session for thread {to_thread} — forward requires the target to be alive at registration",
+        }), 404
+    _add_forward(
+        from_thread=from_thread,
+        to_thread=to_thread,
+        to_channel=target_channel,
+        session_id=target_session_id,
+        user_id=target_user_id,
+    )
+    logger.info(f"Registered forward: {from_thread} -> {to_thread}")
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# File browser blueprint (Google OAuth, restricted to ALLOWED_EMAIL_DOMAIN)
+# ---------------------------------------------------------------------------
+
+import file_browser
+file_browser.init_app(flask_app)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1063,13 +1639,49 @@ def main():
         "--channel", nargs=2, metavar=("CHANNEL", "MESSAGE"),
         help="Post a message to a channel and exit",
     )
+    parser.add_argument(
+        "--history", metavar="CHANNEL_ID",
+        help="Print recent messages from a channel (or a thread if --thread is set)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=50,
+        help="Max messages to return for --history (default 50)",
+    )
+    parser.add_argument(
+        "--find-channel", metavar="QUERY",
+        help="List channels whose name contains QUERY (case-insensitive)",
+    )
+    parser.add_argument(
+        "--with-votes", action="store_true",
+        help="Post the message with Block Kit voting buttons (use with --channel or --send)",
+    )
+    parser.add_argument(
+        "--forward-to", metavar="THREAD_TS", dest="forward_to",
+        help="When a reply lands in this new DM thread, route it into the live session for THREAD_TS instead of starting a new conversation. Requires the running bot server to have a live session for THREAD_TS.",
+    )
+    parser.add_argument(
+        "--session-id", metavar="SESSION_ID", dest="session_id",
+        help="Register this Claude session_id as the resume target for replies in this DM thread. Use for cron jobs that DM someone, exit, and want to continue where they left off when the person replies.",
+    )
     args = parser.parse_args()
 
     # CLI modes — send and exit
     if args.send:
-        thread_ts = send_dm(args.send[0], args.send[1], thread_ts=args.thread)
-        if thread_ts:
-            print(thread_ts)
+        if args.with_votes:
+            response = slack_client.conversations_open(users=[args.send[0]])
+            channel_id = response["channel"]["id"]
+            ts = post_with_votes(channel_id, args.send[1], thread_ts=args.thread)
+            if ts:
+                print(ts)
+        else:
+            thread_ts = send_dm(
+                args.send[0], args.send[1],
+                session_id=args.session_id,
+                thread_ts=args.thread,
+                forward_to=args.forward_to,
+            )
+            if thread_ts:
+                print(thread_ts)
         return
 
     if args.send_result:
@@ -1087,7 +1699,20 @@ def main():
         return
 
     if args.channel:
-        send_to_channel(args.channel[0], args.channel[1], thread_ts=args.thread)
+        if args.with_votes:
+            ts = post_with_votes(args.channel[0], args.channel[1], thread_ts=args.thread)
+            if ts:
+                print(ts)
+        else:
+            send_to_channel(args.channel[0], args.channel[1], thread_ts=args.thread)
+        return
+
+    if args.history:
+        print(fetch_channel_history(args.history, limit=args.limit, thread_ts=args.thread))
+        return
+
+    if args.find_channel:
+        print(find_channel(args.find_channel))
         return
 
     # Server mode
@@ -1100,7 +1725,11 @@ def main():
 
     logger.info(f"{BOT_DISPLAY_NAME} starting on port {PORT}")
     logger.info(f"Authorized users: {AUTHORIZED_USERS or 'all'}")
+    logger.info(f"Allowed channel substrings: {ALLOWED_CHANNEL_SUBSTRINGS or '(all channels)'}")
     logger.info(f"Project dir: {PROJECT_DIR}")
+
+    # Garbage-collect stale forward entries (>14 days old) from prior runs
+    _gc_forwards()
 
     # Start idle session cleanup thread
     threading.Thread(target=_cleanup_idle_sessions, daemon=True).start()
