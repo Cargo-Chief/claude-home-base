@@ -13,7 +13,9 @@ export const meta = {
 // All four args are required. The launching session (via the briefing skill)
 // resolves skillRoot/dataDir from ${CLAUDE_PLUGIN_ROOT}/${CLAUDE_PLUGIN_DATA}
 // and date from the shell (no Date.now in scripts).
-const { user, skillRoot, dataDir, date } = args || {}
+// args can arrive as a JSON string from the scheduled harness (observed 2026-06-10); coerce defensively
+const parsedArgs = typeof args === 'string' ? JSON.parse(args) : (args || {})
+const { user, skillRoot, dataDir, date } = parsedArgs
 if (!user || !skillRoot || !dataDir || !date) {
   throw new Error('args must include {user, skillRoot, dataDir, date}')
 }
