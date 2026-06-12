@@ -26,6 +26,11 @@ const PREFS = `${dataDir}/brief-preferences-${user}.md`
 const INBOX_PREFS = `${dataDir}/inbox-preferences-${user}.md`
 const ACTIVITY_LOG = `${dataDir}/inbox-log-${user}.md`
 
+// Content-selection rules live in the brief preferences. Without this, only the
+// composer reads ${PREFS} — banned items arrive at compose already on the plate,
+// fully formatted (observed with Nityesh's "don't brief threads I'm in" rule, 6/11).
+const NO_BRIEF_RULE = `Before returning findings, read the "What NOT to Brief" section of ${PREFS} (if the file has one) and drop any finding those rules ban.`
+
 // ---------------------------------------------------------------- Parse
 
 phase('Parse')
@@ -106,15 +111,15 @@ const FINDINGS_SCHEMA = {
 const GATHERERS = [
   {
     key: 'email',
-    prompt: `Read ${HANDBOOK}/email.md in full, then run its triage process for ${user} (inbox preferences: ${INBOX_PREFS}). Perform the actions it prescribes (archive, label, draft). Return findings destined for the notepad/brief — every carried item MUST include a one-line "verify" done-check per the conventions in ${HANDBOOK}/notepad.md (read it first). One-shot To Brief items (newsletter summaries, FYIs) use verify: "".`,
+    prompt: `Read ${HANDBOOK}/email.md in full, then run its triage process for ${user} (inbox preferences: ${INBOX_PREFS}). Perform the actions it prescribes (archive, label, draft). Return findings destined for the notepad/brief — every carried item MUST include a one-line "verify" done-check per the conventions in ${HANDBOOK}/notepad.md (read it first). One-shot To Brief items (newsletter summaries, FYIs) use verify: "". ${NO_BRIEF_RULE}`,
   },
   {
     key: 'slack',
-    prompt: `Read ${HANDBOOK}/slack.md in full, then run its triage process for ${user}: mentions, DMs, active threads, promises made. Return findings per the conventions in ${HANDBOOK}/notepad.md — carried items MUST include a one-line "verify" done-check.`,
+    prompt: `Read ${HANDBOOK}/slack.md in full, then run its triage process for ${user}: mentions, DMs, active threads, promises made. Return findings per the conventions in ${HANDBOOK}/notepad.md — carried items MUST include a one-line "verify" done-check. ${NO_BRIEF_RULE}`,
   },
   {
     key: 'logs',
-    prompt: `Review recent Claude Code conversation logs in ~/.claude/projects/-Users-luo/ (last 24h of sessions) for work done, decisions made, and loose ends concerning ${user}. Return findings per the conventions in ${HANDBOOK}/notepad.md — carried items MUST include a one-line "verify" done-check. Ignore routine/automated sessions with nothing notable.`,
+    prompt: `Review recent Claude Code conversation logs in ~/.claude/projects/-Users-luo/ (last 24h of sessions) for work done, decisions made, and loose ends concerning ${user}. Return findings per the conventions in ${HANDBOOK}/notepad.md — carried items MUST include a one-line "verify" done-check. Ignore routine/automated sessions with nothing notable. ${NO_BRIEF_RULE}`,
   },
 ]
 
@@ -169,7 +174,7 @@ ${JSON.stringify(findings.map((f) => f.findings).flat(), null, 2)}
 
 TASKS, in order:
 1. Rewrite ${NOTEPAD} per ${HANDBOOK}/notepad.md: open + unverifiable items carried with their verify:/added: lines intact (when a verdict has derivedVerify set, write it as that item's verify: line — this migrates legacy items); new findings added with their verify: line and "added: ${date}"; resolved items removed, one-liners under Notes.
-2. Format the brief per ${PREFS}, archive to /Users/luo/briefs/${user}/${date}.md, and deliver via the user's channel (Slack bot CLI — see CLAUDE.md).
+2. Format the brief per ${PREFS}. Follow its "Brief Structure" section exactly — same sections, same order, no ad-hoc sections. Enforce its "What NOT to Brief" rules (if present): a banned item stays on the notepad if still open, but is excluded from the delivered brief; record each exclusion in the activity log. Archive to /Users/luo/briefs/${user}/${date}.md and deliver via the user's channel (Slack bot CLI — see CLAUDE.md).
 3. Append this run to ${ACTIVITY_LOG}: resolutions with evidence, gatherer action summaries (${JSON.stringify(findings.map((f) => f.actionsTaken))}), and the delivery record.`,
   { label: 'compose-deliver', phase: 'Compose', schema: COMPOSE_SCHEMA }
 )
