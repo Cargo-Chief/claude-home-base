@@ -28,12 +28,6 @@
       "version": "1.2.0"
     },
     {
-      "name": "experimental",
-      "source": "./plugins/experimental",
-      "description": "Experimental workflows \u2014 blind debiasing, prompt engineering, and forensic self-investigation.",
-      "version": "3.3.0"
-    },
-    {
       "name": "chief-of-staff",
       "source": "./plugins/chief-of-staff",
       "description": "Chief-of-staff workflows for you and your team \u2014 email briefing, action-item tracking, and the operational routines that keep everything moving.",
