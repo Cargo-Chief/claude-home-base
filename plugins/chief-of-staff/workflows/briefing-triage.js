@@ -29,7 +29,8 @@ const ACTIVITY_LOG = `${dataDir}/inbox-log-${user}.md`
 // Content-selection rules live in the brief preferences. Without this, only the
 // composer reads ${PREFS} — banned items arrive at compose already on the plate,
 // fully formatted (observed with Nityesh's "don't brief threads I'm in" rule, 6/11).
-const NO_BRIEF_RULE = `Before returning findings, read the "What NOT to Brief" section of ${PREFS} (if the file has one) and drop any finding those rules ban.`
+// Agents read the whole file, never a named section — sections vary per user.
+const NO_BRIEF_RULE = `Before returning findings, read ${PREFS} and drop any finding its rules ban.`
 
 // ---------------------------------------------------------------- Parse
 
@@ -81,7 +82,7 @@ ${it.text}
 
 ${it.verify
     ? `Recorded done-check — run exactly this, nothing else:\n${it.verify}`
-    : `No recorded done-check (legacy item). Read the "Resolution conventions" section of ${PREFS}, then derive the check from the item's authoritative source (Gmail thread state via gws, GitHub PR state via gh, Slack history, URL status) and run it. Return the check you derived as a reusable one-line predicate in the derivedVerify field.`}
+    : `No recorded done-check (legacy item). Read ${PREFS}, then derive the check from the item's authoritative source (Gmail thread state via gws, GitHub PR state via gh, Slack history, URL status) and run it. Return the check you derived as a reusable one-line predicate in the derivedVerify field.`}
 
 Verdict rules:
 - "resolved" requires positive evidence the user handled it per their conventions (e.g. for email: the thread is no longer in INBOX — that counts as handled even with no reply sent).
@@ -174,7 +175,7 @@ ${JSON.stringify(findings.map((f) => f.findings).flat(), null, 2)}
 
 TASKS, in order:
 1. Rewrite ${NOTEPAD} per ${HANDBOOK}/notepad.md: open + unverifiable items carried with their verify:/added: lines intact (when a verdict has derivedVerify set, write it as that item's verify: line — this migrates legacy items); new findings added with their verify: line and "added: ${date}"; resolved items removed, one-liners under Notes.
-2. Format the brief per ${PREFS}. Follow its "Brief Structure" section exactly — same sections, same order, no ad-hoc sections. Enforce its "What NOT to Brief" rules (if present): a banned item stays on the notepad if still open, but is excluded from the delivered brief; record each exclusion in the activity log. Archive to /Users/luo/briefs/${user}/${date}.md and deliver via the user's channel (Slack bot CLI — see CLAUDE.md).
+2. Format the brief and select its contents per ${PREFS} — read it in full and follow it (a rule-banned item stays on the notepad if still open, but is excluded from the delivered brief; record each exclusion in the activity log). Archive to /Users/luo/briefs/${user}/${date}.md and deliver via the user's channel (Slack bot CLI — see CLAUDE.md).
 3. Append this run to ${ACTIVITY_LOG}: resolutions with evidence, gatherer action summaries (${JSON.stringify(findings.map((f) => f.actionsTaken))}), and the delivery record.`,
   { label: 'compose-deliver', phase: 'Compose', schema: COMPOSE_SCHEMA }
 )

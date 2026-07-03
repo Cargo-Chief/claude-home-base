@@ -6,7 +6,7 @@ The operational core — the workflows a chief of staff runs for you and your te
 
 | Skill | Use When |
 |-------|----------|
-| `briefing` | Process email inboxes, deliver formatted briefs, and manage action items for each team member. Use when any conversation touches briefs, email, action items, inboxes, or whats-happening questions. |
+| `briefing` | Process email inboxes, deliver formatted briefs, and manage action items for each team member. Use when any conversation touches briefs, email, action items, inboxes, or whats-happening questions — and always when a user states or changes a preference about how they're briefed or how their email is handled. |
 
 ## Workflows
 

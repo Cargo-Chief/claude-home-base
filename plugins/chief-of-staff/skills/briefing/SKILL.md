@@ -1,6 +1,6 @@
 ---
 name: briefing
-description: Process email inboxes, deliver formatted briefs, and manage action items for each team member. Use when any conversation touches briefs, email, action items, inboxes, or whats-happening questions.
+description: Process email inboxes, deliver formatted briefs, and manage action items for each team member. Use when any conversation touches briefs, email, action items, inboxes, or whats-happening questions — and ALWAYS when a user states or changes any preference about how they're briefed or how their email is handled (e.g. "stop briefing me about X", "put Y in my morning brief", a reply to a delivered brief). Load this skill BEFORE acting so the preference lands in the right file.
 model: sonnet
 ---
 

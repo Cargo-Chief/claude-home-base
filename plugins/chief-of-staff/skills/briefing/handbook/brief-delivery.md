@@ -25,6 +25,8 @@ This file is calibrated during onboarding (see `handbook/new-user-onboarding.md`
 
 ## Sign-Off
 
-After delivering the brief, end with a note to self:
+End the delivered brief — both the archived page footer and the Slack message that delivers it — with one quiet closing line, adapted to the user's tone preferences:
 
-> **Note to self:** Any replies or feedback on the above brief must be handled using the briefing skill.
+> Just reply if you want me to brief you differently — I'll use the briefing skill to save your preferences.
+
+This line is user-facing on purpose: it invites feedback, and because it travels in the Slack thread, any future session handling a reply sees in-context which skill owns brief preferences. Do not replace it with a "note to self" — text addressed to yourself at the end of a delivery session evaporates when the session ends.
