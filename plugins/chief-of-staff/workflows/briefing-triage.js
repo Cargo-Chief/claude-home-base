@@ -176,7 +176,8 @@ ${JSON.stringify(findings.map((f) => f.findings).flat(), null, 2)}
 TASKS, in order:
 1. Rewrite ${NOTEPAD} per ${HANDBOOK}/notepad.md: open + unverifiable items carried with their verify:/added: lines intact (when a verdict has derivedVerify set, write it as that item's verify: line — this migrates legacy items); new findings added with their verify: line and "added: ${date}"; resolved items removed, one-liners under Notes.
 2. Format the brief and select its contents per ${PREFS} — read it in full and follow it (a rule-banned item stays on the notepad if still open, but is excluded from the delivered brief; record each exclusion in the activity log). Archive to /Users/luo/briefs/${user}/${date}.md and deliver via the user's channel (Slack bot CLI — see CLAUDE.md).
-3. Append this run to ${ACTIVITY_LOG}: resolutions with evidence, gatherer action summaries (${JSON.stringify(findings.map((f) => f.actionsTaken))}), and the delivery record.`,
+3. Only after step 2's delivery is confirmed: rewrite ${NOTEPAD} once more, applying the "After delivery" rule in ${HANDBOOK}/notepad.md — empty the To Brief section (delivered one-shots are spent; leave the header with "(none)") and prune resolved Notes one-liners older than this run. Touch nothing else. If delivery failed, skip this step so nothing is lost.
+4. Append this run to ${ACTIVITY_LOG}: resolutions with evidence, gatherer action summaries (${JSON.stringify(findings.map((f) => f.actionsTaken))}), and the delivery record.`,
   { label: 'compose-deliver', phase: 'Compose', schema: COMPOSE_SCHEMA }
 )
 
