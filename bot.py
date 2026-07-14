@@ -627,6 +627,11 @@ def _reader_loop(session: LiveSession) -> None:
             except json.JSONDecodeError:
                 continue
 
+            # Any output means the session is working — keep the idle reaper
+            # away even when no new message has arrived for a long time
+            # (e.g. a quiet multi-hour background workflow).
+            session.last_activity = time.time()
+
             msg_type = data.get("type")
 
             if msg_type == "system":
