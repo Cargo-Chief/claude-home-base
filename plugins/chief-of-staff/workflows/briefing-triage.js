@@ -30,7 +30,10 @@ const ACTIVITY_LOG = `${dataDir}/inbox-log-${user}.md`
 // composer reads ${PREFS} — banned items arrive at compose already on the plate,
 // fully formatted (observed with Nityesh's "don't brief threads I'm in" rule, 6/11).
 // Agents read the whole file, never a named section — sections vary per user.
-const NO_BRIEF_RULE = `Before returning findings, read ${PREFS} and drop any finding its rules ban.`
+// Surfacing quality (7/15, Piyush's 15:34 pushback: 4 challenged items in one message,
+// 2 conceded wrong — irrelevant PR flags, "Postmark outage" that was a suspended account).
+// What gets flagged, and under what label, is scored as hard as whether it's true.
+const NO_BRIEF_RULE = `Before returning findings, read ${PREFS} and drop any finding its rules ban. Flag an item only if it is ${user}'s to act on — they created it, own its domain, or asked about it; drop findings that merely mention them. Label every finding by what you directly observed, never your inference about the cause (an account suspended over a failed payment is not an "outage" — if you didn't verify the cause, name only the observation).`
 
 // ---------------------------------------------------------------- Parse
 
@@ -86,6 +89,7 @@ ${it.verify
 
 Verdict rules:
 - "resolved" requires positive evidence the user handled it per their conventions (e.g. for email: the thread is no longer in INBOX — that counts as handled even with no reply sent).
+- Email items: Gmail thread IDs are PER-MAILBOX. Before calling a thread unanswered/pending, check every account that could have replied (all credential files in ~/.config/gws/) — a reply often exists only in the other cofounder's copy of the thread (7/15 Stefano miss: answered Jun 23 from Piyush's account, checked only in Nityesh's).
 - "open" when the source confirms it still needs them.
 - "unverifiable" when you cannot reach the source (auth failure, API down). Never guess in either direction.`
 
