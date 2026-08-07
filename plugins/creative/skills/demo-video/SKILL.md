@@ -22,13 +22,15 @@ If cold on the product, spawn a subagent to brief you on it: what it does, its r
 
 ### 1. Concepts (human picks)
 
-By default this tooling tends to produce a video that looks less like a demo and more like a slideshow, which completely defeats the purpose of a demo video. So before any storyboard, find creative angles: present 3–4 unique non-slideshow concepts that max out the ability to creatively use this tool. Describe each concept in motion verbs — what happens, not what's shown — and check it survives the verb test before presenting it. Order them most-recommended first and say why. The human picks one, or grafts pieces of two together; build what they picked.
+By default this tooling tends to produce a video that looks less like a demo and more like a slideshow, which completely defeats the purpose of a demo video. So before any storyboard, find creative angles: present 3–4 unique non-slideshow concepts that max out the ability to creatively use this tool. Describe each concept in motion verbs — what happens, not what's shown — and check it survives the verb test before presenting it. Order them most-recommended first and say why. The human picks one, or combines several — a fused pick makes a longer film, and that's fine when the human wants the full power shown; build what they picked.
 
 ### 2. Gate A — the story table (~3 min of human time)
 
 Write `STORYBOARD.md` per playbook §1 and share the scene table with the human: ~10 rows with beat, timing, **what happens (motion verbs, never frames)**, and exact on-screen copy, plus the story shape, the one global persistence rule, and the fidelity mandate. The human reacts to copy and story arc only. Wrong story here costs minutes; discovered at the end it costs the whole video.
 
-In parallel (agent work, no review): assemble the asset folder and write `frame.md` from the product's real brand — pull actual tokens from the product's CSS, not invented ones.
+Surface the key text frames (the claim/kinetic-type copy) explicitly at this gate — they carry the film's voice, they're where dry humor can live, and the human will want to react to them line by line. And if the human answers with the points they'd make if *they* were explaining the feature, treat that as the find of the gate: those points are the film's text-frame skeleton — state each claim on screen and prove it with the scene that follows.
+
+In parallel (agent work, no review): assemble the asset folder and write `frame.md` from the product's real brand — pull actual tokens from the product's CSS, not invented ones. Pin any reference screenshots the human shares into `assets/` — they are the source of truth for rebuilt UI.
 
 ### 3. Gate B — the contact sheet (~3 min of human time)
 
@@ -36,9 +38,11 @@ One still per scene at its most visually dense moment, composed as a single labe
 
 Iterate stills until approved — loops are cheap (seconds each). Feedback at this gate can include asset work: generated headshots/illustrations (image-gen subagent at low quality settings suffices), redrawing an element so it reads at a glance, de-jargoning copy for non-technical viewers. If an ask is infeasible or not worth it, say so plainly rather than bending backwards.
 
+When frames rebuild a real product's UI — the product being demoed, or a third-party surface like a chat client — approximate-from-memory fails this gate. Build the skins from real sources: the product's actual CSS and view partials, official logo assets, sampled palettes from the human's reference screenshots. If the human flags fidelity issues, the proven fix is a detail pass with the references in hand and a screenshot-compare loop that iterates until clean, forbidden from touching approved copy or beats.
+
 ### 4. Build (agent work, no review)
 
-Write the full composition per playbook §2 and §3: one continuous camera world, one paused GSAP timeline, one sub-comp per scene, reuse before building. Then the full gate loop: `lint` → `validate` (fix what it raises) → `snapshot` (the only gate that catches sub-comp mount bugs) → draft render. Before posting anything, do frame-grab QA: pull stills at each beat's timestamp and check them against the storyboard row by row.
+Write the full composition per playbook §2 and §3: one continuous camera world, one paused GSAP timeline, one sub-comp per scene, reuse before building. The storyboard is law and the approved contact sheet is the visual source of truth — lift its markup directly rather than re-inventing frames. Then the full gate loop: `lint` → `validate` (fix what it raises) → `snapshot` (the only gate that catches sub-comp mount bugs) → draft render. Before posting anything, do frame-grab QA: pull stills at each beat's timestamp and check them against the storyboard row by row. If a subagent did the build, verify its output with your own eyes before sharing — subagent reports are hearsay.
 
 ### 5. Gate C — the draft cut (mandatory)
 
@@ -46,7 +50,9 @@ Share the draft-quality MP4. This is the only gate that can catch slideshow-ness
 
 ### 6. Final
 
-Fix what Gate C surfaces (timeline changes are cheap — renders on an unloaded box take ~1 minute at draft, not the budgeted 20), then `render -q high` and post the final MP4.
+Fix what Gate C surfaces — both the human's notes and the weaknesses you named yourself (timeline changes are cheap; draft renders take a couple of minutes, not the tens you'd budget). Then `render -q high` and share the final MP4.
+
+Audio enters here, after Gate C, so motion gets judged silent first. Sound only what the story sources: BGM as a quiet underscore that fades as the wordmark lands; typing sounds only under text a human types on screen, never under the AI's replies — the AI isn't at a keyboard. Calibrate one gain across all SFX clips, and verify every audio change by measurement (LUFS/RMS windows against the previous cut), not by ear.
 
 ## The anti-slideshow doctrine (the main thing)
 
