@@ -44,7 +44,8 @@ Slideshow = screenshots in device frames + entrance animations + crossfades. Dem
 
 - **Never `npx hyperframes`** — silently exits empty. Source `~/work/cc-events-video/hf-env.sh`; its `hf()` runs the installed `node_modules/hyperframes/dist/cli.js` under `mise exec node@24` (Node 25 breaks sharp) with `SHARP_FORCE_GLOBAL_LIBVIPS=1`.
 - Loop: `init` → author → `lint` → `inspect` (layout sweep) → `validate` (console+contrast) → `snapshot` (the ONLY gate that catches sub-comp mount bugs) → `preview` (Studio, port 3002) → `render -q draft -w1` → review → `render -q high`.
-- Low-memory mode auto-fires at 8GB: 1 worker, screenshot capture. Budget **~1s/frame at draft** → 34s clip ≈ 17 min. "Stopped" background renders often completed anyway — check for the mp4 before rerunning. Wedge at browser launch = memory pressure, probe a trivial page before blaming the HTML.
+- Low-memory mode auto-fires at 8GB: 1 worker, screenshot capture. The ~1s/frame draft budget is worst-case — with streaming encode, real drafts came in far faster twice (a 1,260-frame draft in 71s; a 2,280-frame draft in ~2 min), so iterate freely. "Stopped" background renders often completed anyway — check for the mp4 before rerunning. Wedge at browser launch = memory pressure, probe a trivial page before blaming the HTML.
+- `hf()` cd's into its home project directory, so renders land in THAT project's `renders/`, not yours — go fetch the mp4 from there.
 - Formats: mp4 / **webm + mov carry transparency** / gif (15fps) / png-sequence. `--resolution landscape-4k` for DPR upscale. `doctor` is the first move on any failure.
 - Frame-grab QA: pull stills at timestamps into a `review/` strip (courses pattern) — cheap motion review between draft and final.
 
@@ -53,7 +54,9 @@ Slideshow = screenshots in device frames + entrance animations + crossfades. Dem
 - **TTS**: installed v0.7.1 `tts` is Kokoro-only and silently ignores `HEYGEN_API_KEY` — to get HeyGen voices + **word timestamps** use `node skills/hyperframes-media/scripts/heygen-tts.mjs "text" -o out.wav --words out.words.json`. Kokoro default voice `af_heart`, speeds 0.7-0.8 tutorial / 1.1-1.2 upbeat.
 - **Transcribe**: always pass `--model` explicitly — the `.en` default silently TRANSLATES non-English audio. Quality-check every run (>20% junk → medium.en → API fallback).
 - **Captions**: word groups of 2-6 by energy; karaoke via `tl.to(word,{...}, word.start)`; mandatory exit guarantee per group (`to` opacity 0 + `set` hidden); 15 pre-built styles via `hyperframes add` (`caption-pill-karaoke` = clean default).
-- **BGM**: Lyria via `GEMINI_API_KEY` (we have it) or local MusicGen. `beats` command writes beat JSON for on-beat motion.
+- **BGM**: Lyria via `GEMINI_API_KEY` (we have it) or local MusicGen. `beats` command writes beat JSON for on-beat motion. **No `bgm` CLI command has ever shipped** (verified absent from 0.7.1 through 0.7.99; the hyperframes-media doc describes it anyway) — call Lyria directly via `google-genai` with the same key, and check the generator script into the project so the track is reproducible.
+- **Volume tweens are ignored by the 0.7.1 runtime** (renders a flat bed) — bake fades into the WAV with ffmpeg, keep the unfaded master beside it, and record the exact filter chain in a comment so nobody re-derives it; a tween re-added on a newer runtime would double-apply.
+- **Typing SFX**: clicks only under text a human types on screen, never under AI replies (the AI isn't at a keyboard). One gain calibrated across all clips — per-clip normalization makes the shortest burst the loudest. Verify the mix by measured LUFS/RMS windows against the previous cut, not by ear.
 - **remove-background**: u2net, webm+alpha out, CoreML on this M1; text-behind-subject via inverse plate.
 - **Audio-reactive**: pre-extract with `extract-audio-data.py` → per-frame `tl.call` sampling; text ≤3-6% scale swing; no equalizer-bar clichés.
 
