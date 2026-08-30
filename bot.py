@@ -44,6 +44,13 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_sdk import WebClient
 
 import bot_codex  # alternate backend: rooms with "backend": "codex" route here
+from cargo_chief_safety import (
+    AuthorityPolicy,
+    SafetyError,
+    build_claude_command,
+    preflight_room,
+    resolve_room_policy,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -86,39 +93,11 @@ load_dotenv()
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
-AUTHORIZED_USERS = set(
-    u.strip() for u in os.environ.get("AUTHORIZED_USERS", "").split(",") if u.strip()
-)
-PROJECT_DIR = os.environ.get("PROJECT_DIR", "")
-if not PROJECT_DIR:
-    logger.error("PROJECT_DIR not set. Add it to .env")
-    raise SystemExit(1)
-
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "7200"))  # 2 hour default
 
-# Supervisor users get --dangerously-skip-permissions; everyone else gets --permission-mode dontAsk
-SUPERVISOR_USERS = set(
-    u.strip() for u in os.environ.get("SUPERVISOR_USERS", "").split(",") if u.strip()
-) or AUTHORIZED_USERS  # default: all authorized users are supervisors
-
-# Restricted users get limited tool access (--allowedTools / --disallowedTools).
-# Non-supervisors who aren't in RESTRICTED_USERS get plain dontAsk with no tool filtering.
-RESTRICTED_USERS = set(
-    u.strip() for u in os.environ.get("RESTRICTED_USERS", "").split(",") if u.strip()
-)
-RESTRICTED_ALLOWED_TOOLS = [
-    t.strip() for t in os.environ.get(
-        "RESTRICTED_ALLOWED_TOOLS",
-        "Read,Edit,Write,Grep,Glob,Bash,WebSearch,WebFetch,Agent"
-    ).split(",") if t.strip()
-]
-RESTRICTED_DISALLOWED_TOOLS = [
-    t.strip() for t in os.environ.get("RESTRICTED_DISALLOWED_TOOLS", "").split(",") if t.strip()
-]
-
 # Channel filtering — only respond in channels whose names contain one of these substrings.
-# Applies to both public and private channels. DMs/MPIMs are unaffected — those are
-# governed by AUTHORIZED_USERS. Leave empty to respond in all channels.
+# Applies to both public and private channels. Sender authorization is a
+# separate mandatory gate for every channel type.
 ALLOWED_CHANNEL_SUBSTRINGS = tuple(
     p.strip().lower() for p in os.environ.get("ALLOWED_CHANNELS", "").split(",") if p.strip()
 )
@@ -167,17 +146,6 @@ def _resolve_entry(channel_id: str, user_id: str) -> dict:
     return entry
 
 
-# Models that route through the Codex backend rather than the Claude CLI. A room
-# whose selected model matches routes to bot_codex — so picking one on the
-# /models page is all it takes to make a channel Codex-backed. An explicit
-# "backend" key in the config entry still wins (see resolve_backend).
-_CODEX_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "codex")
-
-
-def _is_codex_model(model: str) -> bool:
-    return bool(model) and model.lower().startswith(_CODEX_MODEL_PREFIXES)
-
-
 def _effective_model(cfg: dict, entry: dict) -> str:
     """The model a room actually gets: its own, else the config's default_model,
     else "" — meaning the CLI default from ~/.claude/settings.json."""
@@ -185,19 +153,8 @@ def _effective_model(cfg: dict, entry: dict) -> str:
 
 
 def resolve_backend(channel_id: str, user_id: str) -> str:
-    """Which engine drives this room — "claude" (default) or "codex".
-
-    An explicit `"backend"` in the room's model-config entry wins; otherwise the
-    engine is inferred from the model in play (a gpt-*/o* model → codex). That
-    way the single model dropdown on the /models page switches engines too, with
-    no second control to keep in sync.
-    """
-    cfg = _load_model_config()
-    entry = _resolve_entry(channel_id, user_id)
-    explicit = entry.get("backend")
-    if explicit:
-        return explicit.lower()
-    return "codex" if _is_codex_model(_effective_model(cfg, entry)) else "claude"
+    """Return the explicitly configured, safety-allowlisted room backend."""
+    return resolve_room_policy(_load_model_config(), channel_id, user_id).backend
 
 
 def resolve_model_settings(channel_id: str, user_id: str) -> tuple[str, str, str]:
@@ -302,7 +259,8 @@ def _is_channel_private(channel_id: str) -> bool:
 def _channel_allowed(channel_id: str, channel_type: str) -> bool:
     """True if Andy should respond in this channel.
 
-    - DMs (im) and group DMs (mpim): always pass; gated by AUTHORIZED_USERS elsewhere.
+    - DMs (im) and group DMs (mpim): always pass this channel-name filter;
+      current-sender authorization is enforced separately.
     - Private channels: always pass — Slack only delivers events for channels
       Andy's a member of, so receiving an event implies she's been explicitly
       invited. Membership = consent to participate. Note: modern private
@@ -643,31 +601,16 @@ def _spawn_claude_process(
     cross-thread DM pattern — passing `--forward-to $CLAUDE_THREAD_TS`).
     """
     battery_context = _get_trust_battery_context()
-    model, effort, model_prompt = resolve_model_settings(channel, user_id)
-    cmd = [
-        "claude",
-        "-p", battery_context,
-        "--input-format", "stream-json",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--effort", effort,
-    ]
-    if model:
-        cmd.extend(["--model", model])
-    if model_prompt:
-        cmd.extend(["--append-system-prompt", model_prompt])
-    if user_id in SUPERVISOR_USERS:
-        cmd.extend(["--permission-mode", "bypassPermissions"])
-    elif user_id in RESTRICTED_USERS:
-        cmd.extend(["--permission-mode", "dontAsk"])
-        if RESTRICTED_ALLOWED_TOOLS:
-            cmd.extend(["--allowedTools", " ".join(RESTRICTED_ALLOWED_TOOLS)])
-        if RESTRICTED_DISALLOWED_TOOLS:
-            cmd.extend(["--disallowedTools", " ".join(RESTRICTED_DISALLOWED_TOOLS)])
-    else:
-        cmd.extend(["--permission-mode", "dontAsk"])
-    if session_id:
-        cmd.extend(["--resume", session_id])
+    _model, _effort, model_prompt = resolve_model_settings(channel, user_id)
+    policy = resolve_room_policy(_load_model_config(), channel, user_id)
+    for warning in preflight_room(policy):
+        logger.warning(f"Cargo Chief preflight: {warning}")
+    cmd = build_claude_command(
+        policy,
+        initial_prompt=battery_context,
+        model_prompt=model_prompt,
+        session_id=session_id,
+    )
 
     stderr_tmp = tempfile.NamedTemporaryFile(
         mode="w+", suffix=".stderr", delete=False
@@ -687,11 +630,14 @@ def _spawn_claude_process(
         stdout=subprocess.PIPE,
         stderr=stderr_tmp,
         text=True,
-        cwd=PROJECT_DIR,
+        cwd=policy.root,
         env=proc_env,
     )
-    perm_mode = "bypassPermissions" if user_id in SUPERVISOR_USERS else "dontAsk"
-    logger.info(f"Spawned Claude process pid={proc.pid} (resume={session_id or 'none'}, user={user_id}, permissions={perm_mode})")
+    logger.info(
+        f"Spawned Claude process pid={proc.pid} (resume={session_id or 'none'}, "
+        f"user={user_id}, permissions={policy.permission_mode}, model={policy.model}, "
+        f"effort={policy.effort}, root={policy.root})"
+    )
     return proc
 
 
@@ -980,7 +926,10 @@ def _cleanup_idle_sessions() -> None:
 
 
 def is_authorized(user_id: str) -> bool:
-    return not AUTHORIZED_USERS or user_id in AUTHORIZED_USERS
+    try:
+        return AuthorityPolicy.from_env().allows(user_id)
+    except SafetyError:
+        return False
 
 
 def log_unauthorized(event: dict) -> None:
@@ -1515,6 +1464,36 @@ def process_message_async(event: dict) -> None:
     text = event.get("text", "").strip()
     channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts")
+    msg_ts = event.get("ts")
+    reaction_channel = channel
+    reaction_msg_ts = msg_ts
+
+    # Defense in depth: every ingress path (including forwarded replies and
+    # mid-turn steering) must pass the current Slack sender, before downloads
+    # or any other filesystem-derived work occurs.
+    if not is_authorized(user_id):
+        log_unauthorized(event)
+        return
+
+    # Resolve forwarding before room policy. Authorization belongs to the
+    # current sender; execution policy belongs to the destination room.
+    forward = _get_forward(thread_ts)
+    original_thread = None
+    if forward:
+        original_thread = thread_ts
+        thread_ts = forward["thread"]
+        channel = forward["channel"]
+
+    try:
+        resolve_room_policy(_load_model_config(), channel, user_id)
+    except SafetyError as exc:
+        logger.error(f"Refusing unsafe room {channel}: {exc}")
+        slack_client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"I could not start this Cargo Chief room safely: {exc}",
+        )
+        return
 
     # While out of usage credits, stay completely silent — the outage was
     # already announced once when the limit was first hit.
@@ -1542,26 +1521,17 @@ def process_message_async(event: dict) -> None:
 
     # Prepend sender attribution so Claude knows who sent this message
     sender_name = _get_user_name(user_id)
-    msg_ts = event.get("ts")
 
     # Cross-thread forwarding: if a reply landed in a thread that's been
     # registered as a forward (e.g., a DM Claude opened mid-task to ask
     # someone a question), rewrite the routing so the reply is delivered
     # into the original conversation with attribution. The eyes reaction
     # below still goes on the original message in its original channel.
-    reaction_channel = channel
-    reaction_msg_ts = msg_ts
-    forward = _get_forward(thread_ts)
     if forward:
-        original_thread = thread_ts
         text = (
             f"[{sender_name} ({user_id}) replied in DM thread {original_thread}]:\n"
             f"{text}"
         )
-        thread_ts = forward["thread"]
-        channel = forward["channel"]
-        if forward.get("user_id"):
-            user_id = forward["user_id"]
         _remove_forward(original_thread)
         logger.info(
             f"Forwarded reply from {sender_name} in {original_thread} -> {thread_ts}"
@@ -1880,20 +1850,10 @@ def handle_message(event, say):
             return
 
     user_id = event.get("user", "")
-    # Forwarded replies bypass the AUTHORIZED_USERS check: the bot itself
-    # opened the DM, and the supervisor who authorized that DM is implicitly
-    # authorizing the reply. Without this, replies from teammates who aren't
-    # in AUTHORIZED_USERS would be rejected with a generic refusal.
-    event_thread_ts = event.get("thread_ts") or event.get("ts")
-    is_forwarded = _get_forward(event_thread_ts) is not None
-    if not is_authorized(user_id) and not is_forwarded:
-        # In DMs, block unauthorized users. In channels, let them through —
-        # Claude will talk to anyone in public but respects info boundaries.
-        if event.get("channel_type") in ("im", "mpim"):
-            log_unauthorized(event)
-            say(text="I only respond to authorized users.", thread_ts=event.get("ts"))
-            return
+    if not is_authorized(user_id):
         log_unauthorized(event)
+        say(text="I only respond to authorized users.", thread_ts=event.get("ts"))
+        return
 
     # In-thread Esc: bare "stop" while a turn is running interrupts it
     if _maybe_stop_from_message(event):
@@ -1913,15 +1873,10 @@ def handle_mention(event, say):
         logger.info(f"Ignoring mention in non-allowed channel {channel} ({_get_channel_name(channel)})")
         return
 
-    event_thread_ts = event.get("thread_ts") or event.get("ts")
-    is_forwarded = _get_forward(event_thread_ts) is not None
-    if not is_authorized(user_id) and not is_forwarded:
-        # In DMs, block. In channels, let through (Claude respects info boundaries).
-        if event.get("channel_type") in ("im", "mpim"):
-            log_unauthorized(event)
-            say(text="I only respond to authorized users.", thread_ts=event.get("ts"))
-            return
+    if not is_authorized(user_id):
         log_unauthorized(event)
+        say(text="I only respond to authorized users.", thread_ts=event.get("ts"))
+        return
 
     # "@bot stop" in a thread = in-thread Esc
     if _maybe_stop_from_message(event):
@@ -1955,6 +1910,9 @@ def handle_file_shared(event):
 def handle_vote_strong(ack, body):
     ack()
     user_id = body["user"]["id"]
+    if not is_authorized(user_id):
+        log_unauthorized(body)
+        return
     vote_key = body["actions"][0]["value"]
     threading.Thread(target=_handle_vote, args=("vote_strong", vote_key, user_id), daemon=True).start()
 
@@ -1963,6 +1921,9 @@ def handle_vote_strong(ack, body):
 def handle_vote_pass(ack, body):
     ack()
     user_id = body["user"]["id"]
+    if not is_authorized(user_id):
+        log_unauthorized(body)
+        return
     vote_key = body["actions"][0]["value"]
     threading.Thread(target=_handle_vote, args=("vote_pass", vote_key, user_id), daemon=True).start()
 
@@ -2189,7 +2150,13 @@ def main():
         print(find_channel(args.find_channel))
         return
 
-    # Server mode
+    # Server mode.  An empty allowlist is a startup error, never "allow all".
+    try:
+        authority = AuthorityPolicy.from_env()
+    except SafetyError as exc:
+        logger.error(f"Cargo Chief authorization configuration refused startup: {exc}")
+        raise SystemExit(1)
+
     if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
         logger.error("Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET in .env")
         raise SystemExit(1)
@@ -2198,9 +2165,10 @@ def main():
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
 
     logger.info(f"{BOT_DISPLAY_NAME} starting on port {PORT}")
-    logger.info(f"Authorized users: {AUTHORIZED_USERS or 'all'}")
+    logger.info(f"Authorized users: {sorted(authority.authorized_users)}")
+    logger.info(f"Named approvers: {sorted(authority.approvers)}")
     logger.info(f"Allowed channel substrings: {ALLOWED_CHANNEL_SUBSTRINGS or '(all channels)'}")
-    logger.info(f"Project dir: {PROJECT_DIR}")
+    logger.info("Project roots are resolved per room from model-config.json")
 
     # Garbage-collect stale forward entries (>14 days old) from prior runs
     _gc_forwards()
