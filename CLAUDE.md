@@ -1,4 +1,4 @@
-# Claude Home Base — Open Source AI Cofounder Framework
+# Claude Home Base — Cargo Chief fork
 
 An open-source project that lets anyone turn a spare Mac into an always-on AI cofounder. DM it in Slack, it responds with full access to your codebase, tools, and context. $200/month flat.
 
@@ -18,15 +18,17 @@ The generalized, open-source version of CC Home Base (Luo Ji's installation). Th
 - **Nityesh** — maintainer, open-sourced this project
 - **External users** — Nityesh's friends and anyone who finds the repo
 
-## Relationship to cc-home-base
+## Relationship to upstream
 
-`cc-home-base` is Luo Ji's **production instance**. This repo is the **open-source template** generalized from it. When making changes:
-- Luo Ji-specific changes → `cc-home-base`
-- Changes that benefit all users → this repo (`claude-home-base`)
+This is Cargo Chief's fork of `nityeshaga/claude-home-base`. Upstream remains the transport
+template; this fork adds Cargo Chief's fail-closed authorization, room policy, and governance
+preflight. Keep broadly useful transport improvements separable so they can be proposed upstream.
 
 ## How to work on it
 
-- Repo is on GitHub: `nityeshaga/claude-home-base`
+- Repo is on GitHub: `Cargo-Chief/claude-home-base`
+- Shared clone stays clean on `main`; make changes in a worktree under
+  `$CARGO_CHIEF_ROOT/worktrees/<slug>/claude-home-base`
 - Setup guide: `index.html` (GitHub Pages)
 - Plugin versioning: bump version in both `plugin.json` and `marketplace.json`
 

@@ -1,5 +1,27 @@
 # Claude Home Base
 
+> This branch is Cargo Chief's hardened fork. It is not ready for Slack traffic yet.
+> The first safety gate permits only explicitly configured Claude rooms using
+> `--permission-mode auto` and refuses startup when user/approver allowlists are empty.
+
+## Cargo Chief safety gate
+
+Before every Claude spawn, the harness verifies that the configured workspace has clean
+`agent-kit` and `docs` shared clones on `master`, a tracked non-empty autonomous overlay, a current
+generated `AGENTS.md`, and a `CLAUDE.md` symlink to it. Room entries must explicitly provide the
+root, permission mode, overlay, private escalation channel, backend, model, effort, and role.
+
+Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
+button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
+agent process. The initial gate allows only the Claude backend; Codex remains disabled until it has
+equivalent governance.
+
+Run the policy tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 An always-on AI cofounder running on your Mac. DM it in Slack, it responds with full access to your codebase, tools, and context. $200/month flat. You own the whole stack.
 
 ## What this is
