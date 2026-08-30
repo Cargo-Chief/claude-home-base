@@ -8,10 +8,15 @@ from cargo_chief_safety import (
     AuthorityPolicy,
     GENERATED_MARKER,
     RoomPolicy,
+    RuntimePolicy,
     SafetyError,
     build_claude_command,
+    find_workspace_root,
+    format_audit_metadata,
     preflight_room,
     resolve_room_policy,
+    validate_secret_env_path,
+    write_private_json,
 )
 
 
@@ -86,6 +91,120 @@ class RoomPolicyTest(unittest.TestCase):
             "dm_users": {"U1": {"model": "claude-opus-4-8[1m]"}},
         }
         self.assertEqual(resolve_room_policy(config, "D1", "U1").model, "claude-opus-4-8[1m]")
+
+
+class RuntimePolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.source = self.base / "workspace" / "claude-home-base"
+        self.source.mkdir(parents=True)
+        (self.base / "workspace" / "agent-kit").mkdir()
+        (self.base / "workspace" / "docs").mkdir()
+        self.workspace = (self.base / "workspace").resolve()
+        self.source = self.source.resolve()
+        self.runtime = self.base / "runtime"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def env(self, **overrides):
+        value = {
+            "CARGO_CHIEF_RUNTIME_DIR": str(self.runtime),
+            "CLAUDE_TIMEOUT": "600",
+            "MAX_LIVE_SESSIONS": "1",
+            "ENABLE_FILE_TRANSFER": "false",
+            "ENABLE_TRANSCRIPT_SEARCH": "false",
+        }
+        value.update(overrides)
+        return value
+
+    def test_prepares_private_runtime_tree(self):
+        policy = RuntimePolicy.from_env(
+            self.env(), source_dir=self.source, workspace_root=self.workspace, home=self.base
+        )
+        policy.prepare()
+        for directory in (policy.root, policy.log_dir, policy.state_dir, policy.temp_dir):
+            self.assertTrue(directory.is_dir())
+            self.assertEqual(0o700, directory.stat().st_mode & 0o777)
+
+    def test_requires_private_external_credential_file(self):
+        credentials = self.base / "credentials.env"
+        credentials.write_text("PLACEHOLDER=value\n")
+        credentials.chmod(0o600)
+        self.assertEqual(
+            credentials,
+            validate_secret_env_path(credentials, workspace_root=self.workspace),
+        )
+        credentials.chmod(0o644)
+        with self.assertRaisesRegex(SafetyError, "mode 600"):
+            validate_secret_env_path(credentials, workspace_root=self.workspace)
+        inside = self.source / "secrets.env"
+        inside.write_text("PLACEHOLDER=value\n")
+        inside.chmod(0o600)
+        with self.assertRaisesRegex(SafetyError, "outside the Cargo Chief workspace"):
+            validate_secret_env_path(inside, workspace_root=self.workspace)
+
+    def test_finds_workspace_from_canonical_and_worktree_checkouts(self):
+        self.assertEqual(self.workspace, find_workspace_root(self.source))
+        worktree_source = self.workspace / "worktrees/task/claude-home-base"
+        worktree_source.mkdir(parents=True)
+        self.assertEqual(self.workspace, find_workspace_root(worktree_source))
+
+    def test_rejects_runtime_inside_checkout(self):
+        env = self.env(CARGO_CHIEF_RUNTIME_DIR=str(self.source / "runtime"))
+        with self.assertRaisesRegex(SafetyError, "outside the Cargo Chief workspace"):
+            RuntimePolicy.from_env(
+                env, source_dir=self.source, workspace_root=self.workspace, home=self.base
+            )
+
+    def test_rejects_long_timeout_or_parallel_sessions(self):
+        with self.assertRaisesRegex(SafetyError, "CLAUDE_TIMEOUT"):
+            RuntimePolicy.from_env(self.env(CLAUDE_TIMEOUT="901"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        with self.assertRaisesRegex(SafetyError, "MAX_LIVE_SESSIONS"):
+            RuntimePolicy.from_env(self.env(MAX_LIVE_SESSIONS="2"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+
+    def test_rejects_file_transfer_and_transcript_search(self):
+        with self.assertRaisesRegex(SafetyError, "ENABLE_FILE_TRANSFER"):
+            RuntimePolicy.from_env(self.env(ENABLE_FILE_TRANSFER="true"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        with self.assertRaisesRegex(SafetyError, "ENABLE_TRANSCRIPT_SEARCH"):
+            RuntimePolicy.from_env(self.env(ENABLE_TRANSCRIPT_SEARCH="true"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+
+    def test_cleans_only_old_regular_temp_files(self):
+        policy = RuntimePolicy.from_env(self.env(), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        policy.prepare()
+        old = policy.temp_dir / "old.stderr"
+        recent = policy.temp_dir / "recent.stderr"
+        old.write_text("old")
+        recent.write_text("recent")
+        old.touch()
+        recent.touch()
+        old_time = 100.0
+        import os
+        os.utime(old, (old_time, old_time))
+        removed = policy.cleanup_temp(older_than_seconds=50, now=200.0)
+        self.assertEqual(1, removed)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
+    def test_state_json_is_private(self):
+        policy = RuntimePolicy.from_env(self.env(), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        policy.prepare()
+        state = policy.state_dir / "sessions.json"
+        write_private_json(state, {"thread": "session"})
+        self.assertEqual(0o600, state.stat().st_mode & 0o777)
+        self.assertEqual({"thread": "session"}, json.loads(state.read_text()))
+
+    def test_audit_formatter_accepts_metadata_not_content(self):
+        record = format_audit_metadata(
+            "INTERACTION", user="U1", channel="C1", thread="T1",
+            message_length=17, response_length=29, session_id="S1", duration=1.25,
+        )
+        self.assertEqual(
+            "INTERACTION | USER:U1 | CHANNEL:C1 | THREAD:T1 | MSG_LEN:17 "
+            "| RESP_LEN:29 | SESSION:S1 | DURATION:1.2s",
+            record,
+        )
 
 
 class PreflightTest(unittest.TestCase):
