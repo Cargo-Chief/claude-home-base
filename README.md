@@ -16,6 +16,12 @@ button actions, forwarded replies, stops, and mid-turn steering are refused befo
 agent process. The initial gate allows only the Claude backend; Codex remains disabled until it has
 equivalent governance.
 
+Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.
+Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
+`CARGO_CHIEF_RUNTIME_DIR`. Gate A permits one live session, caps turns at 15 minutes, writes
+metadata-only audit records, removes stale temporary files at startup, and refuses file transfer
+or transcript search.
+
 Run the policy tests with:
 
 ```bash
@@ -95,9 +101,9 @@ You (anywhere) → Slack → Cloudflare Tunnel → Your Mac → Claude Code CLI
                                               + full filesystem access
 ```
 
-## Codex backend (optional)
+## Codex backend (upstream capability; disabled for Cargo Chief Gate A)
 
-The bot's default brain is Claude Code. You can also point individual rooms at
+Upstream's default brain is Claude Code. Upstream can also point individual rooms at
 OpenAI's Codex — same Slack UX, same full-access posture, a different engine
 answering. It's per-room, so a Claude channel and a Codex channel can coexist
 in one workspace (handy for side-by-side comparison).
@@ -105,10 +111,14 @@ in one workspace (handy for side-by-side comparison).
 **How it works:** `bot_codex.py` drives `codex app-server` over JSON-RPC on
 stdio, mirroring the one-process-per-thread model of the Claude path. Threads
 resume across messages, output streams to Slack, and mid-turn follow-ups steer
-the running turn — exactly like the Claude backend. `bot.py` imports it lazily,
-so if you never use Codex you pay nothing.
+the running turn — exactly like the Claude backend. The Cargo Chief Gate A bot
+does not import this module or create any Codex runtime state.
 
-**Enable it:**
+The Cargo Chief safety policy currently rejects `backend: "codex"` before process spawn. The
+instructions below describe upstream behavior for reference; do not enable it in a Cargo Chief room
+until equivalent governance and sandboxing are implemented and tested.
+
+**Upstream setup:**
 
 1. Install the [`codex` CLI](https://github.com/openai/codex) and sign in.
 2. In `model-config.json`, add `"backend": "codex"` to any channel or DM entry,
@@ -137,7 +147,7 @@ model-config's `effort`.
 - **Async processing** — responds to Slack within 3 seconds, runs Claude in background
 - **Agentic channel behavior** — decides when to respond, stays silent when not relevant (SKIP)
 - **Thread continuity** — session IDs persist per thread
-- **File handling** — downloads attachments, auto-uploads files mentioned in responses
+- **File handling** — upstream capability; disabled by the Cargo Chief Gate A runtime policy
 - **Proactive messaging** — send DMs, post to channels, reply in threads via CLI
 - **Streaming output** — real-time responses as Claude generates
 - **Native tables** — markdown tables in responses render as real Slack tables (Block Kit `markdown` block)

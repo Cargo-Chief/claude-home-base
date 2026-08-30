@@ -43,20 +43,44 @@ from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_sdk import WebClient
 
-import bot_codex  # alternate backend: rooms with "backend": "codex" route here
 from cargo_chief_safety import (
     AuthorityPolicy,
+    RuntimePolicy,
     SafetyError,
     build_claude_command,
+    find_workspace_root,
+    format_audit_metadata,
     preflight_room,
     resolve_room_policy,
+    validate_secret_env_path,
+    write_private_json,
 )
+
+# ---------------------------------------------------------------------------
+# External configuration and controlled runtime storage
+# ---------------------------------------------------------------------------
+
+SOURCE_DIR = Path(__file__).resolve().parent
+WORKSPACE_ROOT = find_workspace_root(SOURCE_DIR)
+ENV_FILE = Path(
+    os.environ.get(
+        "CARGO_CHIEF_ENV_FILE",
+        str(Path.home() / ".config/cargo-chief/home-base.env"),
+    )
+).expanduser()
+ENV_FILE = validate_secret_env_path(ENV_FILE, workspace_root=WORKSPACE_ROOT)
+load_dotenv(dotenv_path=ENV_FILE)
+
+os.umask(0o077)
+RUNTIME_POLICY = RuntimePolicy.from_env(source_dir=SOURCE_DIR, workspace_root=WORKSPACE_ROOT)
+RUNTIME_POLICY.prepare()
+LOG_DIR = RUNTIME_POLICY.log_dir
+STATE_DIR = RUNTIME_POLICY.state_dir
+TEMP_DIR = RUNTIME_POLICY.temp_dir
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-
-LOG_DIR = Path(__file__).parent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +101,12 @@ _rotating_handler.setFormatter(
 logger.addHandler(_rotating_handler)
 
 AUDIT_LOG = LOG_DIR / "audit.log"
-audit_handler = logging.FileHandler(AUDIT_LOG, encoding="utf-8")
+audit_handler = logging.handlers.RotatingFileHandler(
+    AUDIT_LOG,
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding="utf-8",
+)
 audit_handler.setFormatter(
     logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 )
@@ -85,15 +114,16 @@ audit_logger = logging.getLogger("bot.audit")
 audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
 
+for private_log in (LOG_DIR / "bot.log", AUDIT_LOG):
+    private_log.chmod(0o600)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-load_dotenv()
-
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "7200"))  # 2 hour default
+CLAUDE_TIMEOUT = RUNTIME_POLICY.claude_timeout
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -193,7 +223,7 @@ def resolve_prompt_cadence(channel_id: str, user_id: str) -> tuple[int, str]:
         every = 0
     return max(every, 0), prompt
 
-VOTES_FILE = Path(__file__).parent / "votes.json"
+VOTES_FILE = STATE_DIR / "votes.json"
 
 # The Slack user ID of this bot — set via BOT_USER_ID env var.
 # Used to identify the bot's own messages in thread history and to prevent
@@ -348,7 +378,7 @@ def _fetch_thread_context(channel: str, thread_ts: str, current_msg_ts: str) -> 
 # Session store: thread_ts → Claude session_id (file-backed)
 # ---------------------------------------------------------------------------
 
-SESSION_FILE = LOG_DIR / ".sessions.json"
+SESSION_FILE = STATE_DIR / "sessions.json"
 MAX_SESSIONS = 200
 _session_file_lock = threading.Lock()
 
@@ -367,7 +397,7 @@ def _save_session(thread_ts: str, session_id: str) -> None:
         if len(sessions) > MAX_SESSIONS:
             for key in sorted(sessions.keys())[:-MAX_SESSIONS]:
                 del sessions[key]
-        SESSION_FILE.write_text(json.dumps(sessions))
+        write_private_json(SESSION_FILE, sessions)
 
 
 def _get_session(thread_ts: str) -> str | None:
@@ -381,7 +411,7 @@ def _get_session(thread_ts: str) -> str | None:
 # Single-shot — the entry is removed once the first reply has been forwarded.
 # ---------------------------------------------------------------------------
 
-FORWARDS_FILE = LOG_DIR / ".forwards.json"
+FORWARDS_FILE = STATE_DIR / "forwards.json"
 FORWARDS_MAX_AGE_SECONDS = 14 * 24 * 3600
 _forwards_lock = threading.Lock()
 
@@ -394,7 +424,7 @@ def _load_forwards() -> dict:
 
 
 def _write_forwards(fwds: dict) -> None:
-    FORWARDS_FILE.write_text(json.dumps(fwds))
+    write_private_json(FORWARDS_FILE, fwds)
 
 
 def _add_forward(
@@ -450,7 +480,7 @@ def _gc_forwards() -> None:
 # ---------------------------------------------------------------------------
 
 IDLE_TIMEOUT = 10800  # 3 hours — kill process if no messages
-MAX_LIVE_SESSIONS = 5  # max concurrent Claude processes (memory guard)
+MAX_LIVE_SESSIONS = RUNTIME_POLICY.max_live_sessions
 
 
 @dataclass
@@ -613,7 +643,7 @@ def _spawn_claude_process(
     )
 
     stderr_tmp = tempfile.NamedTemporaryFile(
-        mode="w+", suffix=".stderr", delete=False
+        mode="w+", suffix=".stderr", delete=False, dir=TEMP_DIR
     )
 
     proc_env = {**os.environ}
@@ -846,36 +876,6 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
         return session
 
 
-# Parallel registry for Codex-backed sessions (rooms with "backend": "codex").
-# Kept separate from _live_sessions so the Claude path is untouched; both are
-# consulted symmetrically when deciding whether a thread already has a session.
-_codex_sessions: dict[str, "bot_codex.CodexSession"] = {}
-_codex_sessions_lock = threading.Lock()
-
-
-def _get_or_create_codex_session(thread_ts: str, channel: str, user_id: str,
-                                 on_text, on_status=None) -> "bot_codex.CodexSession":
-    """Get an existing Codex session for this Slack thread or spawn a fresh one.
-
-    Mirrors _get_or_create_live_session but routes through bot_codex. The room's
-    Codex model comes from model-config.json (resolve_model_settings)."""
-    with _codex_sessions_lock:
-        existing = _codex_sessions.get(thread_ts)
-        if existing and existing.proc.poll() is None:
-            existing.last_activity = time.time()
-            existing._on_text = on_text
-            existing._on_status = on_status
-            return existing
-
-        model, _effort, _prompt = resolve_model_settings(channel, user_id)
-        session = bot_codex.spawn_codex_session(
-            thread_ts=thread_ts, channel=channel, user_id=user_id,
-            on_text=on_text, on_status=on_status, model=model or None,
-        )
-        _codex_sessions[thread_ts] = session
-        return session
-
-
 def _send_to_claude(session: LiveSession, text: str) -> None:
     """Send a user message to a live Claude process via stdin."""
     session.turns_sent += 1
@@ -935,10 +935,11 @@ def is_authorized(user_id: str) -> bool:
 def log_unauthorized(event: dict) -> None:
     user = event.get("user", "unknown")
     channel = event.get("channel", "unknown")
-    text = event.get("text", "")[:100]
-    audit_logger.warning(
-        f'UNAUTHORIZED | USER:{user} | CHANNEL:{channel} | MSG:"{text}"'
-    )
+    audit_logger.warning(format_audit_metadata(
+        "UNAUTHORIZED", user=user, channel=channel,
+        thread=event.get("thread_ts") or event.get("ts") or "unknown",
+        message_length=len(event.get("text", "")),
+    ))
 
 
 def audit_interaction(
@@ -946,12 +947,12 @@ def audit_interaction(
 ) -> None:
     user = event.get("user", "unknown")
     channel = event.get("channel", "unknown")
-    text = event.get("text", "")[:200]
-    audit_logger.info(
-        f"USER:{user} | CHANNEL:{channel} | SESSION:{session_id or 'new'} "
-        f"| DURATION:{duration:.1f}s | MSG_LEN:{len(text)} | RESP_LEN:{len(response_text)} "
-        f'| MSG:"{text}"'
-    )
+    audit_logger.info(format_audit_metadata(
+        "INTERACTION", user=user, channel=channel,
+        thread=event.get("thread_ts") or event.get("ts") or "unknown",
+        message_length=len(event.get("text", "")), response_length=len(response_text),
+        session_id=session_id or "new", duration=duration,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1048,7 +1049,7 @@ def _load_votes() -> dict:
 
 
 def _save_votes(votes: dict) -> None:
-    VOTES_FILE.write_text(json.dumps(votes, indent=2))
+    write_private_json(VOTES_FILE, votes, indent=2)
 
 
 def _vote_key(channel: str, ts: str) -> str:
@@ -1172,6 +1173,12 @@ def download_slack_files(event: dict) -> list[Path]:
     files = event.get("files", [])
     if not files:
         return []
+    if not RUNTIME_POLICY.file_transfer_enabled:
+        audit_logger.warning(
+            f"FILE_DOWNLOAD_REFUSED | USER:{event.get('user', 'unknown')} "
+            f"| CHANNEL:{event.get('channel', 'unknown')} | FILE_COUNT:{len(files)}"
+        )
+        return []
 
     downloaded = []
     for f in files:
@@ -1188,7 +1195,7 @@ def download_slack_files(event: dict) -> list[Path]:
             )
             with urllib.request.urlopen(req) as resp:
                 tmp = tempfile.NamedTemporaryFile(
-                    suffix=suffix, prefix="slack-", delete=False
+                    suffix=suffix, prefix="slack-", delete=False, dir=TEMP_DIR
                 )
                 tmp.write(resp.read())
                 tmp.close()
@@ -1212,6 +1219,8 @@ _ATTACH_PATTERN = re.compile(
 
 def _auto_upload_files(text: str, channel: str, thread_ts: str | None = None) -> None:
     """Scan text for attach:/path markers and upload matching files to Slack."""
+    if not RUNTIME_POLICY.file_transfer_enabled:
+        return
     seen: set[str] = set()
     for match in _ATTACH_PATTERN.findall(text):
         fp_str = match.rstrip('.,;:!?)]`"\'')
@@ -1244,6 +1253,8 @@ def upload_file_to_slack(
 
     Claude can call this to share screenshots, CSVs, reports, etc.
     """
+    if not RUNTIME_POLICY.file_transfer_enabled:
+        raise SafetyError("file upload is disabled for Gate A")
     path = Path(file_path)
     if not path.exists():
         logger.error(f"File not found: {file_path}")
@@ -1539,18 +1550,11 @@ def process_message_async(event: dict) -> None:
 
     # For channel messages (not DMs), let Claude decide if it should respond
     is_channel = event.get("channel_type") not in ("im", "mpim")
-    # Backend-aware: a Codex-backed thread has its saved thread id / live
-    # process in the codex registries, not the Claude ones. Consult both so
-    # in-thread follow-ups on Codex rooms aren't treated as cold contact.
-    has_existing_session = (
-        _get_session(thread_ts) is not None
-        or bot_codex._load_thread_id(thread_ts) is not None
-    )
+    has_existing_session = _get_session(thread_ts) is not None
 
     # Check if there's already a live process for this thread
     has_live_process = (
-        (thread_ts in _live_sessions and _live_sessions[thread_ts].proc.poll() is None)
-        or (thread_ts in _codex_sessions and _codex_sessions[thread_ts].proc.poll() is None)
+        thread_ts in _live_sessions and _live_sessions[thread_ts].proc.poll() is None
     )
 
     # If this is a thread reply and we have no saved session AND no live process,
@@ -1630,7 +1634,7 @@ def process_message_async(event: dict) -> None:
         # Suppress them; announce the outage once and pause inbound handling.
         if LIMIT_RE.search(text_block):
             until_epoch = _enter_limit_pause(text_block)
-            logger.warning(f"Usage limit hit in thread {thread_ts}: {text_block!r}")
+            logger.warning(f"Usage limit hit in thread {thread_ts}")
             if until_epoch:
                 until = datetime.fromtimestamp(until_epoch, timezone.utc)
                 slack_client.chat_postMessage(
@@ -1655,35 +1659,6 @@ def process_message_async(event: dict) -> None:
         first_text_sent = True
 
     start = time.time()
-
-    # Dispatch: Codex-backed rooms route through bot_codex; every other room
-    # falls through to the unchanged Claude path below. send_to_codex blocks
-    # until the turn completes (its own turn_lock serializes send→wait, and
-    # handles mid-turn follow-ups via turn/steer internally).
-    if resolve_backend(channel, user_id) == "codex":
-        try:
-            codex_session = _get_or_create_codex_session(
-                thread_ts=thread_ts, channel=channel, user_id=user_id, on_text=on_text,
-            )
-            bot_codex.send_to_codex(codex_session, text)
-        except Exception as e:
-            logger.error(f"Codex backend error in thread {thread_ts}: {e}")
-            try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-            except Exception: pass
-            slack_client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f"Something went wrong (Codex backend): {e}",
-            )
-            return
-        try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-        except Exception: pass
-        if skip_detected:
-            logger.info(f"Skipped message from {user_id} in {channel} (not relevant)")
-            return
-        duration = time.time() - start
-        audit_interaction(event, "\n\n".join(all_texts), duration, codex_session.codex_thread_id or "")
-        logger.info(f"Codex turn done in {duration:.1f}s for thread {thread_ts}")
-        return
 
     try:
         session = _get_or_create_live_session(thread_ts, channel, user_id=user_id)
@@ -2169,6 +2144,14 @@ def main():
     logger.info(f"Named approvers: {sorted(authority.approvers)}")
     logger.info(f"Allowed channel substrings: {ALLOWED_CHANNEL_SUBSTRINGS or '(all channels)'}")
     logger.info("Project roots are resolved per room from model-config.json")
+    logger.info(
+        f"Runtime: {RUNTIME_POLICY.root} (sessions={MAX_LIVE_SESSIONS}, "
+        f"timeout={CLAUDE_TIMEOUT}s, file_transfer=off, transcript_search=off)"
+    )
+
+    removed_temp = RUNTIME_POLICY.cleanup_temp()
+    if removed_temp:
+        logger.info(f"Removed {removed_temp} stale runtime temp file(s)")
 
     # Garbage-collect stale forward entries (>14 days old) from prior runs
     _gc_forwards()

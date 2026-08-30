@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 from typing import Mapping
 
 
@@ -26,6 +27,29 @@ ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 class SafetyError(RuntimeError):
     """A configuration or local-state condition that must refuse a spawn."""
+
+
+def find_workspace_root(source_dir: Path) -> Path:
+    source_dir = source_dir.resolve()
+    for candidate in (source_dir, *source_dir.parents):
+        if (candidate / "agent-kit").is_dir() and (candidate / "docs").is_dir():
+            return candidate
+    raise SafetyError("cannot locate Cargo Chief workspace root from harness checkout")
+
+
+def validate_secret_env_path(path: Path, *, workspace_root: Path) -> Path:
+    path = path.expanduser()
+    if not path.is_absolute():
+        raise SafetyError("CARGO_CHIEF_ENV_FILE must be absolute")
+    normalized = path.resolve(strict=False)
+    workspace_root = workspace_root.resolve()
+    if normalized == workspace_root or workspace_root in normalized.parents:
+        raise SafetyError("CARGO_CHIEF_ENV_FILE must be outside the Cargo Chief workspace")
+    if not path.is_file() or path.is_symlink():
+        raise SafetyError(f"external credential file is missing or unsafe: {path}")
+    if path.stat().st_mode & 0o777 != 0o600:
+        raise SafetyError("CARGO_CHIEF_ENV_FILE must have mode 600")
+    return path
 
 
 def parse_ids(value: str) -> frozenset[str]:
@@ -72,6 +96,129 @@ class RoomPolicy:
     model: str
     effort: str
     role: str
+
+
+def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
+    value = env.get(key)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SafetyError(f"{key} must be true or false")
+
+
+@dataclass(frozen=True)
+class RuntimePolicy:
+    root: Path
+    log_dir: Path
+    state_dir: Path
+    temp_dir: Path
+    claude_timeout: int
+    max_live_sessions: int
+    file_transfer_enabled: bool
+    transcript_search_enabled: bool
+
+    @classmethod
+    def from_env(
+        cls,
+        env: Mapping[str, str] = os.environ,
+        *,
+        source_dir: Path,
+        workspace_root: Path,
+        home: Path | None = None,
+    ) -> "RuntimePolicy":
+        home = (home or Path.home()).resolve()
+        configured = env.get("CARGO_CHIEF_RUNTIME_DIR", "").strip()
+        root = Path(configured).expanduser() if configured else home / ".local/state/cargo-chief/home-base"
+        if not root.is_absolute():
+            raise SafetyError("CARGO_CHIEF_RUNTIME_DIR must be absolute")
+        root = root.absolute()
+        source_dir = source_dir.resolve()
+        workspace_root = workspace_root.resolve()
+        if source_dir != workspace_root and workspace_root not in source_dir.parents:
+            raise SafetyError("harness checkout must be inside the Cargo Chief workspace")
+        normalized_root = root.resolve(strict=False)
+        if normalized_root == workspace_root or workspace_root in normalized_root.parents:
+            raise SafetyError("CARGO_CHIEF_RUNTIME_DIR must be outside the Cargo Chief workspace")
+
+        try:
+            timeout = int(env.get("CLAUDE_TIMEOUT", "600"))
+            max_sessions = int(env.get("MAX_LIVE_SESSIONS", "1"))
+        except ValueError as exc:
+            raise SafetyError("CLAUDE_TIMEOUT and MAX_LIVE_SESSIONS must be integers") from exc
+        if not 1 <= timeout <= 900:
+            raise SafetyError("CLAUDE_TIMEOUT must be between 1 and 900 seconds for Gate A")
+        if max_sessions != 1:
+            raise SafetyError("MAX_LIVE_SESSIONS must be 1 for Gate A")
+
+        file_transfer = _env_bool(env, "ENABLE_FILE_TRANSFER", False)
+        transcript_search = _env_bool(env, "ENABLE_TRANSCRIPT_SEARCH", False)
+        if file_transfer:
+            raise SafetyError("ENABLE_FILE_TRANSFER must remain false for Gate A")
+        if transcript_search:
+            raise SafetyError("ENABLE_TRANSCRIPT_SEARCH must remain false for Gate A")
+
+        return cls(
+            root=root,
+            log_dir=root / "logs",
+            state_dir=root / "state",
+            temp_dir=root / "tmp",
+            claude_timeout=timeout,
+            max_live_sessions=max_sessions,
+            file_transfer_enabled=file_transfer,
+            transcript_search_enabled=transcript_search,
+        )
+
+    def prepare(self) -> None:
+        if self.root.exists() and (not self.root.is_dir() or self.root.is_symlink()):
+            raise SafetyError("CARGO_CHIEF_RUNTIME_DIR must be a regular directory")
+        for directory in (self.root, self.log_dir, self.state_dir, self.temp_dir):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+
+    def cleanup_temp(self, *, older_than_seconds: int = 24 * 60 * 60, now: float | None = None) -> int:
+        now = now if now is not None else time.time()
+        removed = 0
+        for path in self.temp_dir.iterdir():
+            if path.is_file() and not path.is_symlink() and now - path.stat().st_mtime > older_than_seconds:
+                path.unlink()
+                removed += 1
+        return removed
+
+
+def write_private_json(path: Path, value: object, *, indent: int | None = None) -> None:
+    path.write_text(json.dumps(value, indent=indent), encoding="utf-8")
+    path.chmod(0o600)
+
+
+def format_audit_metadata(
+    kind: str,
+    *,
+    user: str,
+    channel: str,
+    thread: str,
+    message_length: int,
+    response_length: int | None = None,
+    session_id: str | None = None,
+    duration: float | None = None,
+) -> str:
+    fields = [
+        kind,
+        f"USER:{user}",
+        f"CHANNEL:{channel}",
+        f"THREAD:{thread}",
+        f"MSG_LEN:{message_length}",
+    ]
+    if response_length is not None:
+        fields.append(f"RESP_LEN:{response_length}")
+    if session_id is not None:
+        fields.append(f"SESSION:{session_id}")
+    if duration is not None:
+        fields.append(f"DURATION:{duration:.1f}s")
+    return " | ".join(fields)
 
 
 def load_model_config(path: Path) -> dict:
