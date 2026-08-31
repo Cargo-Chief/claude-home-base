@@ -49,10 +49,13 @@ from cargo_chief_safety import (
     SafetyError,
     build_authority_envelope,
     build_claude_command,
+    cleanup_thread_workspaces,
     find_workspace_root,
     format_audit_metadata,
     preflight_room,
     resolve_room_policy,
+    prepare_thread_workspace,
+    ThreadWorkspace,
     validate_secret_env_path,
     write_private_json,
 )
@@ -524,6 +527,7 @@ class LiveSession:
     private_escalation_pending: bool = False
     first_tool_seen: bool = False
     pre_tool_text: list[str] = field(default_factory=list)
+    workspace: ThreadWorkspace | None = None
 
 
 # thread_ts → LiveSession
@@ -635,7 +639,7 @@ def _spawn_claude_process(
     user_id: str = "",
     thread_ts: str = "",
     channel: str = "",
-) -> tuple[subprocess.Popen, Path, Path]:
+) -> tuple[subprocess.Popen, ThreadWorkspace]:
     """Spawn a long-lived Claude CLI process with stream-json I/O.
 
     Injects CLAUDE_THREAD_TS / CLAUDE_CHANNEL_ID / CLAUDE_SESSION_ID env vars
@@ -647,9 +651,11 @@ def _spawn_claude_process(
     policy = resolve_room_policy(_load_model_config(), channel, user_id)
     for warning in preflight_room(policy):
         logger.warning(f"Cargo Chief preflight: {warning}")
-    safe_thread = re.sub(r"[^0-9.]", "_", thread_ts or "unknown")
-    escalation_message_file = policy.root / "work" / f".home-base-escalation-{safe_thread}.txt"
-    escalation_receipt_file = policy.root / "work" / f".home-base-escalation-{safe_thread}.receipt"
+    workspace = prepare_thread_workspace(
+        policy.root, channel=channel, thread=thread_ts, session_id=session_id
+    )
+    escalation_message_file = workspace.escalation_message_file
+    escalation_receipt_file = workspace.escalation_receipt_file
     for stale_path in (escalation_message_file, escalation_receipt_file):
         try:
             stale_path.unlink()
@@ -679,6 +685,7 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_ESCALATION_CHANNEL"] = policy.escalation_channel
     proc_env["CARGO_CHIEF_ESCALATION_MESSAGE_FILE"] = str(escalation_message_file)
     proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
+    proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
 
     proc = subprocess.Popen(
         cmd,
@@ -686,15 +693,15 @@ def _spawn_claude_process(
         stdout=subprocess.PIPE,
         stderr=stderr_tmp,
         text=True,
-        cwd=policy.root,
+        cwd=workspace.path,
         env=proc_env,
     )
     logger.info(
         f"Spawned Claude process pid={proc.pid} (resume={session_id or 'none'}, "
         f"user={user_id}, permissions={policy.permission_mode}, model={policy.model}, "
-        f"effort={policy.effort}, root={policy.root})"
+        f"effort={policy.effort}, root={policy.root}, thread_work={workspace.key})"
     )
-    return proc, escalation_message_file, escalation_receipt_file
+    return proc, workspace
 
 
 # Announce context utilization in the thread every N tokens (bot-side only —
@@ -869,6 +876,13 @@ def _reader_loop(session: LiveSession) -> None:
                 if sid:
                     session.session_id = sid
                     _save_session(session.thread_ts, sid)
+                    if session.workspace:
+                        prepare_thread_workspace(
+                            session.workspace.root,
+                            channel=session.channel,
+                            thread=session.thread_ts,
+                            session_id=sid,
+                        )
                 if session.private_escalation_pending:
                     delivered = bool(
                         session.escalation_receipt_file
@@ -932,7 +946,7 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
                 oldest.proc.kill()
 
         saved_session_id = _get_session(thread_ts)
-        proc, escalation_message_file, escalation_receipt_file = _spawn_claude_process(
+        proc, workspace = _spawn_claude_process(
             session_id=saved_session_id,
             user_id=user_id,
             thread_ts=thread_ts,
@@ -944,8 +958,9 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
             channel=channel,
             thread_ts=thread_ts,
             user_id=user_id,
-            escalation_message_file=escalation_message_file,
-            escalation_receipt_file=escalation_receipt_file,
+            escalation_message_file=workspace.escalation_message_file,
+            escalation_receipt_file=workspace.escalation_receipt_file,
+            workspace=workspace,
         )
         _live_sessions[thread_ts] = session
 
@@ -995,6 +1010,14 @@ def _cleanup_idle_sessions() -> None:
                 _save_session(ts, session.session_id)
             with _live_sessions_lock:
                 _live_sessions.pop(ts, None)
+
+        with _live_sessions_lock:
+            active_keys = frozenset(
+                session.workspace.key
+                for session in _live_sessions.values()
+                if session.workspace is not None
+            )
+        cleanup_thread_workspaces(WORKSPACE_ROOT, active_keys=active_keys)
 
 
 # ---------------------------------------------------------------------------
@@ -2261,6 +2284,10 @@ def main():
     removed_temp = RUNTIME_POLICY.cleanup_temp()
     if removed_temp:
         logger.info(f"Removed {removed_temp} stale runtime temp file(s)")
+
+    removed_workspaces = cleanup_thread_workspaces(WORKSPACE_ROOT)
+    if removed_workspaces:
+        logger.info(f"Removed {removed_workspaces} stale thread workspace(s)")
 
     # Garbage-collect stale forward entries (>14 days old) from prior runs
     _gc_forwards()
