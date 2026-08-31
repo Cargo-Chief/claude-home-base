@@ -385,11 +385,10 @@ def build_claude_command(
         f"- The configured private escalation route is Slack channel "
         f"{policy.escalation_channel}.\n"
         "- When the autonomous instructions require private escalation, send the "
-        "substantive message through the harness CLI (the Slack token stays inside "
-        "the harness):\n"
+        "substantive message through the fixed-route harness capability (the Slack "
+        "token and destination stay inside the harness):\n"
         f"  {shlex.quote(str(transport_python))} "
-        f"{shlex.quote(str(transport_script))} --channel "
-        f"{policy.escalation_channel} \"<message>\"\n"
+        f"{shlex.quote(str(transport_script))} --escalate \"<message>\"\n"
         "- Post only the policy-appropriate generic status in the source thread."
     )
     appended = "\n\n".join(

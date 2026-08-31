@@ -657,6 +657,7 @@ def _spawn_claude_process(
         proc_env["CLAUDE_CHANNEL_ID"] = channel
     if session_id:
         proc_env["CLAUDE_SESSION_ID"] = session_id
+    proc_env["CARGO_CHIEF_ESCALATION_CHANNEL"] = policy.escalation_channel
 
     proc = subprocess.Popen(
         cmd,
@@ -2047,6 +2048,10 @@ def main():
         help="Post a message to a channel and exit",
     )
     parser.add_argument(
+        "--escalate", metavar="MESSAGE",
+        help="Post to the harness-configured private escalation route and exit",
+    )
+    parser.add_argument(
         "--history", metavar="CHANNEL_ID",
         help="Print recent messages from a channel (or a thread if --thread is set)",
     )
@@ -2112,6 +2117,13 @@ def main():
                 print(ts)
         else:
             send_to_channel(args.channel[0], args.channel[1], thread_ts=args.thread)
+        return
+
+    if args.escalate:
+        escalation_channel = os.environ.get("CARGO_CHIEF_ESCALATION_CHANNEL", "")
+        if not re.fullmatch(r"[CDG][A-Z0-9]+", escalation_channel):
+            raise SystemExit("private escalation route is unavailable")
+        send_to_channel(escalation_channel, args.escalate)
         return
 
     if args.history:
