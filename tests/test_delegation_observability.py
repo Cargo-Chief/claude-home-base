@@ -89,6 +89,40 @@ class DelegationTrackerTest(unittest.TestCase):
         })
         self.assertEqual(0, tracker.finish_turn()[0].owner_verification_tools)
 
+    def test_background_delegation_survives_owner_turn_boundary(self):
+        tracker = DelegationTracker()
+        tracker.observe({
+            "type": "system", "subtype": "task_started",
+            "tool_use_id": "tool-bg", "subagent_type": "cargo-chief-mechanical",
+        })
+
+        # The owner may finish an interim turn while the background delegate
+        # is still running. In-flight state must not be audited or discarded.
+        self.assertEqual([], tracker.finish_turn())
+        self.assertIn("tool-bg", tracker.records)
+
+        tracker.observe({
+            "type": "assistant", "parent_tool_use_id": "tool-bg",
+            "message": {"model": "claude-sonnet-5", "content": []},
+        })
+        tracker.observe({
+            "type": "system", "subtype": "task_notification",
+            "tool_use_id": "tool-bg", "status": "completed",
+            "usage": {"total_tokens": 4000, "tool_uses": 2, "duration_ms": 9000},
+        })
+        tracker.observe({
+            "type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "hidden"}},
+            ]},
+        })
+
+        records = tracker.finish_turn()
+        self.assertEqual(1, len(records))
+        self.assertEqual("completed", records[0].status)
+        self.assertEqual("claude-sonnet-5", records[0].served_model)
+        self.assertEqual(1, records[0].owner_verification_tools)
+        self.assertEqual({}, tracker.records)
+
 
 if __name__ == "__main__":
     unittest.main()
