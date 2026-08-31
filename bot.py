@@ -47,6 +47,7 @@ from cargo_chief_safety import (
     AuthorityPolicy,
     RuntimePolicy,
     SafetyError,
+    build_authority_envelope,
     build_claude_command,
     find_workspace_root,
     format_audit_metadata,
@@ -1558,7 +1559,12 @@ def process_message_async(event: dict) -> None:
     # Defense in depth: every ingress path (including forwarded replies and
     # mid-turn steering) must pass the current Slack sender, before downloads
     # or any other filesystem-derived work occurs.
-    if not is_authorized(user_id):
+    try:
+        authority = AuthorityPolicy.from_env()
+    except SafetyError:
+        log_unauthorized(event)
+        return
+    if not authority.allows(user_id):
         log_unauthorized(event)
         return
 
@@ -1572,7 +1578,7 @@ def process_message_async(event: dict) -> None:
         channel = forward["channel"]
 
     try:
-        resolve_room_policy(_load_model_config(), channel, user_id)
+        room_policy = resolve_room_policy(_load_model_config(), channel, user_id)
     except SafetyError as exc:
         logger.error(f"Refusing unsafe room {channel}: {exc}")
         slack_client.chat_postMessage(
@@ -1615,10 +1621,6 @@ def process_message_async(event: dict) -> None:
     # into the original conversation with attribution. The eyes reaction
     # below still goes on the original message in its original channel.
     if forward:
-        text = (
-            f"[{sender_name} ({user_id}) replied in DM thread {original_thread}]:\n"
-            f"{text}"
-        )
         _remove_forward(original_thread)
         logger.info(
             f"Forwarded reply from {sender_name} in {original_thread} -> {thread_ts}"
@@ -1679,10 +1681,16 @@ def process_message_async(event: dict) -> None:
             reminder=show_reminder,
         )
 
-    if thread_context:
-        text = prefix + f"{thread_context}\n\n[{sender_name}]({user_id}):\n{text}"
-    else:
-        text = prefix + f"[{sender_name}]({user_id}):\n{text}"
+    text = prefix + build_authority_envelope(
+        authority,
+        sender_id=user_id,
+        sender_name=sender_name,
+        channel_id=channel,
+        permission_mode=room_policy.permission_mode,
+        message=text,
+        thread_context=thread_context,
+        forwarded_from=original_thread,
+    )
 
     # Add eyes reaction as thinking indicator
     try:
