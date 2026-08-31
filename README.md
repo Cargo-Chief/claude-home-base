@@ -29,6 +29,13 @@ route, Claude session ID, and activity timestamps across daemon restarts. Stale 
 removed after 14 days; live, recent, unrecognized, malformed, and symlinked entries are preserved
 fail-closed.
 
+Delegation is pinned by the harness rather than inherited from a machine default. The owning room
+uses its configured model and effort; named subagents provide Opus 5/medium bounded work, Sonnet
+5/high mechanical work, and read-only Haiku 4.5/medium exploration. Audit records contain only the
+agent name, configured and served models, configured effort, completion status, aggregate token and
+tool counts, duration, and the number of subsequent owner verification tools. Delegated prompts,
+descriptions, tool inputs, file paths, and response content are never retained or logged.
+
 Run the policy tests with:
 
 ```bash

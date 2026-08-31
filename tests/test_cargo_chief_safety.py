@@ -6,6 +6,7 @@ import threading
 import unittest
 
 from cargo_chief_safety import (
+    APPROVED_DELEGATES,
     AuthorityPolicy,
     GENERATED_MARKER,
     RoomPolicy,
@@ -412,8 +413,17 @@ class PreflightTest(unittest.TestCase):
             session_id="session-1",
         )
         self.assertIn("auto", command)
+        self.assertIn("--forward-subagent-text", command)
         self.assertNotIn("bypassPermissions", command)
         self.assertEqual("claude-opus-4-8[1m]", command[command.index("--model") + 1])
+        agents = json.loads(command[command.index("--agents") + 1])
+        self.assertEqual(APPROVED_DELEGATES, agents)
+        self.assertEqual("claude-opus-5[1m]", agents["cargo-chief-bounded"]["model"])
+        self.assertEqual("medium", agents["cargo-chief-bounded"]["effort"])
+        self.assertEqual("claude-sonnet-5", agents["cargo-chief-mechanical"]["model"])
+        self.assertEqual("high", agents["cargo-chief-mechanical"]["effort"])
+        self.assertEqual(["Read", "Grep", "Glob"], agents["cargo-chief-explore"]["tools"])
+        self.assertEqual("medium", agents["cargo-chief-explore"]["effort"])
         appended = command[command.index("--append-system-prompt") + 1]
         self.assertTrue(appended.startswith(
             "autonomous\n\nCargo Chief harness authority and routing:"
@@ -426,6 +436,7 @@ class PreflightTest(unittest.TestCase):
         )
         self.assertIn("/workspace/work/escalation.txt", appended)
         self.assertNotIn("--channel D1", appended)
+        self.assertIn("Do not invoke built-in Explore, Plan, or general-purpose", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
 
