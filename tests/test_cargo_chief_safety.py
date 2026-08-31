@@ -305,9 +305,10 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(appended.startswith("autonomous\n\nCargo Chief harness routing:"))
         self.assertIn("private escalation route is Slack channel D1", appended)
         self.assertIn(
-            '/venv/bin/python /home-base/bot.py --channel D1 "<message>"',
+            '/venv/bin/python /home-base/bot.py --escalate "<message>"',
             appended,
         )
+        self.assertNotIn("--channel D1", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
 
