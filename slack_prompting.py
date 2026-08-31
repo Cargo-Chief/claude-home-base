@@ -1,5 +1,21 @@
 """Pure Slack prompt builders that can be tested without bot credentials."""
 
+from pathlib import Path
+
+
+def contains_escalation_file_write(content: list, target: Path) -> bool:
+    """Detect a main-loop file tool targeting the harness one-shot message file."""
+    expected = target.expanduser().resolve()
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if block.get("name") not in {"Write", "Edit", "MultiEdit"}:
+            continue
+        value = (block.get("input") or {}).get("file_path")
+        if value and Path(str(value)).expanduser().resolve() == expected:
+            return True
+    return False
+
 
 def needs_relevance_prefix(
     *,

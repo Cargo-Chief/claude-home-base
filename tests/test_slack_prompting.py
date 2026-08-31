@@ -1,9 +1,28 @@
 import unittest
+from pathlib import Path
+import tempfile
 
-from slack_prompting import needs_relevance_prefix, relevance_prefix
+from slack_prompting import (
+    contains_escalation_file_write,
+    needs_relevance_prefix,
+    relevance_prefix,
+)
 
 
 class RelevancePrefixTests(unittest.TestCase):
+    def test_detects_only_the_designated_escalation_file_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "escalation.txt"
+            content = [{
+                "type": "tool_use",
+                "name": "Write",
+                "input": {"file_path": str(target), "content": "sensitive"},
+            }]
+            self.assertTrue(contains_escalation_file_write(content, target))
+            self.assertFalse(contains_escalation_file_write(
+                content, Path(tmp) / "ordinary.txt"
+            ))
+
     def test_explicit_app_mention_bypasses_model_relevance_filter(self):
         self.assertFalse(needs_relevance_prefix(
             event_type="app_mention",
