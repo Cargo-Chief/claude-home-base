@@ -295,6 +295,7 @@ class PreflightTest(unittest.TestCase):
             initial_prompt="context",
             transport_python=Path("/venv/bin/python"),
             transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/work/escalation.txt"),
             model_prompt="room prompt",
             session_id="session-1",
         )
@@ -305,9 +306,10 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(appended.startswith("autonomous\n\nCargo Chief harness routing:"))
         self.assertIn("private escalation route is Slack channel D1", appended)
         self.assertIn(
-            '/venv/bin/python /home-base/bot.py --escalate "<message>"',
+            "/venv/bin/python /home-base/bot.py --escalate",
             appended,
         )
+        self.assertIn("/workspace/work/escalation.txt", appended)
         self.assertNotIn("--channel D1", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])

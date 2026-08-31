@@ -637,11 +637,14 @@ def _spawn_claude_process(
     policy = resolve_room_policy(_load_model_config(), channel, user_id)
     for warning in preflight_room(policy):
         logger.warning(f"Cargo Chief preflight: {warning}")
+    safe_thread = re.sub(r"[^0-9.]", "_", thread_ts or "unknown")
+    escalation_message_file = policy.root / "work" / f".home-base-escalation-{safe_thread}.txt"
     cmd = build_claude_command(
         policy,
         initial_prompt=battery_context,
         transport_python=Path(sys.executable),
         transport_script=SOURCE_DIR / "bot.py",
+        escalation_message_file=escalation_message_file,
         model_prompt=model_prompt,
         session_id=session_id,
     )
@@ -658,6 +661,7 @@ def _spawn_claude_process(
     if session_id:
         proc_env["CLAUDE_SESSION_ID"] = session_id
     proc_env["CARGO_CHIEF_ESCALATION_CHANNEL"] = policy.escalation_channel
+    proc_env["CARGO_CHIEF_ESCALATION_MESSAGE_FILE"] = str(escalation_message_file)
 
     proc = subprocess.Popen(
         cmd,
@@ -2048,7 +2052,7 @@ def main():
         help="Post a message to a channel and exit",
     )
     parser.add_argument(
-        "--escalate", metavar="MESSAGE",
+        "--escalate", action="store_true",
         help="Post to the harness-configured private escalation route and exit",
     )
     parser.add_argument(
@@ -2123,7 +2127,22 @@ def main():
         escalation_channel = os.environ.get("CARGO_CHIEF_ESCALATION_CHANNEL", "")
         if not re.fullmatch(r"[CDG][A-Z0-9]+", escalation_channel):
             raise SystemExit("private escalation route is unavailable")
-        send_to_channel(escalation_channel, args.escalate)
+        message_path_value = os.environ.get("CARGO_CHIEF_ESCALATION_MESSAGE_FILE", "")
+        if not message_path_value:
+            raise SystemExit("private escalation message path is unavailable")
+        message_path = Path(message_path_value)
+        try:
+            message = message_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise SystemExit("private escalation message is unavailable") from exc
+        finally:
+            try:
+                message_path.unlink()
+            except OSError:
+                pass
+        if not message:
+            raise SystemExit("private escalation message is empty")
+        send_to_channel(escalation_channel, message)
         return
 
     if args.history:
