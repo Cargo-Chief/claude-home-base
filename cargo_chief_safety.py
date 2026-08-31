@@ -193,6 +193,7 @@ class RuntimePolicy:
     temp_dir: Path
     claude_timeout: int
     max_live_sessions: int
+    max_live_bundles: int
     file_transfer_enabled: bool
     transcript_search_enabled: bool
 
@@ -222,12 +223,17 @@ class RuntimePolicy:
         try:
             timeout = int(env.get("CLAUDE_TIMEOUT", "600"))
             max_sessions = int(env.get("MAX_LIVE_SESSIONS", "1"))
+            max_bundles = int(env.get("MAX_LIVE_BUNDLES", "3"))
         except ValueError as exc:
-            raise SafetyError("CLAUDE_TIMEOUT and MAX_LIVE_SESSIONS must be integers") from exc
+            raise SafetyError(
+                "CLAUDE_TIMEOUT, MAX_LIVE_SESSIONS, and MAX_LIVE_BUNDLES must be integers"
+            ) from exc
         if not 1 <= timeout <= 900:
             raise SafetyError("CLAUDE_TIMEOUT must be between 1 and 900 seconds for Gate A")
         if max_sessions != 1:
             raise SafetyError("MAX_LIVE_SESSIONS must be 1 for Gate A")
+        if not 1 <= max_bundles <= 5:
+            raise SafetyError("MAX_LIVE_BUNDLES must be between 1 and 5")
 
         file_transfer = _env_bool(env, "ENABLE_FILE_TRANSFER", False)
         transcript_search = _env_bool(env, "ENABLE_TRANSCRIPT_SEARCH", False)
@@ -243,6 +249,7 @@ class RuntimePolicy:
             temp_dir=root / "tmp",
             claude_timeout=timeout,
             max_live_sessions=max_sessions,
+            max_live_bundles=max_bundles,
             file_transfer_enabled=file_transfer,
             transcript_search_enabled=transcript_search,
         )
@@ -283,6 +290,7 @@ class ThreadWorkspace:
     state_file: Path
     escalation_message_file: Path
     escalation_receipt_file: Path
+    bundle_claim_file: Path
 
 
 def thread_workspace_key(channel: str, thread: str) -> str:
@@ -315,25 +323,30 @@ def prepare_thread_workspace(
 
     state_file = path / "state.json"
     created_at = now if now is not None else time.time()
+    bundle = None
     try:
         prior = json.loads(state_file.read_text(encoding="utf-8"))
         if prior.get("channel") != channel or prior.get("thread") != thread:
             raise SafetyError("thread workspace metadata does not match its routing key")
         created_at = prior.get("created_at", created_at)
+        bundle = prior.get("bundle")
     except FileNotFoundError:
         pass
     except json.JSONDecodeError as exc:
         raise SafetyError("thread workspace metadata is invalid") from exc
 
     updated_at = now if now is not None else time.time()
-    write_private_json(state_file, {
+    state = {
         "version": 1,
         "channel": channel,
         "thread": thread,
         "session_id": session_id,
         "created_at": created_at,
         "updated_at": updated_at,
-    })
+    }
+    if bundle is not None:
+        state["bundle"] = bundle
+    write_private_json(state_file, state)
     return ThreadWorkspace(
         key=key,
         root=workspace_root.resolve(),
@@ -341,7 +354,94 @@ def prepare_thread_workspace(
         state_file=state_file,
         escalation_message_file=path / "private-escalation.txt",
         escalation_receipt_file=path / "private-escalation.receipt",
+        bundle_claim_file=path / "bundle-claim.txt",
     )
+
+
+def _validated_bundle_path(workspace: ThreadWorkspace, bundle: object) -> Path:
+    if not isinstance(bundle, str) or not re.fullmatch(r"CN-\d+-[a-z0-9][a-z0-9-]*", bundle):
+        raise SafetyError("bundle name must match CN-####-lowercase-slug")
+    worktrees = workspace.root / "worktrees"
+    candidate = worktrees / bundle
+    if not candidate.is_dir() or candidate.is_symlink():
+        raise SafetyError("claimed worktree bundle is missing or unsafe")
+    resolved = candidate.resolve()
+    if resolved.parent != worktrees.resolve():
+        raise SafetyError("claimed worktree bundle must be a direct child of worktrees")
+    task = candidate / "TASK.md"
+    if not task.is_file() or task.is_symlink():
+        raise SafetyError("claimed worktree bundle must contain a regular TASK.md")
+    return resolved
+
+
+def resolve_thread_bundle(workspace: ThreadWorkspace) -> Path | None:
+    try:
+        state = json.loads(workspace.state_file.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    bundle = state.get("bundle")
+    if bundle is None:
+        return None
+    try:
+        return _validated_bundle_path(workspace, bundle)
+    except SafetyError:
+        return None
+
+
+def consume_bundle_claim(
+    workspace: ThreadWorkspace,
+    *,
+    max_live_bundles: int,
+) -> Path | None:
+    """Validate and persist a one-shot bundle claim for this Slack thread."""
+    claim = workspace.bundle_claim_file
+    if not claim.exists():
+        return None
+    try:
+        if not claim.is_file() or claim.is_symlink() or claim.stat().st_size > 256:
+            raise SafetyError("bundle claim file is unsafe")
+        bundle = claim.read_text(encoding="utf-8").strip()
+        if "\n" in bundle:
+            raise SafetyError("bundle claim must contain exactly one bundle name")
+        candidate = _validated_bundle_path(workspace, bundle)
+
+        active: dict[str, str] = {}
+        for state_file in _thread_work_root(workspace.root).glob("*/state.json"):
+            try:
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+                other_bundle = state.get("bundle")
+                other_key = state_file.parent.name
+                other_workspace = ThreadWorkspace(
+                    key=other_key,
+                    root=workspace.root,
+                    path=state_file.parent,
+                    state_file=state_file,
+                    escalation_message_file=state_file.parent / "private-escalation.txt",
+                    escalation_receipt_file=state_file.parent / "private-escalation.receipt",
+                    bundle_claim_file=state_file.parent / "bundle-claim.txt",
+                )
+                _validated_bundle_path(other_workspace, other_bundle)
+            except (OSError, json.JSONDecodeError, SafetyError):
+                continue
+            if other_key != workspace.key:
+                active[other_key] = str(other_bundle)
+
+        if bundle in active.values():
+            raise SafetyError("claimed worktree bundle is already bound to another thread")
+        current = resolve_thread_bundle(workspace)
+        if current != candidate and len(set(active.values())) >= max_live_bundles:
+            raise SafetyError("live worktree bundle cap reached")
+
+        state = json.loads(workspace.state_file.read_text(encoding="utf-8"))
+        state["bundle"] = bundle
+        state["updated_at"] = time.time()
+        write_private_json(workspace.state_file, state)
+        return candidate
+    finally:
+        try:
+            claim.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def cleanup_thread_workspaces(
@@ -557,6 +657,7 @@ def build_claude_command(
     transport_python: Path,
     transport_script: Path,
     escalation_message_file: Path,
+    bundle_claim_file: Path,
     model_prompt: str = "",
     session_id: str | None = None,
 ) -> list[str]:
@@ -585,7 +686,10 @@ def build_claude_command(
         "- Delegate only through these harness-defined agents: cargo-chief-bounded for bounded "
         "implementation or targeted verification; cargo-chief-mechanical for mechanical/high-volume "
         "work; cargo-chief-explore for read-only search. Do not invoke built-in Explore, Plan, or "
-        "general-purpose agents. Verify every load-bearing delegate return before acting on it."
+        "general-purpose agents. Verify every load-bearing delegate return before acting on it.\n"
+        "- When a normal worktree_task.sh run creates a ticket bundle for this thread, write only "
+        f"its bundle directory name (CN-####-lowercase-slug) to {bundle_claim_file}. The harness "
+        "validates ownership, safety, and the live-bundle cap before persisting the mapping."
     )
     appended = "\n\n".join(
         part for part in (overlay, harness_prompt, model_prompt.strip()) if part

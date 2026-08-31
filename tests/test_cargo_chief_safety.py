@@ -13,7 +13,9 @@ from cargo_chief_safety import (
     RuntimePolicy,
     SafetyError,
     cleanup_thread_workspaces,
+    consume_bundle_claim,
     prepare_thread_workspace,
+    resolve_thread_bundle,
     thread_workspace_key,
     build_authority_envelope,
     build_claude_command,
@@ -209,6 +211,10 @@ class RuntimePolicyTest(unittest.TestCase):
             RuntimePolicy.from_env(self.env(CLAUDE_TIMEOUT="901"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
         with self.assertRaisesRegex(SafetyError, "MAX_LIVE_SESSIONS"):
             RuntimePolicy.from_env(self.env(MAX_LIVE_SESSIONS="2"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        with self.assertRaisesRegex(SafetyError, "MAX_LIVE_BUNDLES"):
+            RuntimePolicy.from_env(self.env(MAX_LIVE_BUNDLES="0"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        with self.assertRaisesRegex(SafetyError, "MAX_LIVE_BUNDLES"):
+            RuntimePolicy.from_env(self.env(MAX_LIVE_BUNDLES="6"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
 
     def test_rejects_file_transfer_and_transcript_search(self):
         with self.assertRaisesRegex(SafetyError, "ENABLE_FILE_TRANSFER"):
@@ -327,6 +333,63 @@ class RuntimePolicyTest(unittest.TestCase):
         self.assertTrue(recent.path.exists())
         self.assertTrue(unknown.exists())
 
+    def _make_bundle(self, name):
+        bundle = self.workspace / "worktrees" / name
+        bundle.mkdir(parents=True)
+        (bundle / "TASK.md").write_text("task\n")
+        return bundle.resolve()
+
+    def test_bundle_claim_persists_and_resolves_across_workspace_resume(self):
+        workspace = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="bundle", now=10.0
+        )
+        expected = self._make_bundle("CN-1234-safe-task")
+        workspace.bundle_claim_file.write_text("CN-1234-safe-task\n")
+        self.assertEqual(
+            expected,
+            consume_bundle_claim(workspace, max_live_bundles=3),
+        )
+        self.assertFalse(workspace.bundle_claim_file.exists())
+        resumed = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="bundle", session_id="S1", now=20.0
+        )
+        self.assertEqual(expected, resolve_thread_bundle(resumed))
+        self.assertEqual(
+            "CN-1234-safe-task",
+            json.loads(resumed.state_file.read_text())["bundle"],
+        )
+
+    def test_bundle_claim_refuses_collision_cap_and_unsafe_shapes(self):
+        first = prepare_thread_workspace(self.workspace, channel="C1", thread="one")
+        second = prepare_thread_workspace(self.workspace, channel="C1", thread="two")
+        third = prepare_thread_workspace(self.workspace, channel="C1", thread="three")
+        self._make_bundle("CN-1-first")
+        self._make_bundle("CN-2-second")
+        first.bundle_claim_file.write_text("CN-1-first")
+        consume_bundle_claim(first, max_live_bundles=1)
+
+        second.bundle_claim_file.write_text("CN-1-first")
+        with self.assertRaisesRegex(SafetyError, "already bound"):
+            consume_bundle_claim(second, max_live_bundles=2)
+        self.assertFalse(second.bundle_claim_file.exists())
+
+        third.bundle_claim_file.write_text("CN-2-second")
+        with self.assertRaisesRegex(SafetyError, "cap reached"):
+            consume_bundle_claim(third, max_live_bundles=1)
+
+        second.bundle_claim_file.write_text("../../escape")
+        with self.assertRaisesRegex(SafetyError, "bundle name"):
+            consume_bundle_claim(second, max_live_bundles=3)
+
+    def test_missing_bound_bundle_falls_back_to_thread_workspace(self):
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="gone")
+        self._make_bundle("CN-9-gone")
+        workspace.bundle_claim_file.write_text("CN-9-gone")
+        bundle = consume_bundle_claim(workspace, max_live_bundles=3)
+        (bundle / "TASK.md").unlink()
+        bundle.rmdir()
+        self.assertIsNone(resolve_thread_bundle(workspace))
+
 
 class PreflightTest(unittest.TestCase):
     def setUp(self):
@@ -409,6 +472,7 @@ class PreflightTest(unittest.TestCase):
             transport_python=Path("/venv/bin/python"),
             transport_script=Path("/home-base/bot.py"),
             escalation_message_file=Path("/workspace/work/escalation.txt"),
+            bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
             model_prompt="room prompt",
             session_id="session-1",
         )
@@ -435,6 +499,7 @@ class PreflightTest(unittest.TestCase):
             appended,
         )
         self.assertIn("/workspace/work/escalation.txt", appended)
+        self.assertIn("/workspace/work/bundle-claim.txt", appended)
         self.assertNotIn("--channel D1", appended)
         self.assertIn("Do not invoke built-in Explore, Plan, or general-purpose", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
