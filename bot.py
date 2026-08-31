@@ -55,7 +55,7 @@ from cargo_chief_safety import (
     validate_secret_env_path,
     write_private_json,
 )
-from slack_prompting import relevance_prefix
+from slack_prompting import needs_relevance_prefix, relevance_prefix
 from http_server import serve_http
 
 # ---------------------------------------------------------------------------
@@ -1591,12 +1591,19 @@ def process_message_async(event: dict) -> None:
             show_reminder = True
 
     prefix = ""
-    if not is_dm and not has_existing_session and not has_live_process:
+    if needs_relevance_prefix(
+        event_type=event.get("type", ""),
+        is_dm=is_dm,
+        has_existing_session=has_existing_session,
+        has_live_process=has_live_process,
+        show_reminder=show_reminder,
+    ):
         channel_name = _get_channel_name(channel)
-        prefix = relevance_prefix(channel_name, BOT_DISPLAY_NAME)
-    elif show_reminder:
-        channel_name = _get_channel_name(channel)
-        prefix = relevance_prefix(channel_name, BOT_DISPLAY_NAME, reminder=True)
+        prefix = relevance_prefix(
+            channel_name,
+            BOT_DISPLAY_NAME,
+            reminder=show_reminder,
+        )
 
     if thread_context:
         text = prefix + f"{thread_context}\n\n[{sender_name}]({user_id}):\n{text}"

@@ -1,6 +1,28 @@
 """Pure Slack prompt builders that can be tested without bot credentials."""
 
 
+def needs_relevance_prefix(
+    *,
+    event_type: str,
+    is_dm: bool,
+    has_existing_session: bool,
+    has_live_process: bool,
+    show_reminder: bool,
+) -> bool:
+    """Return whether a message needs model-based shared-space relevance filtering.
+
+    Slack has already established that an ``app_mention`` directly addresses this
+    bot. Sending that event through a second, model-based relevance decision is
+    redundant and can leak the filter's internal ``SKIP`` deliberation to Slack.
+    """
+    if is_dm or event_type == "app_mention":
+        return False
+    return (
+        (not has_existing_session and not has_live_process)
+        or show_reminder
+    )
+
+
 def relevance_prefix(channel_name: str, bot_display_name: str, *, reminder: bool = False) -> str:
     """Build the shared-space relevance instruction for the configured bot name."""
     if reminder:
