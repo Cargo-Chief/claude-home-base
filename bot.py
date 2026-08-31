@@ -55,7 +55,11 @@ from cargo_chief_safety import (
     validate_secret_env_path,
     write_private_json,
 )
-from slack_prompting import needs_relevance_prefix, relevance_prefix
+from slack_prompting import (
+    contains_escalation_file_write,
+    needs_relevance_prefix,
+    relevance_prefix,
+)
 from http_server import serve_http
 
 # ---------------------------------------------------------------------------
@@ -514,6 +518,11 @@ class LiveSession:
     # Messages sent into this process, for the per-model prompt cadence. Resets
     # when the thread's process is respawned after an idle-out.
     turns_sent: int = 0
+    escalation_message_file: Path | None = None
+    escalation_receipt_file: Path | None = None
+    private_escalation_pending: bool = False
+    first_tool_seen: bool = False
+    pre_tool_text: list[str] = field(default_factory=list)
 
 
 # thread_ts → LiveSession
@@ -625,7 +634,7 @@ def _spawn_claude_process(
     user_id: str = "",
     thread_ts: str = "",
     channel: str = "",
-) -> subprocess.Popen:
+) -> tuple[subprocess.Popen, Path, Path]:
     """Spawn a long-lived Claude CLI process with stream-json I/O.
 
     Injects CLAUDE_THREAD_TS / CLAUDE_CHANNEL_ID / CLAUDE_SESSION_ID env vars
@@ -639,6 +648,12 @@ def _spawn_claude_process(
         logger.warning(f"Cargo Chief preflight: {warning}")
     safe_thread = re.sub(r"[^0-9.]", "_", thread_ts or "unknown")
     escalation_message_file = policy.root / "work" / f".home-base-escalation-{safe_thread}.txt"
+    escalation_receipt_file = policy.root / "work" / f".home-base-escalation-{safe_thread}.receipt"
+    for stale_path in (escalation_message_file, escalation_receipt_file):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
     cmd = build_claude_command(
         policy,
         initial_prompt=battery_context,
@@ -662,6 +677,7 @@ def _spawn_claude_process(
         proc_env["CLAUDE_SESSION_ID"] = session_id
     proc_env["CARGO_CHIEF_ESCALATION_CHANNEL"] = policy.escalation_channel
     proc_env["CARGO_CHIEF_ESCALATION_MESSAGE_FILE"] = str(escalation_message_file)
+    proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
 
     proc = subprocess.Popen(
         cmd,
@@ -677,7 +693,7 @@ def _spawn_claude_process(
         f"user={user_id}, permissions={policy.permission_mode}, model={policy.model}, "
         f"effort={policy.effort}, root={policy.root})"
     )
-    return proc
+    return proc, escalation_message_file, escalation_receipt_file
 
 
 # Announce context utilization in the thread every N tokens (bot-side only —
@@ -800,14 +816,40 @@ def _reader_loop(session: LiveSession) -> None:
                     session.session_id = sid
 
             elif msg_type == "assistant":
-                _track_model(session, data)
-                _track_context(session, data)
                 content = data.get("message", {}).get("content", [])
                 # Subagent (Agent/Task) events stream through the same stdout
                 # with parent_tool_use_id set — their text is internal chatter,
                 # not a reply to the human. Only main-loop text reaches Slack.
                 if data.get("parent_tool_use_id"):
                     continue
+                if (session.escalation_message_file
+                        and contains_escalation_file_write(
+                            content, session.escalation_message_file
+                        )):
+                    session.private_escalation_pending = True
+                    session.pre_tool_text.clear()
+                if session.private_escalation_pending:
+                    continue
+
+                _track_model(session, data)
+                _track_context(session, data)
+                has_tool_use = any(
+                    isinstance(block, dict) and block.get("type") == "tool_use"
+                    for block in content
+                )
+                text_blocks = [
+                    block.get("text", "").strip()
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                    and block.get("text", "").strip()
+                ]
+                if not session.first_tool_seen:
+                    session.pre_tool_text.extend(text_blocks)
+                    if not has_tool_use:
+                        continue
+                    session.first_tool_seen = True
+                    text_blocks = list(session.pre_tool_text)
+                    session.pre_tool_text.clear()
                 for block in content:
                     # Skill visibility: announce main-loop skill invocations in a
                     # grey context block (bot-side only, never enters Claude's
@@ -817,16 +859,39 @@ def _reader_loop(session: LiveSession) -> None:
                         inp = block.get("input") or {}
                         args_str = str(inp.get("args") or "")[:120]
                         _post_skill_notice(session, inp.get("skill", "?"), args_str)
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "").strip()
-                        if text and session._on_text:
-                            session._on_text(text)
+                for text in text_blocks:
+                    if session._on_text:
+                        session._on_text(text)
 
             elif msg_type == "result":
                 sid = data.get("session_id")
                 if sid:
                     session.session_id = sid
                     _save_session(session.thread_ts, sid)
+                if session.private_escalation_pending:
+                    delivered = bool(
+                        session.escalation_receipt_file
+                        and session.escalation_receipt_file.is_file()
+                    )
+                    if session.escalation_receipt_file:
+                        try:
+                            session.escalation_receipt_file.unlink()
+                        except OSError:
+                            pass
+                    status = (
+                        "blocked, escalated privately"
+                        if delivered
+                        else "blocked, private escalation failed"
+                    )
+                    if session._on_text:
+                        session._on_text(status)
+                else:
+                    for text in session.pre_tool_text:
+                        if session._on_text:
+                            session._on_text(text)
+                session.private_escalation_pending = False
+                session.first_tool_seen = False
+                session.pre_tool_text.clear()
                 # Clear eyes reactions from steering messages this turn absorbed
                 while session.pending_reactions:
                     ch, ts = session.pending_reactions.pop(0)
@@ -866,7 +931,7 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
                 oldest.proc.kill()
 
         saved_session_id = _get_session(thread_ts)
-        proc = _spawn_claude_process(
+        proc, escalation_message_file, escalation_receipt_file = _spawn_claude_process(
             session_id=saved_session_id,
             user_id=user_id,
             thread_ts=thread_ts,
@@ -878,6 +943,8 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
             channel=channel,
             thread_ts=thread_ts,
             user_id=user_id,
+            escalation_message_file=escalation_message_file,
+            escalation_receipt_file=escalation_receipt_file,
         )
         _live_sessions[thread_ts] = session
 
@@ -2142,7 +2209,13 @@ def main():
                 pass
         if not message:
             raise SystemExit("private escalation message is empty")
+        receipt_path_value = os.environ.get("CARGO_CHIEF_ESCALATION_RECEIPT_FILE", "")
+        if not receipt_path_value:
+            raise SystemExit("private escalation receipt path is unavailable")
+        receipt_path = Path(receipt_path_value)
         send_to_channel(escalation_channel, message)
+        receipt_path.write_text("delivered\n", encoding="utf-8")
+        receipt_path.chmod(0o600)
         return
 
     if args.history:
