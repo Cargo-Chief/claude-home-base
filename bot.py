@@ -56,6 +56,7 @@ from cargo_chief_safety import (
     write_private_json,
 )
 from slack_prompting import relevance_prefix
+from http_server import serve_http
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -2146,7 +2147,7 @@ def main():
     # Start idle session cleanup thread
     threading.Thread(target=_cleanup_idle_sessions, daemon=True).start()
 
-    flask_app.run(host="0.0.0.0", port=PORT)
+    serve_http(flask_app, PORT)
 
 
 if __name__ == "__main__":
