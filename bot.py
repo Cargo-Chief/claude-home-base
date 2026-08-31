@@ -50,11 +50,13 @@ from cargo_chief_safety import (
     build_authority_envelope,
     build_claude_command,
     cleanup_thread_workspaces,
+    consume_bundle_claim,
     find_workspace_root,
     format_audit_metadata,
     preflight_room,
     resolve_room_policy,
     prepare_thread_workspace,
+    resolve_thread_bundle,
     ThreadWorkspace,
     validate_secret_env_path,
     write_private_json,
@@ -669,6 +671,7 @@ def _spawn_claude_process(
         transport_python=Path(sys.executable),
         transport_script=SOURCE_DIR / "bot.py",
         escalation_message_file=escalation_message_file,
+        bundle_claim_file=workspace.bundle_claim_file,
         model_prompt=model_prompt,
         session_id=session_id,
     )
@@ -688,6 +691,10 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_ESCALATION_MESSAGE_FILE"] = str(escalation_message_file)
     proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
     proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
+    proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
+    bundle = resolve_thread_bundle(workspace)
+    if bundle:
+        proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
 
     proc = subprocess.Popen(
         cmd,
@@ -695,13 +702,14 @@ def _spawn_claude_process(
         stdout=subprocess.PIPE,
         stderr=stderr_tmp,
         text=True,
-        cwd=workspace.path,
+        cwd=bundle or workspace.path,
         env=proc_env,
     )
     logger.info(
         f"Spawned Claude process pid={proc.pid} (resume={session_id or 'none'}, "
         f"user={user_id}, permissions={policy.permission_mode}, model={policy.model}, "
-        f"effort={policy.effort}, root={policy.root}, thread_work={workspace.key})"
+        f"effort={policy.effort}, root={policy.root}, thread_work={workspace.key}, "
+        f"bundle={(bundle.name if bundle else 'none')})"
     )
     return proc, workspace
 
@@ -882,6 +890,25 @@ def _reader_loop(session: LiveSession) -> None:
                         channel=session.channel,
                         thread=session.thread_ts,
                     ))
+                if session.workspace and session.workspace.bundle_claim_file.exists():
+                    try:
+                        bundle = consume_bundle_claim(
+                            session.workspace,
+                            max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+                        )
+                    except SafetyError as exc:
+                        audit_logger.warning(
+                            "BUNDLE_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+                            session.user_id, session.channel, session.thread_ts, str(exc),
+                        )
+                        if session._on_text:
+                            session._on_text(f"Worktree bundle mapping refused: {exc}")
+                    else:
+                        if bundle:
+                            audit_logger.info(
+                                "BUNDLE_BOUND | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s",
+                                session.user_id, session.channel, session.thread_ts, bundle.name,
+                            )
                 sid = data.get("session_id")
                 if sid:
                     session.session_id = sid
@@ -2288,7 +2315,8 @@ def main():
     logger.info("Project roots are resolved per room from model-config.json")
     logger.info(
         f"Runtime: {RUNTIME_POLICY.root} (sessions={MAX_LIVE_SESSIONS}, "
-        f"timeout={CLAUDE_TIMEOUT}s, file_transfer=off, transcript_search=off)"
+        f"bundles={RUNTIME_POLICY.max_live_bundles}, timeout={CLAUDE_TIMEOUT}s, "
+        "file_transfer=off, transcript_search=off)"
     )
 
     removed_temp = RUNTIME_POLICY.cleanup_temp()

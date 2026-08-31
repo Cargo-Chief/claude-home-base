@@ -36,6 +36,13 @@ agent name, configured and served models, configured effort, completion status, 
 tool counts, duration, and the number of subsequent owner verification tools. Delegated prompts,
 descriptions, tool inputs, file paths, and response content are never retained or logged.
 
+When a thread creates a standard `worktrees/CN-####-slug/` bundle, it can claim that bundle through
+its private one-shot claim file. Home-base accepts only a direct, non-symlinked child of
+`$CARGO_CHIEF_ROOT/worktrees/` with a regular `TASK.md`, refuses a bundle already owned by another
+thread, and caps live mappings at `MAX_LIVE_BUNDLES` (default 3, maximum 5). The mapping lives in
+the thread's private state and survives daemon/session restart; a resumed process starts in the
+validated bundle. A removed or invalid bundle safely falls back to the thread scratch directory.
+
 Run the policy tests with:
 
 ```bash
