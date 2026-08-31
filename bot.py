@@ -640,6 +640,8 @@ def _spawn_claude_process(
     cmd = build_claude_command(
         policy,
         initial_prompt=battery_context,
+        transport_python=Path(sys.executable),
+        transport_script=SOURCE_DIR / "bot.py",
         model_prompt=model_prompt,
         session_id=session_id,
     )

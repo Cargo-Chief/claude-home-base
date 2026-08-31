@@ -84,6 +84,14 @@ class RoomPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "not allowlisted"):
             resolve_room_policy(self.config(self.entry(model="claude-unknown")), "C1", "U1")
 
+    def test_rejects_invalid_private_escalation_channel(self):
+        with self.assertRaisesRegex(SafetyError, "invalid private escalation channel"):
+            resolve_room_policy(
+                self.config(self.entry(private_escalation_channel="D1; unsafe")),
+                "C1",
+                "U1",
+            )
+
     def test_dm_override_is_resolved_for_current_sender(self):
         config = {
             "models": self.models,
@@ -283,13 +291,24 @@ class PreflightTest(unittest.TestCase):
 
     def test_command_is_explicit_and_never_bypasses_permissions(self):
         command = build_claude_command(
-            self.policy, initial_prompt="context", model_prompt="room prompt", session_id="session-1"
+            self.policy,
+            initial_prompt="context",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            model_prompt="room prompt",
+            session_id="session-1",
         )
         self.assertIn("auto", command)
         self.assertNotIn("bypassPermissions", command)
         self.assertEqual("claude-opus-4-8[1m]", command[command.index("--model") + 1])
         appended = command[command.index("--append-system-prompt") + 1]
-        self.assertEqual("autonomous\n\nroom prompt", appended)
+        self.assertTrue(appended.startswith("autonomous\n\nCargo Chief harness routing:"))
+        self.assertIn("private escalation route is Slack channel D1", appended)
+        self.assertIn(
+            '/venv/bin/python /home-base/bot.py --channel D1 "<message>"',
+            appended,
+        )
+        self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
 
 
