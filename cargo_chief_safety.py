@@ -28,6 +28,37 @@ ALLOWED_PERMISSION_MODES = {"auto"}
 ALLOWED_BACKENDS = {"claude"}
 ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
+APPROVED_DELEGATES = {
+    "cargo-chief-bounded": {
+        "description": "Bounded implementation or targeted verification against a clear, checkable specification.",
+        "prompt": (
+            "Perform only the bounded task supplied by the owning session. Return concise evidence "
+            "the owner can independently verify. Report unexpected state; do not improvise scope."
+        ),
+        "model": "claude-opus-5[1m]",
+        "effort": "medium",
+    },
+    "cargo-chief-mechanical": {
+        "description": "Mechanical high-volume work with exact scope and a verifiable return shape.",
+        "prompt": (
+            "Perform the exact mechanical task supplied by the owning session. Preserve scope "
+            "boundaries and return only the requested evidence. Report; do not improvise."
+        ),
+        "model": "claude-sonnet-5",
+        "effort": "high",
+    },
+    "cargo-chief-explore": {
+        "description": "Read-only codebase search that returns concise file and line evidence.",
+        "prompt": (
+            "Search read-only. Return concise file:line evidence for the exact question. Never edit "
+            "or create files, and report unexpected state rather than widening scope."
+        ),
+        "tools": ["Read", "Grep", "Glob"],
+        "model": "claude-haiku-4-5-20251001",
+        "effort": "medium",
+    },
+}
+
 
 class SafetyError(RuntimeError):
     """A configuration or local-state condition that must refuse a spawn."""
@@ -550,7 +581,11 @@ def build_claude_command(
         "  2. Run this exact command; it reads and deletes that one-shot file:\n"
         f"  {shlex.quote(str(transport_python))} "
         f"{shlex.quote(str(transport_script))} --escalate\n"
-        "- Post only the policy-appropriate generic status in the source thread."
+        "- Post only the policy-appropriate generic status in the source thread.\n"
+        "- Delegate only through these harness-defined agents: cargo-chief-bounded for bounded "
+        "implementation or targeted verification; cargo-chief-mechanical for mechanical/high-volume "
+        "work; cargo-chief-explore for read-only search. Do not invoke built-in Explore, Plan, or "
+        "general-purpose agents. Verify every load-bearing delegate return before acting on it."
     )
     appended = "\n\n".join(
         part for part in (overlay, harness_prompt, model_prompt.strip()) if part
@@ -560,9 +595,11 @@ def build_claude_command(
         "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
+        "--forward-subagent-text",
         "--effort", policy.effort,
         "--model", policy.model,
         "--permission-mode", policy.permission_mode,
+        "--agents", json.dumps(APPROVED_DELEGATES, separators=(",", ":")),
         "--append-system-prompt", appended,
     ]
     if session_id:

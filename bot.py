@@ -65,6 +65,7 @@ from slack_prompting import (
     relevance_prefix,
 )
 from http_server import serve_http
+from delegation_observability import DelegationTracker, format_delegation_audit
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -528,6 +529,7 @@ class LiveSession:
     first_tool_seen: bool = False
     pre_tool_text: list[str] = field(default_factory=list)
     workspace: ThreadWorkspace | None = None
+    delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
 
 
 # thread_ts → LiveSession
@@ -817,6 +819,7 @@ def _reader_loop(session: LiveSession) -> None:
             session.last_activity = time.time()
 
             msg_type = data.get("type")
+            session.delegation_tracker.observe(data)
 
             if msg_type == "system":
                 sid = data.get("session_id")
@@ -872,6 +875,13 @@ def _reader_loop(session: LiveSession) -> None:
                         session._on_text(text)
 
             elif msg_type == "result":
+                for record in session.delegation_tracker.finish_turn():
+                    audit_logger.info(format_delegation_audit(
+                        record,
+                        user=session.user_id,
+                        channel=session.channel,
+                        thread=session.thread_ts,
+                    ))
                 sid = data.get("session_id")
                 if sid:
                     session.session_id = sid
