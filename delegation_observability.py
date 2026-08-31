@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import time
 
 from cargo_chief_safety import APPROVED_DELEGATES
 
@@ -76,9 +75,9 @@ class DelegationTracker:
                     self.records[tool_id].owner_verification_tools += tool_count
 
     def finish_turn(self) -> list[DelegationRecord]:
-        result = list(self.records.values())
-        self.records.clear()
-        self.completed.clear()
+        finished_ids = [tool_id for tool_id in self.records if tool_id in self.completed]
+        result = [self.records.pop(tool_id) for tool_id in finished_ids]
+        self.completed.difference_update(finished_ids)
         return result
 
 
