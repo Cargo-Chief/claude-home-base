@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import time
 from typing import Mapping
@@ -270,12 +272,17 @@ def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPoli
         raise SafetyError(f"room {channel_id!r} model {model!r} is not allowlisted")
     if role not in {"eng", "support"}:
         raise SafetyError(f"room {channel_id!r} has unsupported role {role!r}")
+    escalation_channel = str(entry["private_escalation_channel"])
+    if not re.fullmatch(r"[CDG][A-Z0-9]+", escalation_channel):
+        raise SafetyError(
+            f"room {channel_id!r} has invalid private escalation channel"
+        )
 
     return RoomPolicy(
         root=root,
         permission_mode=permission_mode,
         overlay=overlay.absolute(),
-        escalation_channel=str(entry["private_escalation_channel"]),
+        escalation_channel=escalation_channel,
         backend=backend,
         model=model,
         effort=effort,
@@ -367,11 +374,27 @@ def build_claude_command(
     policy: RoomPolicy,
     *,
     initial_prompt: str,
+    transport_python: Path,
+    transport_script: Path,
     model_prompt: str = "",
     session_id: str | None = None,
 ) -> list[str]:
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
-    appended = "\n\n".join(part for part in (overlay, model_prompt.strip()) if part)
+    escalation_prompt = (
+        "Cargo Chief harness routing:\n"
+        f"- The configured private escalation route is Slack channel "
+        f"{policy.escalation_channel}.\n"
+        "- When the autonomous instructions require private escalation, send the "
+        "substantive message through the harness CLI (the Slack token stays inside "
+        "the harness):\n"
+        f"  {shlex.quote(str(transport_python))} "
+        f"{shlex.quote(str(transport_script))} --channel "
+        f"{policy.escalation_channel} \"<message>\"\n"
+        "- Post only the policy-appropriate generic status in the source thread."
+    )
+    appended = "\n\n".join(
+        part for part in (overlay, escalation_prompt, model_prompt.strip()) if part
+    )
     command = [
         "claude", "-p", initial_prompt,
         "--input-format", "stream-json",
