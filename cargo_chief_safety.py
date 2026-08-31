@@ -376,6 +376,7 @@ def build_claude_command(
     initial_prompt: str,
     transport_python: Path,
     transport_script: Path,
+    escalation_message_file: Path,
     model_prompt: str = "",
     session_id: str | None = None,
 ) -> list[str]:
@@ -387,8 +388,11 @@ def build_claude_command(
         "- When the autonomous instructions require private escalation, send the "
         "substantive message through the fixed-route harness capability (the Slack "
         "token and destination stay inside the harness):\n"
+        f"  1. Write only the substantive escalation message to "
+        f"{escalation_message_file}.\n"
+        "  2. Run this exact command; it reads and deletes that one-shot file:\n"
         f"  {shlex.quote(str(transport_python))} "
-        f"{shlex.quote(str(transport_script))} --escalate \"<message>\"\n"
+        f"{shlex.quote(str(transport_script))} --escalate\n"
         "- Post only the policy-appropriate generic status in the source thread."
     )
     appended = "\n\n".join(
