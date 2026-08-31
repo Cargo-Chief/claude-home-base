@@ -22,6 +22,13 @@ Logs, session maps, forwards, votes, stderr, and temporary artifacts live under 
 metadata-only audit records, removes stale temporary files at startup, and refuses file transfer
 or transcript search.
 
+Each Slack thread runs from a stable private scratch directory under
+`$CARGO_CHIEF_ROOT/work/home-base/<routing-hash>/`. The hash includes both the channel and thread,
+so separate threads never share a current working directory. A private `state.json` preserves the
+route, Claude session ID, and activity timestamps across daemon restarts. Stale workspaces are
+removed after 14 days; live, recent, unrecognized, malformed, and symlinked entries are preserved
+fail-closed.
+
 Run the policy tests with:
 
 ```bash

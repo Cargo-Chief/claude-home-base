@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 
 from cargo_chief_safety import (
@@ -10,6 +11,9 @@ from cargo_chief_safety import (
     RoomPolicy,
     RuntimePolicy,
     SafetyError,
+    cleanup_thread_workspaces,
+    prepare_thread_workspace,
+    thread_workspace_key,
     build_authority_envelope,
     build_claude_command,
     find_workspace_root,
@@ -246,6 +250,81 @@ class RuntimePolicyTest(unittest.TestCase):
             "| RESP_LEN:29 | SESSION:S1 | DURATION:1.2s",
             record,
         )
+
+    def test_thread_workspaces_are_isolated_and_resumable(self):
+        first = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="100.1", session_id="S1", now=10.0
+        )
+        second = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="100.2", session_id="S2", now=11.0
+        )
+        resumed = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="100.1", session_id="S3", now=12.0
+        )
+        self.assertNotEqual(first.path, second.path)
+        self.assertEqual(first.path, resumed.path)
+        self.assertEqual(0o700, first.path.stat().st_mode & 0o777)
+        state = json.loads(resumed.state_file.read_text())
+        self.assertEqual("S3", state["session_id"])
+        self.assertEqual(10.0, state["created_at"])
+        self.assertEqual(12.0, state["updated_at"])
+        self.assertEqual(0o600, resumed.state_file.stat().st_mode & 0o777)
+
+    def test_thread_workspace_key_includes_channel(self):
+        self.assertNotEqual(
+            thread_workspace_key("C1", "100.1"),
+            thread_workspace_key("C2", "100.1"),
+        )
+        with self.assertRaises(SafetyError):
+            thread_workspace_key("", "100.1")
+
+    def test_concurrent_threads_cannot_overwrite_each_others_scratch(self):
+        left = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="left", now=10.0
+        )
+        right = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="right", now=10.0
+        )
+        barrier = threading.Barrier(2)
+
+        def write(workspace, value):
+            barrier.wait()
+            (workspace.path / "result.txt").write_text(value)
+
+        threads = [
+            threading.Thread(target=write, args=(left, "left-only")),
+            threading.Thread(target=write, args=(right, "right-only")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual("left-only", (left.path / "result.txt").read_text())
+        self.assertEqual("right-only", (right.path / "result.txt").read_text())
+
+    def test_thread_workspace_cleanup_preserves_live_recent_and_unknown(self):
+        stale = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="old", now=10.0
+        )
+        live = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="live", now=10.0
+        )
+        recent = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="recent", now=95.0
+        )
+        unknown = stale.path.parent / "operator-notes"
+        unknown.mkdir()
+        removed = cleanup_thread_workspaces(
+            self.workspace,
+            active_keys=frozenset({live.key}),
+            older_than_seconds=50,
+            now=100.0,
+        )
+        self.assertEqual(1, removed)
+        self.assertFalse(stale.path.exists())
+        self.assertTrue(live.path.exists())
+        self.assertTrue(recent.path.exists())
+        self.assertTrue(unknown.exists())
 
 
 class PreflightTest(unittest.TestCase):

@@ -8,11 +8,13 @@ Claude process.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from typing import Mapping
@@ -234,6 +236,113 @@ class RuntimePolicy:
 def write_private_json(path: Path, value: object, *, indent: int | None = None) -> None:
     path.write_text(json.dumps(value, indent=indent), encoding="utf-8")
     path.chmod(0o600)
+
+
+THREAD_WORK_ROOT_NAME = "home-base"
+THREAD_WORK_MAX_AGE_SECONDS = 14 * 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class ThreadWorkspace:
+    """Stable, private scratch space belonging to one Slack channel/thread pair."""
+
+    key: str
+    root: Path
+    path: Path
+    state_file: Path
+    escalation_message_file: Path
+    escalation_receipt_file: Path
+
+
+def thread_workspace_key(channel: str, thread: str) -> str:
+    if not channel or not thread:
+        raise SafetyError("channel and thread are required for thread workspace isolation")
+    return hashlib.sha256(f"{channel}\0{thread}".encode("utf-8")).hexdigest()[:24]
+
+
+def _thread_work_root(workspace_root: Path) -> Path:
+    return workspace_root.resolve() / "work" / THREAD_WORK_ROOT_NAME
+
+
+def prepare_thread_workspace(
+    workspace_root: Path,
+    *,
+    channel: str,
+    thread: str,
+    session_id: str | None = None,
+    now: float | None = None,
+) -> ThreadWorkspace:
+    """Create or resume the scratch directory for a Slack thread."""
+    key = thread_workspace_key(channel, thread)
+    base = _thread_work_root(workspace_root)
+    path = base / key
+    for directory in (base, path):
+        if directory.exists() and (not directory.is_dir() or directory.is_symlink()):
+            raise SafetyError(f"unsafe thread workspace path: {directory}")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+
+    state_file = path / "state.json"
+    created_at = now if now is not None else time.time()
+    try:
+        prior = json.loads(state_file.read_text(encoding="utf-8"))
+        if prior.get("channel") != channel or prior.get("thread") != thread:
+            raise SafetyError("thread workspace metadata does not match its routing key")
+        created_at = prior.get("created_at", created_at)
+    except FileNotFoundError:
+        pass
+    except json.JSONDecodeError as exc:
+        raise SafetyError("thread workspace metadata is invalid") from exc
+
+    updated_at = now if now is not None else time.time()
+    write_private_json(state_file, {
+        "version": 1,
+        "channel": channel,
+        "thread": thread,
+        "session_id": session_id,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    })
+    return ThreadWorkspace(
+        key=key,
+        root=workspace_root.resolve(),
+        path=path,
+        state_file=state_file,
+        escalation_message_file=path / "private-escalation.txt",
+        escalation_receipt_file=path / "private-escalation.receipt",
+    )
+
+
+def cleanup_thread_workspaces(
+    workspace_root: Path,
+    *,
+    active_keys: frozenset[str] = frozenset(),
+    older_than_seconds: int = THREAD_WORK_MAX_AGE_SECONDS,
+    now: float | None = None,
+) -> int:
+    """Remove only stale, self-identifying thread workspaces that are not live."""
+    base = _thread_work_root(workspace_root)
+    if not base.exists() or not base.is_dir() or base.is_symlink():
+        return 0
+    cutoff = (now if now is not None else time.time()) - older_than_seconds
+    removed = 0
+    for path in base.iterdir():
+        if path.name in active_keys or not re.fullmatch(r"[0-9a-f]{24}", path.name):
+            continue
+        if not path.is_dir() or path.is_symlink():
+            continue
+        state_file = path / "state.json"
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            expected = thread_workspace_key(state["channel"], state["thread"])
+            updated_at = float(state["updated_at"])
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        if expected != path.name or updated_at >= cutoff:
+            continue
+        shutil.rmtree(path)
+        removed += 1
+    return removed
 
 
 def format_audit_metadata(
