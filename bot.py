@@ -55,6 +55,7 @@ from cargo_chief_safety import (
     validate_secret_env_path,
     write_private_json,
 )
+from slack_prompting import relevance_prefix
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -1591,24 +1592,10 @@ def process_message_async(event: dict) -> None:
     prefix = ""
     if not is_dm and not has_existing_session and not has_live_process:
         channel_name = _get_channel_name(channel)
-        prefix = (
-            f"A new message in #{channel_name}. "
-            "Only respond if you're directly addressed by your name 'Andy' or tagged "
-            "or if you're already part of the conversation thread. "
-            "Respond with exactly \"SKIP\" in ALL other cases. "
-            "Don't say 'Skipping this as it's not relevant' or 'Nothing for me to do here' "
-            "or anything like it. Just be precise and say exactly \"SKIP\" — "
-            "because that will result in the harness not showing your msg "
-            "at all in Slack, which is the correct behaviour.\n\n"
-        )
+        prefix = relevance_prefix(channel_name, BOT_DISPLAY_NAME)
     elif show_reminder:
         channel_name = _get_channel_name(channel)
-        prefix = (
-            f"[Reminder: #{channel_name} is a shared, multi-person space.] "
-            "Only respond if you're directly addressed by name 'Andy', tagged, or "
-            "actively part of this exchange. In all other cases respond with exactly "
-            "\"SKIP\" and nothing else — that suppresses the message in Slack.\n\n"
-        )
+        prefix = relevance_prefix(channel_name, BOT_DISPLAY_NAME, reminder=True)
 
     if thread_context:
         text = prefix + f"{thread_context}\n\n[{sender_name}]({user_id}):\n{text}"
@@ -1954,9 +1941,9 @@ def handle_block_action(ack, body):
             "channel": body["channel"]["id"],
             "ts": message["ts"],  # :eyes: lands on the clicked message
             "thread_ts": message.get("thread_ts") or message["ts"],
-            # "Andy" in the text keeps this from being SKIPped by the
+            # The configured bot name keeps this from being SKIPped by the
             # channel-relevance filter when the click starts a fresh session
-            "text": f"[Button click for Andy: {_get_user_name(user_id)} clicked {desc} "
+            "text": f"[Button click for {BOT_DISPLAY_NAME}: {_get_user_name(user_id)} clicked {desc} "
                     f"(action_id: {action.get('action_id', '')})]",
             # unique per click so repeat clicks on one message aren't deduped
             "client_msg_id": f"{action.get('action_id', '')}:{action.get('action_ts', '')}",
