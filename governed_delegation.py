@@ -7,13 +7,15 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Mapping
 
-from openai_fallback import run_codex_turn
+from codex_delegation import run_codex_delegate
 
 
 DEFAULT_TOKEN_BUDGET = 250_000
@@ -65,6 +67,7 @@ class DelegateResult:
     tokens: int = 0
     tool_uses: int = 0
     error: str | None = None
+    budget_exhausted: bool = False
 
 
 def _read_one_shot(path: Path, *, max_bytes: int = MAX_REQUEST_BYTES) -> str:
@@ -215,35 +218,104 @@ def _total_tokens(usage: Mapping[str, object]) -> int:
     )
 
 
-def run_claude_delegate(command: list[str], prompt: str, *, cwd: str, env: Mapping[str, str], timeout: int, on_process: Callable[[subprocess.Popen | None], None]) -> DelegateResult:
+def _stream_reader(stream, output: queue.Queue) -> None:
+    try:
+        for line in stream:
+            output.put(line)
+    finally:
+        output.put(None)
+
+
+def run_claude_delegate(
+    command: list[str], prompt: str, *, cwd: str, env: Mapping[str, str],
+    token_limit: int, timeout: int,
+    on_process: Callable[[subprocess.Popen | None], None],
+) -> DelegateResult:
+    """Run Claude incrementally and stop before another call after the allowance is spent."""
+    if token_limit < 1:
+        return DelegateResult(error="Claude delegate budget is exhausted")
     process = None
+    events: queue.Queue = queue.Queue()
+    tokens = 0
+    tool_uses = 0
+    result_text = ""
+    seen_messages: set[str] = set()
+    completed = False
+    deadline = time.monotonic() + timeout
     try:
         process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=cwd, env=dict(env), text=True,
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cwd=cwd, env=dict(env), text=True, bufsize=1,
         )
         on_process(process)
-        stdout, _stderr = process.communicate(prompt, timeout=timeout)
-    except subprocess.TimeoutExpired:
+        threading.Thread(target=_stream_reader, args=(process.stdout, events), daemon=True).start()
+        process.stdin.write(prompt)
+        process.stdin.close()
+        while not completed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                line = events.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError from exc
+            if line is None:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "assistant":
+                message = event.get("message") or {}
+                message_id = message.get("id")
+                usage = message.get("usage") or {}
+                if not isinstance(message_id, str) or not isinstance(usage, dict):
+                    return DelegateResult(tokens=tokens, error="Claude delegate returned invalid usage")
+                if message_id not in seen_messages:
+                    seen_messages.add(message_id)
+                    tokens += _total_tokens(usage)
+                    content = message.get("content") or []
+                    tool_uses += sum(
+                        1 for item in content
+                        if isinstance(item, dict) and item.get("type") == "tool_use"
+                    )
+                    if tokens >= token_limit:
+                        process.kill()
+                        return DelegateResult(
+                            tokens=tokens, tool_uses=tool_uses, budget_exhausted=True,
+                        )
+            elif event.get("type") == "result":
+                usage = event.get("usage") or {}
+                if not seen_messages and isinstance(usage, dict):
+                    tokens = _total_tokens(usage)
+                text = event.get("result")
+                if not isinstance(text, str):
+                    return DelegateResult(tokens=tokens, error="Claude delegate returned invalid output")
+                result_text = text.strip()
+                completed = True
+        if not completed:
+            return DelegateResult(tokens=tokens, error="Claude delegate ended without completion")
+        process.wait(timeout=5)
+        if process.returncode != 0:
+            return DelegateResult(tokens=tokens, error="Claude delegate failed")
+        if tokens < 1:
+            return DelegateResult(error="Claude delegate returned no usage")
+        return DelegateResult(text=result_text, tokens=tokens, tool_uses=tool_uses)
+    except (TimeoutError, subprocess.TimeoutExpired):
         if process:
             process.kill()
-            process.communicate()
-        return DelegateResult(error="Claude delegate timed out")
+        return DelegateResult(tokens=tokens, error="Claude delegate timed out")
     except OSError:
-        return DelegateResult(error="Claude delegate could not start")
+        return DelegateResult(tokens=tokens, error="Claude delegate could not start")
     finally:
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         on_process(None)
-    if process is None or process.returncode != 0:
-        return DelegateResult(error="Claude delegate failed")
-    try:
-        value = json.loads(stdout)
-    except json.JSONDecodeError:
-        return DelegateResult(error="Claude delegate returned invalid output")
-    text = value.get("result")
-    usage = value.get("usage") or {}
-    if not isinstance(text, str) or not isinstance(usage, dict):
-        return DelegateResult(error="Claude delegate returned invalid output")
-    return DelegateResult(text=text.strip(), tokens=_total_tokens(usage))
 
 
 def _write_pid(path: Path, process: subprocess.Popen | None) -> None:
@@ -318,6 +390,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     before = budget_status(budget_file)
     if before["used"] >= before["limit"]:
         raise DelegationError("thread delegation budget is exhausted")
+    remaining_tokens = before["limit"] - before["used"]
     prompt = (
         "You are a governed Cargo Chief delegate. Perform only the supplied bounded task. "
         "Do not delegate again, access credentials, touch production, commit, push, or widen scope. "
@@ -330,35 +403,33 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     started = time.monotonic()
     if provider == "openai":
         command = [
-            "codex", "--profile", "cargo-chief", "-c", f'model_reasoning_effort="{effort}"',
-            "-c", "features.multi_agent=false",
-            "exec", "--json", "--model", model, "--cd", os.getcwd(),
-            "--skip-git-repo-check", "-",
+            "codex", "-c", "features.multi_agent=false", "app-server", "--stdio",
         ]
-        if not request.mutation:
-            command[command.index("exec") + 1:command.index("exec") + 1] = ["--sandbox", "read-only"]
-        result_raw = run_codex_turn(
-            command, prompt, cwd=os.getcwd(), env=env, timeout=timeout,
+        result_raw = run_codex_delegate(
+            command, prompt, cwd=os.getcwd(), env=env, model=model, effort=effort,
+            read_only=not request.mutation, token_limit=remaining_tokens, timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
         result = DelegateResult(
             text="\n\n".join(result_raw.texts),
-            tokens=_total_tokens(result_raw.usage),
+            tokens=result_raw.tokens,
             error=result_raw.error,
+            budget_exhausted=result_raw.budget_exhausted,
         )
     else:
         command = [
-            "claude", "-p", "--output-format", "json", "--model", model,
+            "claude", "-p", "--output-format", "stream-json", "--verbose", "--model", model,
             "--effort", effort, "--permission-mode", "auto",
         ]
         if not request.mutation:
             command.extend(["--allowedTools", "Read,Grep,Glob"])
         result = run_claude_delegate(
-            command, prompt, cwd=os.getcwd(), env=env, timeout=timeout,
+            command, prompt, cwd=os.getcwd(), env=env, token_limit=remaining_tokens,
+            timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
     state = update_budget(budget_file, add_tokens=result.tokens)
-    exhausted = state["used"] >= state["limit"]
+    exhausted = result.budget_exhausted or state["used"] >= state["limit"]
     status = "failed" if result.error else "budget_exhausted" if exhausted else "completed"
     _append_audit(Path(env["CARGO_CHIEF_AUDIT_LOG"]), {
         "USER": env["CARGO_CHIEF_CURRENT_USER"],
