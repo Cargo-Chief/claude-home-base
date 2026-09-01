@@ -146,6 +146,10 @@ OpenAI rather than oscillating when Claude credits return.
 The approved routing equivalents are Sol/high for the owning thread, Sol/medium for bounded
 engineering, Terra/high for mechanical or high-volume work, and Luna/medium for read-only search.
 Fallback turns are serialized per Slack thread; the Claude path retains its live mid-turn steering.
+Governed delegation metadata is written to
+`$CARGO_CHIEF_ROOT/work/home-base/delegation-audit.log`. Keeping this audit inside the workspace
+lets both Claude and OpenAI owning sessions append it without a filesystem-permission retry; the
+file is mode `0600` and never contains prompts or delegate returns.
 
 ## Bot features
 

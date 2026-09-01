@@ -79,7 +79,7 @@ from openai_fallback import (
     model_notice_text,
     run_codex_turn,
 )
-from governed_delegation import budget_status, update_budget
+from governed_delegation import budget_status, delegation_audit_path, update_budget
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -763,7 +763,7 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_DELEGATION_BUDGET_FILE"] = str(workspace.delegation_budget_file)
     proc_env["CARGO_CHIEF_DELEGATE_PID_FILE"] = str(workspace.delegate_pid_file)
     proc_env["CARGO_CHIEF_DELEGATE_VERIFICATION_FILE"] = str(workspace.delegate_verification_file)
-    proc_env["CARGO_CHIEF_AUDIT_LOG"] = str(AUDIT_LOG)
+    proc_env["CARGO_CHIEF_AUDIT_LOG"] = str(delegation_audit_path(policy.root))
     proc_env["CARGO_CHIEF_OWNER_PROVIDER"] = "claude"
     proc_env["CARGO_CHIEF_OWNER_MODEL"] = policy.model
     proc_env["CARGO_CHIEF_OWNER_EFFORT"] = policy.effort
@@ -1802,7 +1802,7 @@ def _run_openai_fallback(
         "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(workspace.delegation_budget_file),
         "CARGO_CHIEF_DELEGATE_PID_FILE": str(workspace.delegate_pid_file),
         "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(workspace.delegate_verification_file),
-        "CARGO_CHIEF_AUDIT_LOG": str(AUDIT_LOG),
+        "CARGO_CHIEF_AUDIT_LOG": str(delegation_audit_path(policy.root)),
         "CARGO_CHIEF_OWNER_PROVIDER": "openai",
         "CARGO_CHIEF_OWNER_MODEL": policy.fallback_model,
         "CARGO_CHIEF_OWNER_EFFORT": policy.fallback_effort,

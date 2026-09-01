@@ -260,8 +260,16 @@ def _write_pid(path: Path, process: subprocess.Popen | None) -> None:
 def _append_audit(path: Path, fields: Mapping[str, object]) -> None:
     safe = " | ".join(f"{key}:{value}" for key, value in fields.items())
     with path.open("a", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
         fcntl.flock(handle, fcntl.LOCK_EX)
         handle.write(time.strftime("%Y-%m-%d %H:%M:%S") + " | DELEGATION | " + safe + "\n")
+
+
+def delegation_audit_path(root: Path) -> Path:
+    """Return the workspace-writable, operator-readable delegation audit log."""
+    path = root.resolve() / "work" / "home-base" / "delegation-audit.log"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
 
 
 def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:

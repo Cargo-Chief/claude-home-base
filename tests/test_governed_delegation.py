@@ -8,10 +8,12 @@ import unittest
 from unittest.mock import patch
 
 from governed_delegation import (
+    _append_audit,
     DEFAULT_TOKEN_BUDGET,
     DelegationError,
     ROUTES,
     budget_status,
+    delegation_audit_path,
     launch_from_environment,
     load_request,
     run_claude_delegate,
@@ -51,6 +53,17 @@ Status: clear
 
 
 class GovernedDelegationTest(unittest.TestCase):
+
+    def test_delegation_audit_is_workspace_writable_and_private(self):
+        path = delegation_audit_path(self.root)
+        self.assertEqual(
+            self.root.resolve() / "work" / "home-base" / "delegation-audit.log",
+            path,
+        )
+        _append_audit(path, {"STATUS": "completed"})
+        self.assertIn("STATUS:completed", path.read_text(encoding="utf-8"))
+        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
