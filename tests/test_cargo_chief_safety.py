@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from cargo_chief_safety import (
     APPROVED_DELEGATES,
@@ -21,11 +22,14 @@ from cargo_chief_safety import (
     thread_workspace_key,
     build_authority_envelope,
     build_claude_command,
+    build_codex_command,
+    build_codex_prompt,
     find_workspace_root,
     format_audit_metadata,
     preflight_room,
     resolve_room_policy,
     validate_secret_env_path,
+    validate_codex_runtime,
     write_private_json,
 )
 
@@ -104,6 +108,9 @@ class RoomPolicyTest(unittest.TestCase):
             "backend": "claude",
             "model": "claude-opus-4-8[1m]",
             "effort": "high",
+            "fallback": {
+                "backend": "codex", "model": "gpt-5.6-sol", "effort": "high",
+            },
         }
         value.update(overrides)
         return value
@@ -125,6 +132,17 @@ class RoomPolicyTest(unittest.TestCase):
     def test_rejects_model_outside_allowlist(self):
         with self.assertRaisesRegex(SafetyError, "not allowlisted"):
             resolve_room_policy(self.config(self.entry(model="claude-unknown")), "C1", "U1")
+
+    def test_requires_exact_allowlisted_codex_fallback(self):
+        with self.assertRaisesRegex(SafetyError, "explicit fallback"):
+            resolve_room_policy(self.config(self.entry(fallback=None)), "C1", "U1")
+        with self.assertRaisesRegex(SafetyError, "fallback model"):
+            resolve_room_policy(
+                self.config(self.entry(fallback={
+                    "backend": "codex", "model": "gpt-unknown", "effort": "high",
+                })),
+                "C1", "U1",
+            )
 
     def test_rejects_invalid_private_escalation_channel(self):
         with self.assertRaisesRegex(SafetyError, "invalid private escalation channel"):
@@ -505,7 +523,8 @@ class PreflightTest(unittest.TestCase):
         self.policy = RoomPolicy(
             root=self.root, permission_mode="auto", overlay=self.overlay,
             escalation_channel="D1", backend="claude", model="claude-opus-4-8[1m]",
-            effort="high", role="eng",
+            effort="high", role="eng", fallback_backend="codex",
+            fallback_model="gpt-5.6-sol", fallback_effort="high",
         )
 
     def tearDown(self):
@@ -592,6 +611,52 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("Do not invoke built-in Explore, Plan, or general-purpose", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
+
+    def test_codex_command_uses_governed_profile_model_and_effort(self):
+        command = build_codex_command(self.policy, cwd=Path("/workspace/work/thread"))
+        self.assertEqual("codex", command[0])
+        self.assertEqual("cargo-chief", command[command.index("--profile") + 1])
+        self.assertEqual("gpt-5.6-sol", command[command.index("--model") + 1])
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertIn("/workspace/work/thread", command)
+        self.assertNotIn("danger-full-access", command)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+
+        resumed = build_codex_command(
+            self.policy, cwd=Path("/ignored"), session_id="openai-session-1"
+        )
+        self.assertIn("resume", resumed)
+        self.assertIn("openai-session-1", resumed)
+        self.assertNotIn("--cd", resumed)
+
+        prompt = build_codex_prompt(
+            self.policy,
+            inbound_prompt="authority envelope",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/escalation.txt"),
+            bundle_claim_file=Path("/workspace/bundle.txt"),
+            parking_claim_file=Path("/workspace/parking.txt"),
+        )
+        self.assertTrue(prompt.startswith("autonomous\n\nCargo Chief harness"))
+        self.assertIn("gpt-5.6-sol at medium effort", prompt)
+        self.assertIn("gpt-5.6-terra at high", prompt)
+        self.assertIn("gpt-5.6-luna at medium", prompt)
+        self.assertTrue(prompt.endswith("authority envelope"))
+
+    def test_codex_runtime_requires_cli_and_generated_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            with mock.patch("cargo_chief_safety.shutil.which", return_value=None):
+                with self.assertRaisesRegex(SafetyError, "not installed"):
+                    validate_codex_runtime(home=home, env={})
+            with mock.patch("cargo_chief_safety.shutil.which", return_value="/bin/codex"):
+                with self.assertRaisesRegex(SafetyError, "profile"):
+                    validate_codex_runtime(home=home, env={})
+                profile = home / ".codex" / "cargo-chief.config.toml"
+                profile.parent.mkdir()
+                profile.write_text("generated profile\n")
+                self.assertEqual(profile, validate_codex_runtime(home=home, env={}))
 
 
 if __name__ == "__main__":

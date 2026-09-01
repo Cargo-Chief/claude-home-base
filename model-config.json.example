@@ -1,14 +1,15 @@
 {
   "_readme": "Copy to model-config.json (next to bot.py). Every Cargo Chief room must explicitly name its root, permission mode, autonomous overlay, escalation channel, backend, model, effort, and role. Missing or unsafe values refuse the spawn.",
-  "_readme_backend": "The initial Cargo Chief safety gate permits only the Claude backend with permission_mode auto. Codex remains disabled until it has equivalent governance.",
-  "default_model": "claude-fable-5",
-  "default_effort": "medium",
+  "_readme_backend": "Claude is primary. Every room must explicitly name a governed Codex fallback used only after a recognized Claude account credit-limit event.",
+  "default_model": "claude-opus-5",
+  "default_effort": "high",
   "models": [
-    "claude-opus-4-8[1m]",
-    "claude-fable-5",
+    "claude-opus-5",
     "claude-sonnet-5",
     "claude-haiku-4-5-20251001",
-    "gpt-5.6-sol"
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna"
   ],
   "channels": {
     "C0EXAMPLE01": {
@@ -18,8 +19,13 @@
       "autonomous_overlay": "agent-kit/modes/autonomous.md",
       "private_escalation_channel": "D0APPROVER",
       "backend": "claude",
-      "model": "claude-opus-4-8[1m]",
+      "model": "claude-opus-5",
       "effort": "high",
+      "fallback": {
+        "backend": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "high"
+      },
       "role": "eng"
     },
     "C0EXAMPLE02": {
@@ -31,20 +37,21 @@
       "backend": "claude",
       "model": "claude-sonnet-5",
       "effort": "medium",
+      "fallback": {
+        "backend": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "medium"
+      },
       "role": "eng"
     }
   },
   "dm_users": {
     "U0EXAMPLE01": {
       "name": "Alice",
-      "model": "claude-opus-4-8[1m]"
+      "model": "claude-opus-5"
     }
   },
-  "model_prompts": {
-    "claude-fable-5": "Plain text appended to the system prompt wherever this model answers — say what it needs that CLAUDE.md does not cover."
-  },
+  "model_prompts": {},
   "_readme_cadence": "model_prompt_cadence repeats a model's prompt during a thread. The prompt is always in the system prompt at spawn; N here also appends it to every Nth message the human sends, so a standing instruction does not fade out over a long conversation. 0 or absent = spawn only. Set it on the /models page.",
-  "model_prompt_cadence": {
-    "claude-fable-5": 4
-  }
+  "model_prompt_cadence": {}
 }
