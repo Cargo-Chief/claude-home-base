@@ -4,8 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import re
 import subprocess
 from typing import Callable, Iterable, Mapping
+
+
+CLAUDE_LIMIT_RE = re.compile(
+    r"You've hit your (?:(?:usage|weekly) )?limit",
+    re.IGNORECASE,
+)
+
+
+def is_claude_limit_notice(text: str) -> bool:
+    """Return whether Claude emitted an account usage-limit notice."""
+    return CLAUDE_LIMIT_RE.search(text) is not None
 
 
 @dataclass

@@ -73,7 +73,7 @@ from slack_prompting import (
 )
 from http_server import serve_http
 from delegation_observability import DelegationTracker, format_delegation_audit
-from openai_fallback import run_codex_turn
+from openai_fallback import is_claude_limit_notice, run_codex_turn
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -600,7 +600,6 @@ REMINDER_EVERY = 10
 # the explicit OpenAI fallback until the reset time. Limits are account-wide,
 # so the pause is a single global, while successful fallback sessions remain
 # pinned per thread.
-LIMIT_RE = re.compile(r"You've hit your (usage )?limit", re.I)
 LIMIT_RESET_RE = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)", re.I)
 LIMIT_PAUSE_FALLBACK = 1800  # seconds, if the reset time can't be parsed
 _limit_pause_lock = threading.Lock()
@@ -2000,7 +1999,7 @@ def process_message_async(event: dict) -> None:
         # Usage-limit notices are synthesized by the CLI, not the model.
         # Suppress them and replay the same authenticated turn through the
         # configured OpenAI fallback after the Claude result closes.
-        if LIMIT_RE.search(text_block):
+        if is_claude_limit_notice(text_block):
             _enter_limit_pause(text_block)
             fallback_requested = True
             logger.warning(f"Usage limit hit in thread {thread_ts}")

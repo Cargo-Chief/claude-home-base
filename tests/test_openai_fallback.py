@@ -3,10 +3,27 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from openai_fallback import parse_codex_events, run_codex_turn
+from openai_fallback import (
+    is_claude_limit_notice,
+    parse_codex_events,
+    run_codex_turn,
+)
 
 
 class OpenAIFallbackTest(unittest.TestCase):
+    def test_recognizes_claude_limit_notices(self):
+        for notice in (
+            "You've hit your limit · resets 4pm (UTC)",
+            "You've hit your usage limit · resets at 4:00 pm",
+            "You've hit your weekly limit · resets Sep 2 at 7pm (America/Los_Angeles)",
+        ):
+            with self.subTest(notice=notice):
+                self.assertTrue(is_claude_limit_notice(notice))
+
+    def test_does_not_treat_ordinary_errors_as_limit_notices(self):
+        self.assertFalse(is_claude_limit_notice("Claude process exited with status 1"))
+        self.assertFalse(is_claude_limit_notice("You've hit your tool limit"))
+
     def test_parser_keeps_only_session_text_and_usage(self):
         lines = [
             json.dumps({"type": "thread.started", "thread_id": "T1"}),
