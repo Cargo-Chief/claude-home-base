@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from openai_fallback import (
     is_claude_limit_notice,
+    model_notice_text,
     parse_codex_events,
     run_codex_turn,
 )
@@ -23,6 +24,17 @@ class OpenAIFallbackTest(unittest.TestCase):
     def test_does_not_treat_ordinary_errors_as_limit_notices(self):
         self.assertFalse(is_claude_limit_notice("Claude process exited with status 1"))
         self.assertFalse(is_claude_limit_notice("You've hit your tool limit"))
+
+    def test_model_notice_ignores_synthetic_limit_envelope(self):
+        self.assertIsNone(model_notice_text("<synthetic>"))
+
+    def test_model_notice_attributes_and_deduplicates_fallback(self):
+        self.assertEqual("model: gpt-5.6-sol", model_notice_text("gpt-5.6-sol"))
+        self.assertIsNone(model_notice_text("gpt-5.6-sol", "gpt-5.6-sol"))
+        self.assertEqual(
+            "model changed: gpt-5.6-sol → gpt-5.6-terra",
+            model_notice_text("gpt-5.6-terra", "gpt-5.6-sol"),
+        )
 
     def test_parser_keeps_only_session_text_and_usage(self):
         lines = [

@@ -73,7 +73,11 @@ from slack_prompting import (
 )
 from http_server import serve_http
 from delegation_observability import DelegationTracker, format_delegation_audit
-from openai_fallback import is_claude_limit_notice, run_codex_turn
+from openai_fallback import (
+    is_claude_limit_notice,
+    model_notice_text,
+    run_codex_turn,
+)
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -580,6 +584,7 @@ _live_sessions_lock = threading.Lock()
 _openai_turn_locks: dict[str, threading.Lock] = {}
 _openai_processes: dict[str, subprocess.Popen] = {}
 _openai_stopped: set[str] = set()
+_openai_models_notified: dict[str, str] = {}
 
 
 def _openai_turn_lock(thread_ts: str) -> threading.Lock:
@@ -802,7 +807,9 @@ def _post_skill_notice(session: LiveSession, skill: str, args_str: str) -> None:
         logger.warning(f"Failed to post skill notice: {e}")
 
 
-def _post_model_notice(session: LiveSession, model: str, prev: str) -> None:
+def _post_model_notice_to_thread(
+    channel: str, thread_ts: str, model: str, prev: str
+) -> None:
     """Post a small grey context-block notice naming the serving model.
 
     `model` comes from message.model on the assistant event — the API's report
@@ -810,16 +817,24 @@ def _post_model_notice(session: LiveSession, model: str, prev: str) -> None:
     silent fallbacks (e.g. opus-5 → opus-4-8). Posted once per session and
     again only if the served model ever changes.
     """
+    note = model_notice_text(model, prev)
+    if note is None:
+        return
     try:
-        note = f"model: {model}" if not prev else f"model changed: {prev} → {model}"
         slack_client.chat_postMessage(
-            channel=session.channel, thread_ts=session.thread_ts,
+            channel=channel, thread_ts=thread_ts,
             text=note,
             blocks=[{"type": "context", "elements": [
                 {"type": "mrkdwn", "text": f":robot_face: _{note}_"}]}],
         )
     except Exception as e:
         logger.warning(f"Failed to post model notice: {e}")
+
+
+def _post_model_notice(session: LiveSession, model: str, prev: str) -> None:
+    _post_model_notice_to_thread(
+        session.channel, session.thread_ts, model, prev
+    )
 
 
 def _track_model(session: LiveSession, data: dict) -> None:
@@ -830,9 +845,19 @@ def _track_model(session: LiveSession, data: dict) -> None:
     if data.get("parent_tool_use_id"):
         return
     model = data.get("message", {}).get("model") or ""
-    if model and model != session.model_notified:
+    if model_notice_text(model, session.model_notified) is not None:
         _post_model_notice(session, model, session.model_notified)
         session.model_notified = model
+
+
+def _track_openai_model(channel: str, thread_ts: str, model: str) -> None:
+    """Announce the serving Codex model once per Slack thread."""
+    with _live_sessions_lock:
+        previous = _openai_models_notified.get(thread_ts, "")
+        if model_notice_text(model, previous) is None:
+            return
+        _openai_models_notified[thread_ts] = model
+    _post_model_notice_to_thread(channel, thread_ts, model, previous)
 
 
 def _track_context(session: LiveSession, data: dict) -> None:
@@ -1797,6 +1822,8 @@ def _run_openai_fallback(
             workspace.escalation_attempt_file.unlink()
         except OSError:
             pass
+    if not stopped and not result.error:
+        _track_openai_model(channel, thread_ts, policy.fallback_model)
     if stopped:
         pass
     elif delivered:

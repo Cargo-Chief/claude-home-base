@@ -20,6 +20,15 @@ def is_claude_limit_notice(text: str) -> bool:
     return CLAUDE_LIMIT_RE.search(text) is not None
 
 
+def model_notice_text(model: str, previous: str = "") -> str | None:
+    """Build truthful model attribution, excluding CLI synthetic envelopes."""
+    if not model or model == "<synthetic>" or model == previous:
+        return None
+    if previous:
+        return f"model changed: {previous} → {model}"
+    return f"model: {model}"
+
+
 @dataclass
 class CodexTurnResult:
     session_id: str | None = None
