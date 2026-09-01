@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 
 from slack_prompting import (
-    contains_escalation_file_write,
+    contains_private_escalation_action,
     needs_relevance_prefix,
     relevance_prefix,
 )
@@ -13,14 +13,42 @@ class RelevancePrefixTests(unittest.TestCase):
     def test_detects_only_the_designated_escalation_file_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "escalation.txt"
+            transport = Path(tmp) / "bot.py"
             content = [{
                 "type": "tool_use",
                 "name": "Write",
                 "input": {"file_path": str(target), "content": "sensitive"},
             }]
-            self.assertTrue(contains_escalation_file_write(content, target))
-            self.assertFalse(contains_escalation_file_write(
-                content, Path(tmp) / "ordinary.txt"
+            python = Path(tmp) / "venv" / "bin" / "python"
+            self.assertTrue(contains_private_escalation_action(
+                content, target, python, transport
+            ))
+            self.assertFalse(contains_private_escalation_action(
+                content, Path(tmp) / "ordinary.txt", python, transport
+            ))
+
+    def test_detects_only_exact_no_argument_escalation_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "escalation.txt"
+            transport = Path(tmp) / "bot.py"
+            python = Path(tmp) / "venv" / "bin" / "python"
+
+            def content(command):
+                return [{"type": "tool_use", "name": "Bash", "input": {"command": command}}]
+
+            exact = f"{python} {transport} --escalate"
+            self.assertTrue(contains_private_escalation_action(
+                content(exact), target, python, transport
+            ))
+            self.assertFalse(contains_private_escalation_action(
+                content(exact + " extra"), target, python, transport
+            ))
+            self.assertFalse(contains_private_escalation_action(
+                content(f"echo {transport} --escalate"), target, python, transport
+            ))
+            self.assertFalse(contains_private_escalation_action(
+                content(f"{python} {Path(tmp) / 'other.py'} --escalate"),
+                target, python, transport
             ))
 
     def test_explicit_app_mention_bypasses_model_relevance_filter(self):

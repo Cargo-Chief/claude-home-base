@@ -69,7 +69,7 @@ from cargo_chief_safety import (
     write_private_json,
 )
 from slack_prompting import (
-    contains_escalation_file_write,
+    contains_private_escalation_action,
     needs_relevance_prefix,
     relevance_prefix,
 )
@@ -963,8 +963,11 @@ def _reader_loop(session: LiveSession) -> None:
                 if data.get("parent_tool_use_id"):
                     continue
                 if (session.escalation_message_file
-                        and contains_escalation_file_write(
-                            content, session.escalation_message_file
+                        and contains_private_escalation_action(
+                            content,
+                            session.escalation_message_file,
+                            Path(sys.executable),
+                            SOURCE_DIR / "bot.py",
                         )):
                     session.private_escalation_pending = True
                     session.pre_tool_text.clear()
