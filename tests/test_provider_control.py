@@ -19,6 +19,7 @@ class ProviderControlTest(unittest.TestCase):
 
     def test_parses_only_exact_provider_commands(self):
         self.assertEqual("openai", parse_provider_command("provider openai"))
+        self.assertEqual("openai new", parse_provider_command("provider openai new"))
         self.assertEqual("claude", parse_provider_command("<@U123> provider claude"))
         self.assertEqual("auto", parse_provider_command("provider auto"))
         self.assertEqual("status", parse_provider_command("provider status"))
