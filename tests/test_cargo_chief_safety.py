@@ -579,6 +579,8 @@ class PreflightTest(unittest.TestCase):
             escalation_message_file=Path("/workspace/work/escalation.txt"),
             bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
             parking_claim_file=Path("/workspace/work/parking-claim.txt"),
+            delegation_request_file=Path("/workspace/work/delegation-request.json"),
+            implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
             model_prompt="room prompt",
             session_id="session-1",
         )
@@ -586,14 +588,7 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("--forward-subagent-text", command)
         self.assertNotIn("bypassPermissions", command)
         self.assertEqual("claude-opus-4-8[1m]", command[command.index("--model") + 1])
-        agents = json.loads(command[command.index("--agents") + 1])
-        self.assertEqual(APPROVED_DELEGATES, agents)
-        self.assertEqual("claude-opus-5[1m]", agents["cargo-chief-bounded"]["model"])
-        self.assertEqual("medium", agents["cargo-chief-bounded"]["effort"])
-        self.assertEqual("claude-sonnet-5", agents["cargo-chief-mechanical"]["model"])
-        self.assertEqual("high", agents["cargo-chief-mechanical"]["effort"])
-        self.assertEqual(["Read", "Grep", "Glob"], agents["cargo-chief-explore"]["tools"])
-        self.assertEqual("medium", agents["cargo-chief-explore"]["effort"])
+        self.assertNotIn("--agents", command)
         appended = command[command.index("--append-system-prompt") + 1]
         self.assertTrue(appended.startswith(
             "autonomous\n\nCargo Chief harness authority and routing:"
@@ -607,8 +602,10 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("/workspace/work/parking-claim.txt", appended)
         self.assertIn("/workspace/work/escalation.txt", appended)
         self.assertIn("/workspace/work/bundle-claim.txt", appended)
+        self.assertIn("/workspace/work/delegation-request.json", appended)
+        self.assertIn("/workspace/work/implementation-claim.txt", appended)
         self.assertNotIn("--channel D1", appended)
-        self.assertIn("Do not invoke built-in Explore, Plan, or general-purpose", appended)
+        self.assertIn("Do not invoke Agent, Task, Explore, Plan", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
 
@@ -618,6 +615,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("cargo-chief", command[command.index("--profile") + 1])
         self.assertEqual("gpt-5.6-sol", command[command.index("--model") + 1])
         self.assertIn('model_reasoning_effort="high"', command)
+        self.assertIn("features.multi_agent=false", command)
         self.assertIn("/workspace/work/thread", command)
         self.assertNotIn("danger-full-access", command)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
@@ -637,11 +635,12 @@ class PreflightTest(unittest.TestCase):
             escalation_message_file=Path("/workspace/escalation.txt"),
             bundle_claim_file=Path("/workspace/bundle.txt"),
             parking_claim_file=Path("/workspace/parking.txt"),
+            delegation_request_file=Path("/workspace/delegation-request.json"),
+            implementation_claim_file=Path("/workspace/implementation-claim.txt"),
         )
         self.assertTrue(prompt.startswith("autonomous\n\nCargo Chief harness"))
-        self.assertIn("gpt-5.6-sol at medium effort", prompt)
-        self.assertIn("gpt-5.6-terra at high", prompt)
-        self.assertIn("gpt-5.6-luna at medium", prompt)
+        self.assertIn("raw Codex collaboration is disabled", prompt)
+        self.assertIn("governed_delegation.py", prompt)
         self.assertTrue(prompt.endswith("authority envelope"))
 
     def test_codex_runtime_requires_cli_and_generated_profile(self):

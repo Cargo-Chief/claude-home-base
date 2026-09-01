@@ -33,6 +33,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -78,6 +79,7 @@ from openai_fallback import (
     model_notice_text,
     run_codex_turn,
 )
+from governed_delegation import budget_status, update_budget
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -716,6 +718,8 @@ def _spawn_claude_process(
     for stale_path in (
         escalation_message_file, escalation_receipt_file,
         workspace.escalation_attempt_file, workspace.parking_claim_file,
+        workspace.delegation_request_file, workspace.implementation_claim_file,
+        workspace.delegate_pid_file,
     ):
         try:
             stale_path.unlink()
@@ -729,6 +733,8 @@ def _spawn_claude_process(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=workspace.bundle_claim_file,
         parking_claim_file=workspace.parking_claim_file,
+        delegation_request_file=workspace.delegation_request_file,
+        implementation_claim_file=workspace.implementation_claim_file,
         model_prompt=model_prompt,
         session_id=session_id,
     )
@@ -751,6 +757,18 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
     proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
     proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
+    proc_env["CARGO_CHIEF_ROOT"] = str(policy.root)
+    proc_env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"] = str(workspace.delegation_request_file)
+    proc_env["CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE"] = str(workspace.implementation_claim_file)
+    proc_env["CARGO_CHIEF_DELEGATION_BUDGET_FILE"] = str(workspace.delegation_budget_file)
+    proc_env["CARGO_CHIEF_DELEGATE_PID_FILE"] = str(workspace.delegate_pid_file)
+    proc_env["CARGO_CHIEF_DELEGATE_VERIFICATION_FILE"] = str(workspace.delegate_verification_file)
+    proc_env["CARGO_CHIEF_AUDIT_LOG"] = str(AUDIT_LOG)
+    proc_env["CARGO_CHIEF_OWNER_PROVIDER"] = "claude"
+    proc_env["CARGO_CHIEF_OWNER_MODEL"] = policy.model
+    proc_env["CARGO_CHIEF_OWNER_EFFORT"] = policy.effort
+    proc_env["CARGO_CHIEF_CURRENT_USER"] = user_id
+    proc_env["CARGO_CHIEF_DELEGATE_TIMEOUT"] = str(CLAUDE_TIMEOUT)
     bundle = resolve_thread_bundle(workspace)
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
@@ -929,6 +947,12 @@ def _reader_loop(session: LiveSession) -> None:
                 if session.private_escalation_pending:
                     continue
 
+                if (session.workspace
+                        and session.workspace.delegate_verification_file.is_file()):
+                    # The delegate return is visible inside the owner context but may not reach
+                    # Slack until the owner records an independent verification.
+                    continue
+
                 _track_model(session, data)
                 _track_context(session, data)
                 has_tool_use = any(
@@ -1006,6 +1030,16 @@ def _reader_loop(session: LiveSession) -> None:
                                 session.user_id, session.channel, session.thread_ts,
                                 parking.kind, parking.path.relative_to(session.workspace.root),
                             )
+                verification_missing = bool(
+                    session.workspace
+                    and session.workspace.delegate_verification_file.is_file()
+                )
+                if verification_missing:
+                    audit_logger.warning(
+                        "DELEGATION_VERIFICATION | USER:%s | CHANNEL:%s | THREAD:%s "
+                        "| OWNER_VERIFY_TOOLS:0 | STATUS:missing",
+                        session.user_id, session.channel, session.thread_ts,
+                    )
                 sid = data.get("session_id")
                 if sid:
                     session.session_id = sid
@@ -1034,6 +1068,11 @@ def _reader_loop(session: LiveSession) -> None:
                     )
                     if session._on_text:
                         session._on_text(status)
+                elif verification_missing:
+                    if session._on_text:
+                        session._on_text(
+                            "Delegate result withheld: independent owner verification is missing."
+                        )
                 else:
                     for text in session.pre_tool_text:
                         if session._on_text:
@@ -1721,6 +1760,9 @@ def _run_openai_fallback(
         workspace.escalation_receipt_file,
         workspace.escalation_attempt_file,
         workspace.parking_claim_file,
+        workspace.delegation_request_file,
+        workspace.implementation_claim_file,
+        workspace.delegate_pid_file,
     ):
         try:
             stale_path.unlink()
@@ -1740,6 +1782,8 @@ def _run_openai_fallback(
         escalation_message_file=workspace.escalation_message_file,
         bundle_claim_file=workspace.bundle_claim_file,
         parking_claim_file=workspace.parking_claim_file,
+        delegation_request_file=workspace.delegation_request_file,
+        implementation_claim_file=workspace.implementation_claim_file,
     )
     proc_env = {**os.environ}
     proc_env.update({
@@ -1752,6 +1796,18 @@ def _run_openai_fallback(
         "CARGO_CHIEF_THREAD_WORK_DIR": str(workspace.path),
         "CARGO_CHIEF_BUNDLE_CLAIM_FILE": str(workspace.bundle_claim_file),
         "CARGO_CHIEF_PARKING_CLAIM_FILE": str(workspace.parking_claim_file),
+        "CARGO_CHIEF_ROOT": str(policy.root),
+        "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(workspace.delegation_request_file),
+        "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(workspace.implementation_claim_file),
+        "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(workspace.delegation_budget_file),
+        "CARGO_CHIEF_DELEGATE_PID_FILE": str(workspace.delegate_pid_file),
+        "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(workspace.delegate_verification_file),
+        "CARGO_CHIEF_AUDIT_LOG": str(AUDIT_LOG),
+        "CARGO_CHIEF_OWNER_PROVIDER": "openai",
+        "CARGO_CHIEF_OWNER_MODEL": policy.fallback_model,
+        "CARGO_CHIEF_OWNER_EFFORT": policy.fallback_effort,
+        "CARGO_CHIEF_CURRENT_USER": user_id,
+        "CARGO_CHIEF_DELEGATE_TIMEOUT": str(CLAUDE_TIMEOUT),
     })
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
@@ -1817,6 +1873,7 @@ def _run_openai_fallback(
 
     delivered = workspace.escalation_receipt_file.is_file()
     attempted = workspace.escalation_attempt_file.is_file()
+    verification_missing = workspace.delegate_verification_file.is_file()
     if attempted:
         try:
             workspace.escalation_attempt_file.unlink()
@@ -1843,6 +1900,13 @@ def _run_openai_fallback(
     elif result.error:
         logger.warning("OpenAI fallback turn failed in thread %s", thread_ts)
         on_text("OpenAI fallback could not complete this turn.")
+    elif verification_missing:
+        audit_logger.warning(
+            "DELEGATION_VERIFICATION | PROVIDER:openai | USER:%s | CHANNEL:%s | "
+            "THREAD:%s | OWNER_VERIFY_TOOLS:0 | STATUS:missing",
+            user_id, channel, thread_ts,
+        )
+        on_text("Delegate result withheld: independent owner verification is missing.")
     else:
         for text_block in result.texts:
             on_text(text_block)
@@ -2201,6 +2265,22 @@ def _maybe_stop_from_message(event: dict) -> bool:
     if text not in ("stop", "esc"):
         return False
     thread_ts = event.get("thread_ts") or event.get("ts")
+    delegate_stopped = False
+    try:
+        policy = resolve_room_policy(
+            _load_model_config(), event.get("channel", ""), event.get("user", "")
+        )
+        workspace = prepare_thread_workspace(
+            policy.root, channel=event.get("channel", ""), thread=thread_ts
+        )
+        if workspace.delegate_pid_file.is_file() and not workspace.delegate_pid_file.is_symlink():
+            pid_text = workspace.delegate_pid_file.read_text(encoding="utf-8").strip()
+            if pid_text.isdigit() and int(pid_text) > 1:
+                os.kill(int(pid_text), signal.SIGTERM)
+                delegate_stopped = True
+            workspace.delegate_pid_file.unlink(missing_ok=True)
+    except (OSError, SafetyError):
+        pass
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
         openai_process = _openai_processes.get(thread_ts)
@@ -2220,6 +2300,12 @@ def _maybe_stop_from_message(event: dict) -> bool:
         )
         return True
     if not session or session.proc.poll() is not None or not session.turn_lock.locked():
+        if delegate_stopped:
+            slack_client.chat_postMessage(
+                channel=event.get("channel"), thread_ts=thread_ts,
+                text="Stopped: stopped the active governed delegate",
+            )
+            return True
         return False  # nothing running here — treat as a normal message
 
     def _do_stop():
@@ -2237,6 +2323,60 @@ def _maybe_stop_from_message(event: dict) -> bool:
             pass
 
     threading.Thread(target=_do_stop, daemon=True).start()
+    return True
+
+
+def _maybe_delegation_budget_command(event: dict) -> bool:
+    """Handle exact per-thread budget controls from a named approver."""
+    text = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip().lower()
+    match = re.fullmatch(r"delegation budget (status|reset|set\s+([1-9][0-9]*))", text)
+    if not match:
+        return False
+    user_id = event.get("user", "")
+    try:
+        authority = AuthorityPolicy.from_env()
+        if not authority.can_approve(user_id):
+            raise SafetyError("named approver required")
+        channel = event.get("channel", "")
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        policy = resolve_room_policy(_load_model_config(), channel, user_id)
+        workspace = prepare_thread_workspace(
+            policy.root, channel=channel, thread=thread_ts
+        )
+        action = match.group(1)
+        if action == "status":
+            state = budget_status(workspace.delegation_budget_file)
+        elif action == "reset":
+            state = update_budget(workspace.delegation_budget_file, reset=True)
+        else:
+            state = update_budget(
+                workspace.delegation_budget_file, limit=int(match.group(2))
+            )
+        if state["used"] < state["limit"]:
+            marker = workspace.delegate_verification_file
+            try:
+                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                if metadata.get("status") == "budget_exhausted":
+                    marker.unlink()
+            except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError):
+                pass
+    except (SafetyError, ValueError, OSError) as exc:
+        slack_client.chat_postMessage(
+            channel=event.get("channel"),
+            thread_ts=event.get("thread_ts") or event.get("ts"),
+            text=f"Delegation budget refused: {exc}",
+        )
+        return True
+    slack_client.chat_postMessage(
+        channel=event.get("channel"),
+        thread_ts=event.get("thread_ts") or event.get("ts"),
+        text=f"Delegation budget: {state['used']}/{state['limit']} tokens used",
+    )
+    audit_logger.info(format_audit_metadata(
+        "DELEGATION_BUDGET", user=user_id, channel=event.get("channel", ""),
+        thread=event.get("thread_ts") or event.get("ts") or "unknown",
+        action=match.group(1).split()[0], used=state["used"], limit=state["limit"],
+    ))
     return True
 
 
@@ -2270,6 +2410,8 @@ def handle_message(event, say):
     # In-thread Esc: bare "stop" while a turn is running interrupts it
     if _maybe_stop_from_message(event):
         return
+    if _maybe_delegation_budget_command(event):
+        return
 
     # Process async — return immediately so Slack gets its 200
     threading.Thread(target=process_message_async, args=(event,), daemon=True).start()
@@ -2292,6 +2434,8 @@ def handle_mention(event, say):
 
     # "@bot stop" in a thread = in-thread Esc
     if _maybe_stop_from_message(event):
+        return
+    if _maybe_delegation_budget_command(event):
         return
 
     threading.Thread(target=process_message_async, args=(event,), daemon=True).start()
