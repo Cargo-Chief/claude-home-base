@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from codex_delegation import CodexDelegateResult
+
 from governed_delegation import (
     _append_audit,
     DEFAULT_TOKEN_BUDGET,
@@ -22,7 +24,42 @@ from governed_delegation import (
     validate_implementation_plan,
     verify_from_environment,
 )
-from openai_fallback import CodexTurnResult
+
+
+class _Input:
+    def __init__(self):
+        self.value = ""
+
+    def write(self, value):
+        self.value += value
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _StreamProcess:
+    def __init__(self, lines):
+        self.stdin = _Input()
+        self.stdout = iter(lines)
+        self.returncode = None
+        self.pid = 123
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
 
 
 PLAN = """---
@@ -145,23 +182,73 @@ class GovernedDelegationTest(unittest.TestCase):
 
     @patch("governed_delegation.subprocess.Popen")
     def test_claude_prompt_uses_stdin_and_usage_is_metered(self, popen):
-        process = popen.return_value
-        process.returncode = 0
-        process.communicate.return_value = (
-            json.dumps({"result": "evidence", "usage": {"input_tokens": 8, "output_tokens": 2}}),
-            "ignored stderr",
-        )
+        process = _StreamProcess([
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "m1", "usage": {"input_tokens": 8, "output_tokens": 2},
+                            "content": [{"type": "text", "text": "evidence"}]},
+            }) + "\n",
+            json.dumps({"type": "result", "result": "evidence"}) + "\n",
+        ])
+        popen.return_value = process
         seen = []
         result = run_claude_delegate(
-            ["claude", "-p", "--output-format", "json"], "private prompt",
-            cwd=str(self.work), env={}, timeout=10,
+            ["claude", "-p", "--output-format", "stream-json"], "private prompt",
+            cwd=str(self.work), env={}, token_limit=100, timeout=10,
             on_process=lambda value: seen.append(value),
         )
         self.assertEqual("evidence", result.text)
         self.assertEqual(10, result.tokens)
-        process.communicate.assert_called_once_with("private prompt", timeout=10)
+        self.assertEqual("private prompt", process.stdin.value)
         self.assertNotIn("private prompt", popen.call_args.args[0])
         self.assertEqual([process, None], seen)
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_stops_and_withholds_at_incremental_limit(self, popen):
+        process = _StreamProcess([
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "m1", "usage": {"input_tokens": 8, "output_tokens": 3},
+                            "content": [{"type": "tool_use", "name": "Write"}]},
+            }) + "\n",
+            json.dumps({"type": "result", "result": "must not surface"}) + "\n",
+        ])
+        popen.return_value = process
+        result = run_claude_delegate(
+            ["claude", "-p", "--output-format", "stream-json"], "work",
+            cwd=str(self.work), env={}, token_limit=10, timeout=10,
+            on_process=lambda _value: None,
+        )
+        self.assertTrue(result.budget_exhausted)
+        self.assertEqual("", result.text)
+        self.assertEqual(11, result.tokens)
+        self.assertEqual(-9, process.returncode)
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_accumulates_each_message_usage_once(self, popen):
+        first = {
+            "type": "assistant",
+            "message": {"id": "m1", "usage": {"input_tokens": 8, "output_tokens": 2},
+                        "content": []},
+        }
+        process = _StreamProcess([
+            json.dumps(first) + "\n",
+            json.dumps(first) + "\n",
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "m2", "usage": {"input_tokens": 5, "output_tokens": 1},
+                            "content": []},
+            }) + "\n",
+            json.dumps({"type": "result", "result": "done"}) + "\n",
+        ])
+        popen.return_value = process
+        result = run_claude_delegate(
+            ["claude", "-p", "--output-format", "stream-json"], "work",
+            cwd=str(self.work), env={}, token_limit=20, timeout=10,
+            on_process=lambda _value: None,
+        )
+        self.assertEqual("done", result.text)
+        self.assertEqual(16, result.tokens)
 
     def test_refuses_concurrent_delegate_before_consuming_request(self):
         request = self.work / "delegation-request.json"
@@ -176,19 +263,18 @@ class GovernedDelegationTest(unittest.TestCase):
                 launch_from_environment(env)
         self.assertTrue(request.exists())
 
-    @patch("governed_delegation.run_codex_turn")
+    @patch("governed_delegation.run_codex_delegate")
     def test_openai_launch_records_budget_and_content_free_audit(self, run):
-        run.return_value = CodexTurnResult(
-            session_id="S", texts=["delegate evidence"],
-            usage={"input_tokens": 30, "output_tokens": 5},
-        )
+        run.return_value = CodexDelegateResult(texts=["delegate evidence"], tokens=35)
         request = self.work / "delegation-request.json"
         request.write_text(json.dumps({"tier": "bounded", "prompt": "private brief", "mutation": False}))
+        budget = self.work / "budget.json"
+        update_budget(budget, add_tokens=40)
         env = {
             "CARGO_CHIEF_ROOT": str(self.root),
             "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(request),
             "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(self.work / "claim.txt"),
-            "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(self.work / "budget.json"),
+            "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(budget),
             "CARGO_CHIEF_DELEGATE_PID_FILE": str(self.work / "pid"),
             "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
             "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
@@ -203,14 +289,15 @@ class GovernedDelegationTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, launch_from_environment(env))
         self.assertEqual("delegate evidence\n", output.getvalue())
-        self.assertEqual(35, budget_status(self.work / "budget.json")["used"])
+        self.assertEqual(75, budget_status(budget)["used"])
         audit = (self.work / "audit.log").read_text()
         self.assertIn("MODEL:gpt-5.6-sol", audit)
         self.assertIn("TOKENS:35", audit)
         self.assertNotIn("private brief", audit)
         self.assertNotIn("delegate evidence", audit)
-        self.assertIn("--sandbox", run.call_args.args[0])
-        self.assertIn("read-only", run.call_args.args[0])
+        self.assertTrue(run.call_args.kwargs["read_only"])
+        self.assertEqual(DEFAULT_TOKEN_BUDGET - 40, run.call_args.kwargs["token_limit"])
+        self.assertIn("app-server", run.call_args.args[0])
         self.assertTrue((self.work / "verification.json").is_file())
         verify_output = io.StringIO()
         with contextlib.redirect_stdout(verify_output):
@@ -219,10 +306,10 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertFalse((self.work / "verification.json").exists())
         self.assertIn("OWNER_VERIFY_TOOLS:1", (self.work / "audit.log").read_text())
 
-    @patch("governed_delegation.run_codex_turn")
+    @patch("governed_delegation.run_codex_delegate")
     def test_over_budget_return_is_withheld(self, run):
-        run.return_value = CodexTurnResult(
-            texts=["must not surface"], usage={"total_tokens": 10}
+        run.return_value = CodexDelegateResult(
+            tokens=10, budget_exhausted=True,
         )
         budget = self.work / "budget.json"
         update_budget(budget, limit=10)
