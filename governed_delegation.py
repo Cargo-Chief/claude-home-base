@@ -272,6 +272,22 @@ def delegation_audit_path(root: Path) -> Path:
     return path
 
 
+def delegation_verification_status(path: Path) -> str | None:
+    """Read only the fail-closed status of a pending delegation marker."""
+    try:
+        if not path.exists() and not path.is_symlink():
+            return None
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+            return "invalid"
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "invalid"
+    if not isinstance(metadata, dict):
+        return "invalid"
+    status = metadata.get("status")
+    return status if status in {"pending", "budget_exhausted"} else "invalid"
+
+
 def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     env = dict(env or os.environ)
     required = (
