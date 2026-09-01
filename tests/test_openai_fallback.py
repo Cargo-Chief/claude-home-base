@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from openai_fallback import (
+    fallback_error_kind,
     is_claude_limit_notice,
     model_notice_text,
     parse_codex_events,
@@ -12,6 +13,11 @@ from openai_fallback import (
 
 
 class OpenAIFallbackTest(unittest.TestCase):
+    def test_fallback_errors_have_content_free_log_categories(self):
+        self.assertEqual("timeout", fallback_error_kind("Codex fallback timed out"))
+        self.assertEqual("start", fallback_error_kind("Codex fallback could not start"))
+        self.assertEqual("provider", fallback_error_kind("sensitive provider detail"))
+
     def test_recognizes_claude_limit_notices(self):
         for notice in (
             "You've hit your limit · resets 4pm (UTC)",

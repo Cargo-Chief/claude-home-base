@@ -1,9 +1,22 @@
 import unittest
 
-from provider_control import parse_provider_command, use_openai_provider
+from provider_control import (
+    format_provider_audit,
+    parse_provider_command,
+    use_openai_provider,
+)
 
 
 class ProviderControlTest(unittest.TestCase):
+    def test_formats_content_free_provider_audit(self):
+        self.assertEqual(
+            "PROVIDER_CONTROL | USER:U1 | CHANNEL:C1 | THREAD:T1 | ACTION:openai | PROVIDER:openai",
+            format_provider_audit(
+                user="U1", channel="C1", thread="T1",
+                action="openai", provider="openai",
+            ),
+        )
+
     def test_parses_only_exact_provider_commands(self):
         self.assertEqual("openai", parse_provider_command("provider openai"))
         self.assertEqual("claude", parse_provider_command("<@U123> provider claude"))

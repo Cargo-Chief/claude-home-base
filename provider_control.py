@@ -24,3 +24,13 @@ def use_openai_provider(
     if override == "claude":
         return False
     return limit_paused or has_openai_session
+
+
+def format_provider_audit(
+    *, user: str, channel: str, thread: str, action: str, provider: str,
+) -> str:
+    """Build a content-free provider-control audit record."""
+    return (
+        f"PROVIDER_CONTROL | USER:{user} | CHANNEL:{channel} | THREAD:{thread} "
+        f"| ACTION:{action} | PROVIDER:{provider}"
+    )

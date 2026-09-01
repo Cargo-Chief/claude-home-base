@@ -20,6 +20,14 @@ def is_claude_limit_notice(text: str) -> bool:
     return CLAUDE_LIMIT_RE.search(text) is not None
 
 
+def fallback_error_kind(error: str | None) -> str:
+    """Return a content-free failure category safe for service logs."""
+    return {
+        "Codex fallback timed out": "timeout",
+        "Codex fallback could not start": "start",
+    }.get(error, "provider")
+
+
 def model_notice_text(model: str, previous: str = "") -> str | None:
     """Build truthful model attribution, excluding CLI synthetic envelopes."""
     if not model or model == "<synthetic>" or model == previous:
