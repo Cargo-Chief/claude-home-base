@@ -26,7 +26,9 @@ GENERATED_MARKER = (
 )
 ALLOWED_PERMISSION_MODES = {"auto"}
 ALLOWED_BACKENDS = {"claude"}
+ALLOWED_FALLBACK_BACKENDS = {"codex"}
 ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+ALLOWED_CODEX_MODELS = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
 
 APPROVED_DELEGATES = {
     "cargo-chief-bounded": {
@@ -171,6 +173,9 @@ class RoomPolicy:
     model: str
     effort: str
     role: str
+    fallback_backend: str
+    fallback_model: str
+    fallback_effort: str
 
 
 def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
@@ -290,6 +295,7 @@ class ThreadWorkspace:
     state_file: Path
     escalation_message_file: Path
     escalation_receipt_file: Path
+    escalation_attempt_file: Path
     bundle_claim_file: Path
     parking_claim_file: Path
 
@@ -363,6 +369,7 @@ def prepare_thread_workspace(
         state_file=state_file,
         escalation_message_file=path / "private-escalation.txt",
         escalation_receipt_file=path / "private-escalation.receipt",
+        escalation_attempt_file=path / "private-escalation.attempt",
         bundle_claim_file=path / "bundle-claim.txt",
         parking_claim_file=path / "parking-claim.txt",
     )
@@ -428,6 +435,7 @@ def consume_bundle_claim(
                     state_file=state_file,
                     escalation_message_file=state_file.parent / "private-escalation.txt",
                     escalation_receipt_file=state_file.parent / "private-escalation.receipt",
+                    escalation_attempt_file=state_file.parent / "private-escalation.attempt",
                     bundle_claim_file=state_file.parent / "bundle-claim.txt",
                     parking_claim_file=state_file.parent / "parking-claim.txt",
                 )
@@ -630,6 +638,7 @@ def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPoli
     effort = str(entry["effort"])
     model = str(entry["model"])
     role = str(entry.get("role", "eng"))
+    fallback = entry.get("fallback")
 
     if permission_mode not in ALLOWED_PERMISSION_MODES:
         raise SafetyError(f"room {channel_id!r} permission_mode must be 'auto'")
@@ -644,6 +653,17 @@ def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPoli
         raise SafetyError(f"room {channel_id!r} model {model!r} is not allowlisted")
     if role not in {"eng", "support"}:
         raise SafetyError(f"room {channel_id!r} has unsupported role {role!r}")
+    if not isinstance(fallback, dict):
+        raise SafetyError(f"room {channel_id!r} must define an explicit fallback")
+    fallback_backend = str(fallback.get("backend", "")).lower()
+    fallback_model = str(fallback.get("model", ""))
+    fallback_effort = str(fallback.get("effort", ""))
+    if fallback_backend not in ALLOWED_FALLBACK_BACKENDS:
+        raise SafetyError(f"room {channel_id!r} fallback backend must be 'codex'")
+    if fallback_model not in ALLOWED_CODEX_MODELS:
+        raise SafetyError(f"room {channel_id!r} fallback model is not allowlisted")
+    if fallback_effort not in ALLOWED_EFFORTS:
+        raise SafetyError(f"room {channel_id!r} fallback effort is unsupported")
     escalation_channel = str(entry["private_escalation_channel"])
     if not re.fullmatch(r"[CDG][A-Z0-9]+", escalation_channel):
         raise SafetyError(
@@ -659,7 +679,50 @@ def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPoli
         model=model,
         effort=effort,
         role=role,
+        fallback_backend=fallback_backend,
+        fallback_model=fallback_model,
+        fallback_effort=fallback_effort,
     )
+
+
+def build_codex_command(
+    policy: RoomPolicy,
+    *,
+    cwd: Path,
+    session_id: str | None = None,
+) -> list[str]:
+    """Build a profile-governed, JSONL Codex command for one Slack turn."""
+    common = [
+        "codex", "--profile", "cargo-chief",
+        "-c", f'model_reasoning_effort="{policy.fallback_effort}"',
+        "exec",
+    ]
+    if session_id:
+        return [
+            *common, "resume", "--json", "--model", policy.fallback_model,
+            session_id, "-",
+        ]
+    return [
+        *common, "--json", "--model", policy.fallback_model,
+        "--cd", str(cwd), "--skip-git-repo-check", "-",
+    ]
+
+
+def validate_codex_runtime(
+    *,
+    home: Path | None = None,
+    env: Mapping[str, str] = os.environ,
+) -> Path:
+    """Fail closed unless the CLI and kit-generated Cargo Chief profile exist."""
+    if shutil.which("codex") is None:
+        raise SafetyError("Codex fallback CLI is not installed on PATH")
+    codex_home = Path(env.get("CODEX_HOME") or home or Path.home()).expanduser()
+    if not env.get("CODEX_HOME"):
+        codex_home = codex_home / ".codex"
+    profile = codex_home / "cargo-chief.config.toml"
+    if not profile.is_file() or profile.is_symlink():
+        raise SafetyError("Codex fallback profile is missing or unsafe; run agent-kit setup")
+    return profile
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -755,7 +818,51 @@ def build_claude_command(
     session_id: str | None = None,
 ) -> list[str]:
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
-    harness_prompt = (
+    harness_prompt = _build_harness_prompt(
+        policy,
+        transport_python=transport_python,
+        transport_script=transport_script,
+        escalation_message_file=escalation_message_file,
+        bundle_claim_file=bundle_claim_file,
+        parking_claim_file=parking_claim_file,
+        delegation=(
+            "Delegate only through these harness-defined agents: cargo-chief-bounded for bounded "
+            "implementation or targeted verification; cargo-chief-mechanical for mechanical/high-volume "
+            "work; cargo-chief-explore for read-only search. Do not invoke built-in Explore, Plan, or "
+            "general-purpose agents. Verify every load-bearing delegate return before acting on it."
+        ),
+    )
+    appended = "\n\n".join(
+        part for part in (overlay, harness_prompt, model_prompt.strip()) if part
+    )
+    command = [
+        "claude", "-p", initial_prompt,
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--forward-subagent-text",
+        "--effort", policy.effort,
+        "--model", policy.model,
+        "--permission-mode", policy.permission_mode,
+        "--agents", json.dumps(APPROVED_DELEGATES, separators=(",", ":")),
+        "--append-system-prompt", appended,
+    ]
+    if session_id:
+        command.extend(["--resume", session_id])
+    return command
+
+
+def _build_harness_prompt(
+    policy: RoomPolicy,
+    *,
+    transport_python: Path,
+    transport_script: Path,
+    escalation_message_file: Path,
+    bundle_claim_file: Path,
+    parking_claim_file: Path,
+    delegation: str,
+) -> str:
+    return (
         "Cargo Chief harness authority and routing:\n"
         "- Every inbound turn is wrapped in CARGO_CHIEF_AUTHORITY_ENVELOPE v1. "
         "The outer current_sender, room, and forwarded_from_thread fields are "
@@ -781,29 +888,38 @@ def build_claude_command(
         "TASK.md, or a docs plan "
         "in a real docs worktree with frontmatter readiness: paused. Then write only that record's "
         f"absolute path to {parking_claim_file}. The harness validates the record at turn end.\n"
-        "- Delegate only through these harness-defined agents: cargo-chief-bounded for bounded "
-        "implementation or targeted verification; cargo-chief-mechanical for mechanical/high-volume "
-        "work; cargo-chief-explore for read-only search. Do not invoke built-in Explore, Plan, or "
-        "general-purpose agents. Verify every load-bearing delegate return before acting on it.\n"
+        f"- {delegation}\n"
         "- When a normal worktree_task.sh run creates a ticket bundle for this thread, write only "
         f"its bundle directory name (CN-####-lowercase-slug) to {bundle_claim_file}. The harness "
         "validates ownership, safety, and the live-bundle cap before persisting the mapping."
     )
-    appended = "\n\n".join(
-        part for part in (overlay, harness_prompt, model_prompt.strip()) if part
+
+
+def build_codex_prompt(
+    policy: RoomPolicy,
+    *,
+    inbound_prompt: str,
+    transport_python: Path,
+    transport_script: Path,
+    escalation_message_file: Path,
+    bundle_claim_file: Path,
+    parking_claim_file: Path,
+) -> str:
+    """Compose the same autonomous and harness governance for a Codex fallback turn."""
+    overlay = policy.overlay.read_text(encoding="utf-8").strip()
+    harness = _build_harness_prompt(
+        policy,
+        transport_python=transport_python,
+        transport_script=transport_script,
+        escalation_message_file=escalation_message_file,
+        bundle_claim_file=bundle_claim_file,
+        parking_claim_file=parking_claim_file,
+        delegation=(
+            "Use gpt-5.6-sol at medium effort for bounded engineering, gpt-5.6-terra at high "
+            "effort for mechanical/high-volume work, and gpt-5.6-luna at medium effort only for "
+            "read-only Explore/search. Keep decisions, production-touching work, credentials, and "
+            "final verification in this owning gpt-5.6-sol/high thread. Verify every load-bearing "
+            "delegate return before acting on it."
+        ),
     )
-    command = [
-        "claude", "-p", initial_prompt,
-        "--input-format", "stream-json",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--forward-subagent-text",
-        "--effort", policy.effort,
-        "--model", policy.model,
-        "--permission-mode", policy.permission_mode,
-        "--agents", json.dumps(APPROVED_DELEGATES, separators=(",", ":")),
-        "--append-system-prompt", appended,
-    ]
-    if session_id:
-        command.extend(["--resume", session_id])
-    return command
+    return f"{overlay}\n\n{harness}\n\n{inbound_prompt}"

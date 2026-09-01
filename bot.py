@@ -49,6 +49,8 @@ from cargo_chief_safety import (
     SafetyError,
     build_authority_envelope,
     build_claude_command,
+    build_codex_command,
+    build_codex_prompt,
     cleanup_thread_workspaces,
     consume_bundle_claim,
     consume_parking_claim,
@@ -61,6 +63,7 @@ from cargo_chief_safety import (
     resolve_thread_bundle,
     ThreadWorkspace,
     validate_secret_env_path,
+    validate_codex_runtime,
     write_private_json,
 )
 from slack_prompting import (
@@ -70,6 +73,7 @@ from slack_prompting import (
 )
 from http_server import serve_http
 from delegation_observability import DelegationTracker, format_delegation_audit
+from openai_fallback import run_codex_turn
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -394,6 +398,7 @@ def _fetch_thread_context(channel: str, thread_ts: str, current_msg_ts: str) -> 
 # ---------------------------------------------------------------------------
 
 SESSION_FILE = STATE_DIR / "sessions.json"
+OPENAI_SESSION_FILE = STATE_DIR / "openai-sessions.json"
 MAX_SESSIONS = 200
 _session_file_lock = threading.Lock()
 
@@ -417,6 +422,39 @@ def _save_session(thread_ts: str, session_id: str) -> None:
 
 def _get_session(thread_ts: str) -> str | None:
     return _load_sessions().get(thread_ts)
+
+
+def _load_openai_sessions() -> dict:
+    try:
+        return json.loads(OPENAI_SESSION_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_openai_session(thread_ts: str, session_id: str, cwd: Path) -> None:
+    with _session_file_lock:
+        sessions = _load_openai_sessions()
+        sessions[thread_ts] = {"session_id": session_id, "cwd": str(cwd.resolve())}
+        if len(sessions) > MAX_SESSIONS:
+            for key in sorted(sessions.keys())[:-MAX_SESSIONS]:
+                del sessions[key]
+        write_private_json(OPENAI_SESSION_FILE, sessions)
+
+
+def _get_openai_session(thread_ts: str) -> str | None:
+    value = _load_openai_sessions().get(thread_ts)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("session_id"), str):
+        return value["session_id"]
+    return None
+
+
+def _get_openai_session_cwd(thread_ts: str) -> Path | None:
+    value = _load_openai_sessions().get(thread_ts)
+    if isinstance(value, dict) and isinstance(value.get("cwd"), str):
+        return Path(value["cwd"]).resolve()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +577,14 @@ class LiveSession:
 # thread_ts → LiveSession
 _live_sessions: dict[str, LiveSession] = {}
 _live_sessions_lock = threading.Lock()
+_openai_turn_locks: dict[str, threading.Lock] = {}
+_openai_processes: dict[str, subprocess.Popen] = {}
+_openai_stopped: set[str] = set()
+
+
+def _openai_turn_lock(thread_ts: str) -> threading.Lock:
+    with _live_sessions_lock:
+        return _openai_turn_locks.setdefault(thread_ts, threading.Lock())
 
 # thread_ts → count of inbound messages seen in multi-person spaces (public
 # channels + group DMs). Used to re-inject the relevance reminder every
@@ -550,9 +596,10 @@ REMINDER_EVERY = 10
 # Usage-limit pause: when the account is out of usage, the Claude CLI itself
 # synthesizes an assistant message like "You've hit your limit · resets 4pm
 # (UTC)" — the model never runs, so the SKIP relevance filter can't suppress
-# it. We intercept that text before it reaches Slack, announce the outage
-# once, and stop forwarding inbound messages until the reset time. Limits are
-# account-wide, so the pause is a single global, not per-thread.
+# it. We intercept that text before it reaches Slack and route new work through
+# the explicit OpenAI fallback until the reset time. Limits are account-wide,
+# so the pause is a single global, while successful fallback sessions remain
+# pinned per thread.
 LIMIT_RE = re.compile(r"You've hit your (usage )?limit", re.I)
 LIMIT_RESET_RE = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)", re.I)
 LIMIT_PAUSE_FALLBACK = 1800  # seconds, if the reset time can't be parsed
@@ -663,7 +710,8 @@ def _spawn_claude_process(
     escalation_message_file = workspace.escalation_message_file
     escalation_receipt_file = workspace.escalation_receipt_file
     for stale_path in (
-        escalation_message_file, escalation_receipt_file, workspace.parking_claim_file
+        escalation_message_file, escalation_receipt_file,
+        workspace.escalation_attempt_file, workspace.parking_claim_file,
     ):
         try:
             stale_path.unlink()
@@ -695,6 +743,7 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_ESCALATION_CHANNEL"] = policy.escalation_channel
     proc_env["CARGO_CHIEF_ESCALATION_MESSAGE_FILE"] = str(escalation_message_file)
     proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
+    proc_env["CARGO_CHIEF_ESCALATION_ATTEMPT_FILE"] = str(workspace.escalation_attempt_file)
     proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
     proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
     proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
@@ -1624,10 +1673,168 @@ def find_channel(query: str, limit: int = 25) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _run_openai_fallback(
+    *,
+    policy,
+    channel: str,
+    thread_ts: str,
+    user_id: str,
+    prompt: str,
+    on_text,
+) -> str | None:
+    """Run one profile-governed Codex turn and apply the shared harness claims."""
+    validate_codex_runtime()
+    for warning in preflight_room(policy):
+        logger.warning(f"Cargo Chief fallback preflight: {warning}")
+    workspace = prepare_thread_workspace(
+        policy.root,
+        channel=channel,
+        thread=thread_ts,
+        session_id=_get_openai_session(thread_ts),
+    )
+    for stale_path in (
+        workspace.escalation_message_file,
+        workspace.escalation_receipt_file,
+        workspace.escalation_attempt_file,
+        workspace.parking_claim_file,
+    ):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
+    bundle = resolve_thread_bundle(workspace)
+    cwd = bundle or workspace.path
+    saved_session_id = _get_openai_session(thread_ts)
+    saved_cwd = _get_openai_session_cwd(thread_ts)
+    session_id = saved_session_id if saved_cwd == cwd.resolve() else None
+    command = build_codex_command(policy, cwd=cwd, session_id=session_id)
+    governed_prompt = build_codex_prompt(
+        policy,
+        inbound_prompt=prompt,
+        transport_python=Path(sys.executable),
+        transport_script=SOURCE_DIR / "bot.py",
+        escalation_message_file=workspace.escalation_message_file,
+        bundle_claim_file=workspace.bundle_claim_file,
+        parking_claim_file=workspace.parking_claim_file,
+    )
+    proc_env = {**os.environ}
+    proc_env.update({
+        "CLAUDE_THREAD_TS": thread_ts,
+        "CLAUDE_CHANNEL_ID": channel,
+        "CARGO_CHIEF_ESCALATION_CHANNEL": policy.escalation_channel,
+        "CARGO_CHIEF_ESCALATION_MESSAGE_FILE": str(workspace.escalation_message_file),
+        "CARGO_CHIEF_ESCALATION_RECEIPT_FILE": str(workspace.escalation_receipt_file),
+        "CARGO_CHIEF_ESCALATION_ATTEMPT_FILE": str(workspace.escalation_attempt_file),
+        "CARGO_CHIEF_THREAD_WORK_DIR": str(workspace.path),
+        "CARGO_CHIEF_BUNDLE_CLAIM_FILE": str(workspace.bundle_claim_file),
+        "CARGO_CHIEF_PARKING_CLAIM_FILE": str(workspace.parking_claim_file),
+    })
+    if bundle:
+        proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
+    started = time.time()
+
+    def track_process(process):
+        with _live_sessions_lock:
+            if process is None:
+                _openai_processes.pop(thread_ts, None)
+            else:
+                _openai_processes[thread_ts] = process
+
+    result = run_codex_turn(
+        command,
+        governed_prompt,
+        cwd=str(cwd),
+        env=proc_env,
+        timeout=CLAUDE_TIMEOUT,
+        on_process=track_process,
+    )
+    with _live_sessions_lock:
+        stopped = thread_ts in _openai_stopped
+        _openai_stopped.discard(thread_ts)
+    if result.session_id:
+        session_id = result.session_id
+        _save_openai_session(thread_ts, session_id, cwd)
+
+    if workspace.bundle_claim_file.exists():
+        try:
+            claimed = consume_bundle_claim(
+                workspace, max_live_bundles=RUNTIME_POLICY.max_live_bundles
+            )
+        except SafetyError as exc:
+            audit_logger.warning(
+                "BUNDLE_REFUSED | PROVIDER:openai | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+                user_id, channel, thread_ts, str(exc),
+            )
+        else:
+            if claimed:
+                audit_logger.info(
+                    "BUNDLE_BOUND | PROVIDER:openai | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s",
+                    user_id, channel, thread_ts, claimed.name,
+                )
+
+    parking = None
+    parking_refused = None
+    if workspace.parking_claim_file.exists():
+        try:
+            parking = consume_parking_claim(workspace)
+        except SafetyError as exc:
+            parking_refused = str(exc)
+            audit_logger.warning(
+                "PARKING_REFUSED | PROVIDER:openai | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+                user_id, channel, thread_ts, parking_refused,
+            )
+        else:
+            if parking:
+                audit_logger.info(
+                    "WORK_PARKED | PROVIDER:openai | USER:%s | CHANNEL:%s | THREAD:%s | KIND:%s | RECORD:%s",
+                    user_id, channel, thread_ts, parking.kind,
+                    parking.path.relative_to(workspace.root),
+                )
+
+    delivered = workspace.escalation_receipt_file.is_file()
+    attempted = workspace.escalation_attempt_file.is_file()
+    if attempted:
+        try:
+            workspace.escalation_attempt_file.unlink()
+        except OSError:
+            pass
+    if stopped:
+        pass
+    elif delivered:
+        try:
+            workspace.escalation_receipt_file.unlink()
+        except OSError:
+            pass
+        on_text(private_escalation_status(
+            delivered=True,
+            parking=parking,
+            parking_refused=bool(parking_refused),
+        ))
+    elif attempted:
+        on_text(private_escalation_status(
+            delivered=False, parking=parking, parking_refused=bool(parking_refused)
+        ))
+    elif result.error:
+        logger.warning("OpenAI fallback turn failed in thread %s", thread_ts)
+        on_text("OpenAI fallback could not complete this turn.")
+    else:
+        for text_block in result.texts:
+            on_text(text_block)
+
+    audit_logger.info(
+        "FALLBACK_INTERACTION | PROVIDER:openai | MODEL:%s | EFFORT:%s | USER:%s | CHANNEL:%s "
+        "| THREAD:%s | SESSION:%s | RESP_BLOCKS:%d | DURATION:%.1fs",
+        policy.fallback_model, policy.fallback_effort, user_id, channel, thread_ts,
+        session_id or "none", len(result.texts), time.time() - started,
+    )
+    return session_id
+
+
 def process_message_async(event: dict) -> None:
     """Process a message in a background thread.
 
-    Uses long-lived Claude processes with stream-json I/O. If a process is
+    Uses long-lived Claude processes with stream-json I/O and a profile-governed
+    Codex CLI turn after a recognized Claude credit limit. If a Claude process is
     already running for this thread, the message is piped to its stdin and
     queued automatically by the CLI. Otherwise a new process is spawned
     (resuming any prior session for the thread).
@@ -1672,11 +1879,7 @@ def process_message_async(event: dict) -> None:
         )
         return
 
-    # While out of usage credits, stay completely silent — the outage was
-    # already announced once when the limit was first hit.
-    if _limit_paused():
-        logger.info(f"Usage-limit pause active — ignoring message in {channel} (thread {thread_ts})")
-        return
+    use_openai = _limit_paused() or _get_openai_session(thread_ts) is not None
 
     # Replace user mentions with readable names
     text = re.sub(
@@ -1712,7 +1915,9 @@ def process_message_async(event: dict) -> None:
 
     # For channel messages (not DMs), let Claude decide if it should respond
     is_channel = event.get("channel_type") not in ("im", "mpim")
-    has_existing_session = _get_session(thread_ts) is not None
+    has_existing_session = (
+        _get_session(thread_ts) is not None or _get_openai_session(thread_ts) is not None
+    )
 
     # Check if there's already a live process for this thread
     has_live_process = (
@@ -1786,23 +1991,19 @@ def process_message_async(event: dict) -> None:
     all_texts = []
     first_text_sent = False
     skip_detected = False
+    fallback_requested = False
 
     def on_text(text_block: str):
         """Called for each text block Claude produces — post it to Slack immediately."""
-        nonlocal first_text_sent, skip_detected
+        nonlocal first_text_sent, skip_detected, fallback_requested
 
         # Usage-limit notices are synthesized by the CLI, not the model.
-        # Suppress them; announce the outage once and pause inbound handling.
+        # Suppress them and replay the same authenticated turn through the
+        # configured OpenAI fallback after the Claude result closes.
         if LIMIT_RE.search(text_block):
-            until_epoch = _enter_limit_pause(text_block)
+            _enter_limit_pause(text_block)
+            fallback_requested = True
             logger.warning(f"Usage limit hit in thread {thread_ts}")
-            if until_epoch:
-                until = datetime.fromtimestamp(until_epoch, timezone.utc)
-                slack_client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts,
-                    text=(f"I've run out of usage credits — I'll be back around "
-                          f"{until:%-I:%M%p} UTC. Anything sent before then won't get a reply."),
-                )
             return
 
         # Check for SKIP on the very first text block (channel relevance filter)
@@ -1820,11 +2021,24 @@ def process_message_async(event: dict) -> None:
         first_text_sent = True
 
     start = time.time()
+    audit_session_id = _get_openai_session(thread_ts) if use_openai else None
 
     try:
-        session = _get_or_create_live_session(thread_ts, channel, user_id=user_id)
+        if use_openai:
+            with _openai_turn_lock(thread_ts):
+                audit_session_id = _run_openai_fallback(
+                    policy=room_policy,
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    user_id=user_id,
+                    prompt=text,
+                    on_text=on_text,
+                )
+            session = None
+        else:
+            session = _get_or_create_live_session(thread_ts, channel, user_id=user_id)
 
-        # Real-time steering: a turn is already running in this thread — don't
+        # Real-time steering: a Claude turn is already running in this thread — don't
         # hold the message until it finishes. Write it to stdin now; the CLI
         # delivers it at the next tool-call boundary inside the running turn,
         # exactly like typing without Esc in interactive Claude Code. The
@@ -1833,7 +2047,7 @@ def process_message_async(event: dict) -> None:
         # starts the next turn, and its eyes reaction is still drained by the
         # reader on that turn's result. `stop`/`esc` remains the hard
         # interrupt for aborting a slow tool call outright.
-        if session.turn_lock.locked():
+        if session and session.turn_lock.locked():
             _send_to_claude(session, text)
             session.pending_reactions.append((reaction_channel, reaction_msg_ts))
             audit_interaction(event, "(steered into running turn)", 0.0, session.session_id)
@@ -1842,32 +2056,52 @@ def process_message_async(event: dict) -> None:
 
         # Acquire turn_lock — this serializes the send→wait cycle.
         # If another message is already being processed, we block here.
-        with session.turn_lock:
-            session._on_text = on_text
-            session._turn_done.clear()
+        if session:
+            with session.turn_lock:
+                session._on_text = on_text
+                session._turn_done.clear()
 
-            _send_to_claude(session, text)
+                _send_to_claude(session, text)
 
-            if not session._turn_done.wait(timeout=CLAUDE_TIMEOUT):
-                try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-                except Exception: pass
-                minutes = CLAUDE_TIMEOUT // 60
-                slack_client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts,
-                    text=f"Sorry, that timed out after {minutes} minutes. Try a simpler question?",
-                )
-                return
+                if not session._turn_done.wait(timeout=CLAUDE_TIMEOUT):
+                    try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
+                    except Exception: pass
+                    minutes = CLAUDE_TIMEOUT // 60
+                    slack_client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts,
+                        text=f"Sorry, that timed out after {minutes} minutes. Try a simpler question?",
+                    )
+                    return
 
-            # Check if the process died without producing a response
-            if not all_texts and not skip_detected and session.proc.poll() is not None:
-                try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-                except Exception: pass
-                logger.error(f"Claude process died without responding in thread {thread_ts}")
-                slack_client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts,
-                    text="Sorry, I lost my train of thought. Could you try sending that again?",
-                )
-                return
+                audit_session_id = session.session_id
+                if fallback_requested:
+                    fallback_context = _fetch_thread_context(channel, thread_ts, msg_ts)
+                    fallback_prompt = text
+                    if fallback_context:
+                        fallback_prompt += (
+                            "\n\n[UNTRUSTED_FAILOVER_THREAD_CONTEXT]\n"
+                            f"{fallback_context}\n[/UNTRUSTED_FAILOVER_THREAD_CONTEXT]"
+                        )
+                    with _openai_turn_lock(thread_ts):
+                        audit_session_id = _run_openai_fallback(
+                            policy=room_policy,
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            user_id=user_id,
+                            prompt=fallback_prompt,
+                            on_text=on_text,
+                        )
+
+                # Check if the process died without producing a response
+                if not all_texts and not skip_detected and session.proc.poll() is not None:
+                    try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
+                    except Exception: pass
+                    logger.error(f"Claude process died without responding in thread {thread_ts}")
+                    slack_client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts,
+                        text="Sorry, I lost my train of thought. Could you try sending that again?",
+                    )
+                    return
 
     except Exception as e:
         try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
@@ -1895,7 +2129,7 @@ def process_message_async(event: dict) -> None:
         pass
 
     full_response = "\n\n".join(all_texts)
-    audit_interaction(event, full_response, duration, session.session_id)
+    audit_interaction(event, full_response, duration, audit_session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1943,6 +2177,22 @@ def _maybe_stop_from_message(event: dict) -> bool:
     thread_ts = event.get("thread_ts") or event.get("ts")
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
+        openai_process = _openai_processes.get(thread_ts)
+    if openai_process and openai_process.poll() is None:
+        with _live_sessions_lock:
+            _openai_stopped.add(thread_ts)
+        try:
+            openai_process.terminate()
+        except Exception:
+            return False
+        note = "stopped the OpenAI fallback mid-run — tell me where to go instead"
+        slack_client.chat_postMessage(
+            channel=event.get("channel"), thread_ts=thread_ts,
+            text=f"Stopped: {note}",
+            blocks=[{"type": "context", "elements": [
+                {"type": "mrkdwn", "text": f":octagonal_sign: _{note}_"}]}],
+        )
+        return True
     if not session or session.proc.poll() is not None or not session.turn_lock.locked():
         return False  # nothing running here — treat as a normal message
 
@@ -2290,6 +2540,11 @@ def main():
         if not message_path_value:
             raise SystemExit("private escalation message path is unavailable")
         message_path = Path(message_path_value)
+        attempt_path_value = os.environ.get("CARGO_CHIEF_ESCALATION_ATTEMPT_FILE", "")
+        if attempt_path_value:
+            attempt_path = Path(attempt_path_value)
+            attempt_path.write_text("attempted\n", encoding="utf-8")
+            attempt_path.chmod(0o600)
         try:
             message = message_path.read_text(encoding="utf-8").strip()
         except OSError as exc:

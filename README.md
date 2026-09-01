@@ -9,12 +9,13 @@
 Before every Claude spawn, the harness verifies that the configured workspace has clean
 `agent-kit` and `docs` shared clones on `master`, a tracked non-empty autonomous overlay, a current
 generated `AGENTS.md`, and a `CLAUDE.md` symlink to it. Room entries must explicitly provide the
-root, permission mode, overlay, private escalation channel, backend, model, effort, and role.
+root, permission mode, overlay, private escalation channel, primary model/effort, explicit OpenAI
+fallback, and role.
 
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
-agent process. The initial gate allows only the Claude backend; Codex remains disabled until it has
-equivalent governance.
+agent process. Claude remains primary; a room can move to its OpenAI fallback only after the
+harness recognizes Claude's account credit-limit response.
 
 Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
@@ -79,7 +80,7 @@ A complete setup for turning a spare Mac (Mini, MacBook Air, whatever) into a de
 
 ```
 bot.py                  # Slack bot (Flask + HTTP Events API)
-bot_codex.py            # Optional Codex backend (drives `codex app-server` instead of Claude)
+openai_fallback.py      # Governed Codex CLI fallback for Claude credit exhaustion
 index.html              # Setup guide (GitHub Pages)
 CLAUDE.md.example       # Template for your AI's operations manual
 identity.md             # Your AI's soul (principles + self-authored identity)
@@ -122,45 +123,23 @@ You (anywhere) → Slack → Cloudflare Tunnel → Your Mac → Claude Code CLI
                                               + full filesystem access
 ```
 
-## Codex backend (upstream capability; disabled for Cargo Chief Gate A)
+## OpenAI fallback
 
-Upstream's default brain is Claude Code. Upstream can also point individual rooms at
-OpenAI's Codex — same Slack UX, same full-access posture, a different engine
-answering. It's per-room, so a Claude channel and a Codex channel can coexist
-in one workspace (handy for side-by-side comparison).
+Every Cargo Chief room keeps Claude as its primary owning process and explicitly names a Codex
+fallback model and effort. The harness switches only when the Claude CLI emits its recognized
+account credit-limit response. Arbitrary model errors, tool failures and timeouts do not trigger a
+provider change.
 
-**How it works:** `bot_codex.py` drives `codex app-server` over JSON-RPC on
-stdio, mirroring the one-process-per-thread model of the Claude path. Threads
-resume across messages, output streams to Slack, and mid-turn follow-ups steer
-the running turn — exactly like the Claude backend. The Cargo Chief Gate A bot
-does not import this module or create any Codex runtime state.
+Fallback turns run as `codex --profile cargo-chief exec --json`: the generated Cargo Chief profile
+keeps the workspace sandbox, network policy and automatic approval reviewer active. The same
+authenticated Slack authority envelope, autonomous overlay, working directory or bound bundle,
+private escalation route, parking claim and audit metadata are carried into the fallback turn.
+The OpenAI session id is persisted per Slack thread, so a thread that crosses providers remains on
+OpenAI rather than oscillating when Claude credits return.
 
-The Cargo Chief safety policy currently rejects `backend: "codex"` before process spawn. The
-instructions below describe upstream behavior for reference; do not enable it in a Cargo Chief room
-until equivalent governance and sandboxing are implemented and tested.
-
-**Upstream setup:**
-
-1. Install the [`codex` CLI](https://github.com/openai/codex) and sign in.
-2. In `model-config.json`, add `"backend": "codex"` to any channel or DM entry,
-   with a Codex `"model"`:
-   ```json
-   "channels": {
-     "C0YOURCODEXROOM": { "name": "#codex", "backend": "codex", "model": "gpt-5.6-sol" }
-   }
-   ```
-3. (Optional) Set `CODEX_HOME` in `.env` to isolate the bot's Codex threads/auth
-   from your own interactive `codex`.
-
-Picking a `gpt-*` / `o*` model for a room on the `/models` page is enough on its
-own — the backend is inferred from the model, so there is no second control to
-keep in sync. An explicit `"backend"` key still wins when you need it.
-
-**Notes:** Codex runs with approvals off and no sandbox (`danger-full-access`) —
-the equivalent of Claude's `--dangerously-skip-permissions` — because a
-Slack-driven turn has no human to answer an approval prompt. Reasoning effort
-comes from Codex's own `config.toml` (`model_reasoning_effort`), not
-model-config's `effort`.
+The approved routing equivalents are Sol/high for the owning thread, Sol/medium for bounded
+engineering, Terra/high for mechanical or high-volume work, and Luna/medium for read-only search.
+Fallback turns are serialized per Slack thread; the Claude path retains its live mid-turn steering.
 
 ## Bot features
 
@@ -173,8 +152,8 @@ model-config's `effort`.
 - **Streaming output** — real-time responses as Claude generates
 - **Native tables** — markdown tables in responses render as real Slack tables (Block Kit `markdown` block)
 - **Per-room models** — `model-config.json` picks which model and reasoning effort answers in each channel or DM, plus an optional per-model system prompt; read fresh on every spawn (no restart), editable from the file explorer's `/models` page. Name a `default_model` there and the page's default row becomes a dropdown too, so you can move every unconfigured room to a different model in one pick
-- **Prompt cadence** — a per-model prompt is in the system prompt at spawn; give it a cadence and it is also re-sent with every Nth message, so a standing instruction ("keep Slack replies short") doesn't decay over a long thread (Claude backend; Codex rooms take their instructions from Codex's own config)
-- **Pluggable backend** — point any room at OpenAI's Codex instead of Claude by picking a `gpt-*` model for it on the `/models` page; same Slack UX, different engine (see [Codex backend](#codex-backend-optional))
+- **Prompt cadence** — a per-model prompt is in the Claude system prompt at spawn and can be re-sent every Nth message so a standing instruction does not decay
+- **Credit-limit fallback** — a recognized Claude account limit moves the Slack thread to its explicit, profile-governed OpenAI model while preserving the authority envelope and durable session id
 - **Interactive buttons** — button clicks and menu picks route back into the thread's Claude session as messages, so your AI can offer approve/hold/snooze choices and act on the answer (requires Interactivity enabled in your Slack app config; Request URL = the same `/slack/events` endpoint)
 - **In-thread stop** — type a bare `stop` in a thread where the bot is mid-run to interrupt it (like Esc in the terminal); the session survives with full context, so your next message steers it in the new direction
 - **Mid-turn steering** — message a thread while the bot is mid-run and it sees your message at the next tool-call boundary, inside the same turn (like typing without Esc in the terminal); no more waiting for the whole task to finish before you can course-correct
