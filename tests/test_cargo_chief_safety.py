@@ -29,6 +29,7 @@ from cargo_chief_safety import (
     preflight_room,
     resolve_room_policy,
     validate_secret_env_path,
+    validate_existing_thread_workspace,
     validate_codex_runtime,
     write_private_json,
 )
@@ -304,6 +305,37 @@ class RuntimePolicyTest(unittest.TestCase):
         )
         with self.assertRaises(SafetyError):
             thread_workspace_key("", "100.1")
+
+    def test_existing_thread_workspace_requires_matching_regular_state(self):
+        workspace = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="100.1", now=10.0
+        )
+        self.assertEqual(
+            workspace.path.resolve(),
+            validate_existing_thread_workspace(
+                self.workspace, channel="C1", thread="100.1"
+            ),
+        )
+
+        state = json.loads(workspace.state_file.read_text())
+        state["channel"] = "C2"
+        workspace.state_file.write_text(json.dumps(state))
+        with self.assertRaisesRegex(SafetyError, "does not match"):
+            validate_existing_thread_workspace(
+                self.workspace, channel="C1", thread="100.1"
+            )
+
+    def test_existing_thread_workspace_refuses_symlinked_state(self):
+        workspace = prepare_thread_workspace(
+            self.workspace, channel="C1", thread="100.2", now=10.0
+        )
+        target = workspace.path / "state-target.json"
+        workspace.state_file.rename(target)
+        workspace.state_file.symlink_to(target)
+        with self.assertRaisesRegex(SafetyError, "missing or unsafe"):
+            validate_existing_thread_workspace(
+                self.workspace, channel="C1", thread="100.2"
+            )
 
     def test_concurrent_threads_cannot_overwrite_each_others_scratch(self):
         left = prepare_thread_workspace(

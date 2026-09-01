@@ -323,6 +323,30 @@ def _thread_work_root(workspace_root: Path) -> Path:
     return workspace_root.resolve() / "work" / THREAD_WORK_ROOT_NAME
 
 
+def validate_existing_thread_workspace(
+    workspace_root: Path, *, channel: str, thread: str
+) -> Path:
+    """Return an existing thread workspace only when its private routing state matches."""
+    key = thread_workspace_key(channel, thread)
+    base = _thread_work_root(workspace_root)
+    path = base / key
+    state_file = path / "state.json"
+    if (
+        not path.is_dir()
+        or path.is_symlink()
+        or not state_file.is_file()
+        or state_file.is_symlink()
+    ):
+        raise SafetyError("saved thread workspace is missing or unsafe")
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyError("saved thread workspace metadata is invalid") from exc
+    if state.get("channel") != channel or state.get("thread") != thread:
+        raise SafetyError("saved thread workspace metadata does not match its routing key")
+    return path.resolve()
+
+
 def prepare_thread_workspace(
     workspace_root: Path,
     *,
