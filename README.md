@@ -136,7 +136,8 @@ fallback model and effort. The harness switches only when the Claude CLI emits i
 account credit-limit response. Arbitrary model errors, tool failures and timeouts do not trigger a
 provider change. A named approver can also pin one Slack thread explicitly with `provider openai`
 or `provider claude`; `provider status` reports the pin and `provider auto` removes it. The command
-affects subsequent turns and survives daemon restarts.
+affects subsequent turns and survives daemon restarts. `provider openai new` keeps the OpenAI pin
+but discards that thread's saved Codex resume id, for explicit recovery from a rejected session.
 
 Fallback turns run as `codex --profile cargo-chief exec --json`: the generated Cargo Chief profile
 keeps the workspace sandbox, network policy and automatic approval reviewer active. The same

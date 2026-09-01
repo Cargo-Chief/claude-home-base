@@ -11,7 +11,7 @@ PROVIDERS = {"claude", "openai"}
 def parse_provider_command(text: str) -> str | None:
     """Return an exact provider control action, ignoring an optional Slack mention."""
     normalized = re.sub(r"<@[A-Z0-9]+>", "", text).strip().lower()
-    match = re.fullmatch(r"provider (status|claude|openai|auto)", normalized)
+    match = re.fullmatch(r"provider (status|claude|openai(?: new)?|auto)", normalized)
     return match.group(1) if match else None
 
 

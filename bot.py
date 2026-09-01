@@ -475,6 +475,14 @@ def _get_openai_session_cwd(thread_ts: str) -> Path | None:
     return None
 
 
+def _clear_openai_session(thread_ts: str) -> None:
+    """Forget only one thread's Codex resume id; leave its workspace intact."""
+    with _session_file_lock:
+        sessions = _load_openai_sessions()
+        sessions.pop(thread_ts, None)
+        write_private_json(OPENAI_SESSION_FILE, sessions)
+
+
 def _load_provider_overrides() -> dict:
     try:
         value = json.loads(PROVIDER_OVERRIDE_FILE.read_text())
@@ -2455,6 +2463,9 @@ def _maybe_provider_command(event: dict) -> bool:
             raise SafetyError("named approver required")
         if action == "auto":
             _set_provider_override(thread_ts, None)
+        elif action == "openai new":
+            _clear_openai_session(thread_ts)
+            _set_provider_override(thread_ts, "openai")
         elif action != "status":
             _set_provider_override(thread_ts, action)
         selected = _get_provider_override(thread_ts) or "auto"
@@ -2466,7 +2477,10 @@ def _maybe_provider_command(event: dict) -> bool:
         return True
     slack_client.chat_postMessage(
         channel=channel, thread_ts=thread_ts,
-        text=f"Thread provider: {selected}",
+        text=(
+            "Thread provider: openai (new session)"
+            if action == "openai new" else f"Thread provider: {selected}"
+        ),
     )
     audit_logger.info(format_provider_audit(
         user=user_id, channel=channel, thread=thread_ts or "unknown",
