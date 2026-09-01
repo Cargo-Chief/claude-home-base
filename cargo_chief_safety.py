@@ -298,6 +298,11 @@ class ThreadWorkspace:
     escalation_attempt_file: Path
     bundle_claim_file: Path
     parking_claim_file: Path
+    delegation_request_file: Path
+    implementation_claim_file: Path
+    delegation_budget_file: Path
+    delegate_pid_file: Path
+    delegate_verification_file: Path
 
 
 @dataclass(frozen=True)
@@ -372,6 +377,11 @@ def prepare_thread_workspace(
         escalation_attempt_file=path / "private-escalation.attempt",
         bundle_claim_file=path / "bundle-claim.txt",
         parking_claim_file=path / "parking-claim.txt",
+        delegation_request_file=path / "delegation-request.json",
+        implementation_claim_file=path / "implementation-claim.txt",
+        delegation_budget_file=path / "delegation-budget.json",
+        delegate_pid_file=path / "delegate.pid",
+        delegate_verification_file=path / "delegate-verification.json",
     )
 
 
@@ -438,6 +448,11 @@ def consume_bundle_claim(
                     escalation_attempt_file=state_file.parent / "private-escalation.attempt",
                     bundle_claim_file=state_file.parent / "bundle-claim.txt",
                     parking_claim_file=state_file.parent / "parking-claim.txt",
+                    delegation_request_file=state_file.parent / "delegation-request.json",
+                    implementation_claim_file=state_file.parent / "implementation-claim.txt",
+                    delegation_budget_file=state_file.parent / "delegation-budget.json",
+                    delegate_pid_file=state_file.parent / "delegate.pid",
+                    delegate_verification_file=state_file.parent / "delegate-verification.json",
                 )
                 _validated_bundle_path(other_workspace, other_bundle)
             except (OSError, json.JSONDecodeError, SafetyError):
@@ -695,6 +710,7 @@ def build_codex_command(
     common = [
         "codex", "--profile", "cargo-chief",
         "-c", f'model_reasoning_effort="{policy.fallback_effort}"',
+        "-c", "features.multi_agent=false",
         "exec",
     ]
     if session_id:
@@ -814,6 +830,8 @@ def build_claude_command(
     escalation_message_file: Path,
     bundle_claim_file: Path,
     parking_claim_file: Path,
+    delegation_request_file: Path,
+    implementation_claim_file: Path,
     model_prompt: str = "",
     session_id: str | None = None,
 ) -> list[str]:
@@ -825,11 +843,12 @@ def build_claude_command(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=bundle_claim_file,
         parking_claim_file=parking_claim_file,
+        delegation_request_file=delegation_request_file,
+        implementation_claim_file=implementation_claim_file,
         delegation=(
-            "Delegate only through these harness-defined agents: cargo-chief-bounded for bounded "
-            "implementation or targeted verification; cargo-chief-mechanical for mechanical/high-volume "
-            "work; cargo-chief-explore for read-only search. Do not invoke built-in Explore, Plan, or "
-            "general-purpose agents. Verify every load-bearing delegate return before acting on it."
+            "Delegate only through the governed launcher described below. Do not invoke Agent, Task, "
+            "Explore, Plan, general-purpose, or any other provider-native subagent. Verify every "
+            "load-bearing delegate return before acting on it."
         ),
     )
     appended = "\n\n".join(
@@ -844,7 +863,6 @@ def build_claude_command(
         "--effort", policy.effort,
         "--model", policy.model,
         "--permission-mode", policy.permission_mode,
-        "--agents", json.dumps(APPROVED_DELEGATES, separators=(",", ":")),
         "--append-system-prompt", appended,
     ]
     if session_id:
@@ -860,6 +878,8 @@ def _build_harness_prompt(
     escalation_message_file: Path,
     bundle_claim_file: Path,
     parking_claim_file: Path,
+    delegation_request_file: Path,
+    implementation_claim_file: Path,
     delegation: str,
 ) -> str:
     return (
@@ -888,6 +908,21 @@ def _build_harness_prompt(
         "TASK.md, or a docs plan "
         "in a real docs worktree with frontmatter readiness: paused. Then write only that record's "
         f"absolute path to {parking_claim_file}. The harness validates the record at turn end.\n"
+        "- To delegate, write exactly one JSON object with only `tier`, `prompt`, and boolean "
+        "`mutation` keys to "
+        f"{delegation_request_file}. Allowed tiers are implementation, bounded, mechanical, and "
+        "explore. Every mutation=true request requires first writing the absolute path of the implementation-ready "
+        f"docs-worktree plan to {implementation_claim_file}. Then run exactly:\n"
+        f"  {shlex.quote(str(transport_python))} "
+        f"{shlex.quote(str(transport_script.parent / 'governed_delegation.py'))}\n"
+        "  The launcher consumes the one-shot files, validates the plan when required, enforces the "
+        "thread budget, selects the provider-equivalent model and effort, and returns evidence.\n"
+        "- After a delegate returns, independently verify its load-bearing result with at least one "
+        "tool call. Only then run this exact command to release the owner response:\n"
+        f"  {shlex.quote(str(transport_python))} "
+        f"{shlex.quote(str(transport_script.parent / 'governed_delegation.py'))} --verify\n"
+        "  If that verification receipt is missing at turn end, the harness withholds the substantive "
+        "owner response.\n"
         f"- {delegation}\n"
         "- When a normal worktree_task.sh run creates a ticket bundle for this thread, write only "
         f"its bundle directory name (CN-####-lowercase-slug) to {bundle_claim_file}. The harness "
@@ -904,6 +939,8 @@ def build_codex_prompt(
     escalation_message_file: Path,
     bundle_claim_file: Path,
     parking_claim_file: Path,
+    delegation_request_file: Path,
+    implementation_claim_file: Path,
 ) -> str:
     """Compose the same autonomous and harness governance for a Codex fallback turn."""
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
@@ -914,12 +951,13 @@ def build_codex_prompt(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=bundle_claim_file,
         parking_claim_file=parking_claim_file,
+        delegation_request_file=delegation_request_file,
+        implementation_claim_file=implementation_claim_file,
         delegation=(
-            "Use gpt-5.6-sol at medium effort for bounded engineering, gpt-5.6-terra at high "
-            "effort for mechanical/high-volume work, and gpt-5.6-luna at medium effort only for "
-            "read-only Explore/search. Keep decisions, production-touching work, credentials, and "
-            "final verification in this owning gpt-5.6-sol/high thread. Verify every load-bearing "
-            "delegate return before acting on it."
+            "Delegate only through the governed launcher described below; raw Codex collaboration "
+            "is disabled. Keep decisions, production-touching work, credentials, and final "
+            "verification in this owning gpt-5.6-sol/high thread. Verify every load-bearing delegate "
+            "return before acting on it."
         ),
     )
     return f"{overlay}\n\n{harness}\n\n{inbound_prompt}"

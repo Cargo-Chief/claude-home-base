@@ -30,12 +30,18 @@ route, Claude session ID, and activity timestamps across daemon restarts. Stale 
 removed after 14 days; live, recent, unrecognized, malformed, and symlinked entries are preserved
 fail-closed.
 
-Delegation is pinned by the harness rather than inherited from a machine default. The owning room
-uses its configured model and effort; named subagents provide Opus 5/medium bounded work, Sonnet
-5/high mechanical work, and read-only Haiku 4.5/medium exploration. Audit records contain only the
-agent name, configured and served models, configured effort, completion status, aggregate token and
-tool counts, duration, and the number of subsequent owner verification tools. Delegated prompts,
-descriptions, tool inputs, file paths, and response content are never retained or logged.
+Delegation is pinned by the harness rather than inherited from a machine default. Raw Claude Agent
+calls and Codex multi-agent are disabled; both providers use the same one-shot governed launcher.
+Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,
+mechanical, and explore tiers route to the approved provider-equivalent model and effort. Every
+thread has a persistent 250,000 delegated-token ceiling; only a named approver can inspect, reset,
+or change it, and bare `stop` terminates an active delegate. Audit records contain routing,
+plan-gate, aggregate usage, duration, and outcome metadata only. Delegated prompts, tool inputs,
+file paths, and response content are never retained or logged.
+
+Every request declares `mutation` explicitly. A mutating request at any capable tier requires the
+implementation plan claim. A non-mutating request runs with read-only provider tools; Explore can
+never be marked mutating.
 
 When a thread creates a standard `worktrees/CN-####-slug/` bundle, it can claim that bundle through
 its private one-shot claim file. Home-base accepts only a direct, non-symlinked child of
@@ -154,6 +160,7 @@ Fallback turns are serialized per Slack thread; the Claude path retains its live
 - **Per-room models** — `model-config.json` picks which model and reasoning effort answers in each channel or DM, plus an optional per-model system prompt; read fresh on every spawn (no restart), editable from the file explorer's `/models` page. Name a `default_model` there and the page's default row becomes a dropdown too, so you can move every unconfigured room to a different model in one pick
 - **Prompt cadence** — a per-model prompt is in the Claude system prompt at spawn and can be re-sent every Nth message so a standing instruction does not decay
 - **Credit-limit fallback** — a recognized Claude account limit moves the Slack thread to its explicit, profile-governed OpenAI model while preserving the authority envelope and durable session id
+- **Governed delegation** — one provider-neutral launcher enforces implementation-plan readiness, exact model/effort routing, a persistent 250k thread budget, metadata-only audit, and the shared stop path
 - **Interactive buttons** — button clicks and menu picks route back into the thread's Claude session as messages, so your AI can offer approve/hold/snooze choices and act on the answer (requires Interactivity enabled in your Slack app config; Request URL = the same `/slack/events` endpoint)
 - **In-thread stop** — type a bare `stop` in a thread where the bot is mid-run to interrupt it (like Esc in the terminal); the session survives with full context, so your next message steers it in the new direction
 - **Mid-turn steering** — message a thread while the bot is mid-run and it sees your message at the next tool-call boundary, inside the same turn (like typing without Esc in the terminal); no more waiting for the whole task to finish before you can course-correct
