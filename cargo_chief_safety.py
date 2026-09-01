@@ -716,7 +716,7 @@ def build_codex_command(
     if session_id:
         return [
             *common, "resume", "--json", "--model", policy.fallback_model,
-            session_id, "-",
+            "--skip-git-repo-check", session_id, "-",
         ]
     return [
         *common, "--json", "--model", policy.fallback_model,
