@@ -626,6 +626,7 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("resume", resumed)
         self.assertIn("openai-session-1", resumed)
         self.assertNotIn("--cd", resumed)
+        self.assertIn("--skip-git-repo-check", resumed)
 
         prompt = build_codex_prompt(
             self.policy,
