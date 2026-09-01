@@ -14,6 +14,7 @@ from governed_delegation import (
     ROUTES,
     budget_status,
     delegation_audit_path,
+    delegation_verification_status,
     launch_from_environment,
     load_request,
     run_claude_delegate,
@@ -63,6 +64,16 @@ class GovernedDelegationTest(unittest.TestCase):
         _append_audit(path, {"STATUS": "completed"})
         self.assertIn("STATUS:completed", path.read_text(encoding="utf-8"))
         self.assertEqual(0o600, path.stat().st_mode & 0o777)
+
+    def test_delegation_verification_status_distinguishes_budget_exhaustion(self):
+        marker = self.work / "verification.json"
+        self.assertIsNone(delegation_verification_status(marker))
+        marker.write_text('{"status":"pending"}\n', encoding="utf-8")
+        self.assertEqual("pending", delegation_verification_status(marker))
+        marker.write_text('{"status":"budget_exhausted"}\n', encoding="utf-8")
+        self.assertEqual("budget_exhausted", delegation_verification_status(marker))
+        marker.write_text("not-json\n", encoding="utf-8")
+        self.assertEqual("invalid", delegation_verification_status(marker))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

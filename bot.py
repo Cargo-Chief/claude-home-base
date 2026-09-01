@@ -79,7 +79,12 @@ from openai_fallback import (
     model_notice_text,
     run_codex_turn,
 )
-from governed_delegation import budget_status, delegation_audit_path, update_budget
+from governed_delegation import (
+    budget_status,
+    delegation_audit_path,
+    delegation_verification_status,
+    update_budget,
+)
 
 # ---------------------------------------------------------------------------
 # External configuration and controlled runtime storage
@@ -1030,10 +1035,12 @@ def _reader_loop(session: LiveSession) -> None:
                                 session.user_id, session.channel, session.thread_ts,
                                 parking.kind, parking.path.relative_to(session.workspace.root),
                             )
-                verification_missing = bool(
-                    session.workspace
-                    and session.workspace.delegate_verification_file.is_file()
+                verification_status = (
+                    delegation_verification_status(
+                        session.workspace.delegate_verification_file
+                    ) if session.workspace else None
                 )
+                verification_missing = verification_status in {"pending", "invalid"}
                 if verification_missing:
                     audit_logger.warning(
                         "DELEGATION_VERIFICATION | USER:%s | CHANNEL:%s | THREAD:%s "
@@ -1068,6 +1075,12 @@ def _reader_loop(session: LiveSession) -> None:
                     )
                     if session._on_text:
                         session._on_text(status)
+                elif verification_status == "budget_exhausted":
+                    if session._on_text:
+                        session._on_text(
+                            "Delegate result withheld: thread delegation budget exhausted; "
+                            "a named approver must reset or raise the budget."
+                        )
                 elif verification_missing:
                     if session._on_text:
                         session._on_text(
@@ -1873,7 +1886,10 @@ def _run_openai_fallback(
 
     delivered = workspace.escalation_receipt_file.is_file()
     attempted = workspace.escalation_attempt_file.is_file()
-    verification_missing = workspace.delegate_verification_file.is_file()
+    verification_status = delegation_verification_status(
+        workspace.delegate_verification_file
+    )
+    verification_missing = verification_status in {"pending", "invalid"}
     if attempted:
         try:
             workspace.escalation_attempt_file.unlink()
@@ -1900,6 +1916,11 @@ def _run_openai_fallback(
     elif result.error:
         logger.warning("OpenAI fallback turn failed in thread %s", thread_ts)
         on_text("OpenAI fallback could not complete this turn.")
+    elif verification_status == "budget_exhausted":
+        on_text(
+            "Delegate result withheld: thread delegation budget exhausted; "
+            "a named approver must reset or raise the budget."
+        )
     elif verification_missing:
         audit_logger.warning(
             "DELEGATION_VERIFICATION | PROVIDER:openai | USER:%s | CHANNEL:%s | "
