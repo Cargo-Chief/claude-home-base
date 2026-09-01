@@ -1,19 +1,37 @@
 """Pure Slack prompt builders that can be tested without bot credentials."""
 
 from pathlib import Path
+import shlex
 
 
-def contains_escalation_file_write(content: list, target: Path) -> bool:
-    """Detect a main-loop file tool targeting the harness one-shot message file."""
+def contains_private_escalation_action(
+    content: list, target: Path, transport_python: Path, transport_script: Path
+) -> bool:
+    """Detect the one-shot file write or the exact no-argument escalation command."""
     expected = target.expanduser().resolve()
+    expected_python = transport_python.expanduser().resolve()
+    expected_script = transport_script.expanduser().resolve()
     for block in content:
         if not isinstance(block, dict) or block.get("type") != "tool_use":
             continue
-        if block.get("name") not in {"Write", "Edit", "MultiEdit"}:
-            continue
-        value = (block.get("input") or {}).get("file_path")
-        if value and Path(str(value)).expanduser().resolve() == expected:
-            return True
+        name = block.get("name")
+        tool_input = block.get("input") or {}
+        if name in {"Write", "Edit", "MultiEdit"}:
+            value = tool_input.get("file_path")
+            if value and Path(str(value)).expanduser().resolve() == expected:
+                return True
+        if name == "Bash":
+            try:
+                tokens = shlex.split(str(tool_input.get("command") or ""))
+            except ValueError:
+                continue
+            if (
+                len(tokens) == 3
+                and Path(tokens[0]).expanduser().resolve() == expected_python
+                and Path(tokens[1]).expanduser().resolve() == expected_script
+                and tokens[2] == "--escalate"
+            ):
+                return True
     return False
 
 
