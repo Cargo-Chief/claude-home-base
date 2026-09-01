@@ -75,11 +75,16 @@ from slack_prompting import (
 from http_server import serve_http
 from delegation_observability import DelegationTracker, format_delegation_audit
 from openai_fallback import (
+    fallback_error_kind,
     is_claude_limit_notice,
     model_notice_text,
     run_codex_turn,
 )
-from provider_control import parse_provider_command, use_openai_provider
+from provider_control import (
+    format_provider_audit,
+    parse_provider_command,
+    use_openai_provider,
+)
 from governed_delegation import (
     budget_status,
     delegation_audit_path,
@@ -1942,7 +1947,10 @@ def _run_openai_fallback(
             delivered=False, parking=parking, parking_refused=bool(parking_refused)
         ))
     elif result.error:
-        logger.warning("OpenAI fallback turn failed in thread %s", thread_ts)
+        logger.warning(
+            "OpenAI fallback turn failed in thread %s (kind=%s)",
+            thread_ts, fallback_error_kind(result.error),
+        )
         on_text("OpenAI fallback could not complete this turn.")
     elif verification_status == "budget_exhausted":
         on_text(
@@ -2460,9 +2468,9 @@ def _maybe_provider_command(event: dict) -> bool:
         channel=channel, thread_ts=thread_ts,
         text=f"Thread provider: {selected}",
     )
-    audit_logger.info(format_audit_metadata(
-        "PROVIDER_CONTROL", user=user_id, channel=channel,
-        thread=thread_ts or "unknown", action=action, provider=selected,
+    audit_logger.info(format_provider_audit(
+        user=user_id, channel=channel, thread=thread_ts or "unknown",
+        action=action, provider=selected,
     ))
     return True
 
