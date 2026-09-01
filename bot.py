@@ -79,6 +79,7 @@ from openai_fallback import (
     model_notice_text,
     run_codex_turn,
 )
+from provider_control import parse_provider_command, use_openai_provider
 from governed_delegation import (
     budget_status,
     delegation_audit_path,
@@ -410,6 +411,7 @@ def _fetch_thread_context(channel: str, thread_ts: str, current_msg_ts: str) -> 
 
 SESSION_FILE = STATE_DIR / "sessions.json"
 OPENAI_SESSION_FILE = STATE_DIR / "openai-sessions.json"
+PROVIDER_OVERRIDE_FILE = STATE_DIR / "provider-overrides.json"
 MAX_SESSIONS = 200
 _session_file_lock = threading.Lock()
 
@@ -466,6 +468,32 @@ def _get_openai_session_cwd(thread_ts: str) -> Path | None:
     if isinstance(value, dict) and isinstance(value.get("cwd"), str):
         return Path(value["cwd"]).resolve()
     return None
+
+
+def _load_provider_overrides() -> dict:
+    try:
+        value = json.loads(PROVIDER_OVERRIDE_FILE.read_text())
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _get_provider_override(thread_ts: str) -> str | None:
+    value = _load_provider_overrides().get(thread_ts)
+    return value if value in {"claude", "openai"} else None
+
+
+def _set_provider_override(thread_ts: str, provider: str | None) -> None:
+    with _session_file_lock:
+        overrides = _load_provider_overrides()
+        if provider is None:
+            overrides.pop(thread_ts, None)
+        else:
+            overrides[thread_ts] = provider
+        if len(overrides) > MAX_SESSIONS:
+            for key in sorted(overrides.keys())[:-MAX_SESSIONS]:
+                del overrides[key]
+        write_private_json(PROVIDER_OVERRIDE_FILE, overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -1990,7 +2018,11 @@ def process_message_async(event: dict) -> None:
         )
         return
 
-    use_openai = _limit_paused() or _get_openai_session(thread_ts) is not None
+    use_openai = use_openai_provider(
+        _get_provider_override(thread_ts),
+        limit_paused=_limit_paused(),
+        has_openai_session=_get_openai_session(thread_ts) is not None,
+    )
 
     # Replace user mentions with readable names
     text = re.sub(
@@ -2401,6 +2433,40 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
     return True
 
 
+def _maybe_provider_command(event: dict) -> bool:
+    """Set or inspect an exact per-thread provider choice for a named approver."""
+    action = parse_provider_command(event.get("text", ""))
+    if action is None:
+        return False
+    user_id = event.get("user", "")
+    channel = event.get("channel", "")
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    try:
+        authority = AuthorityPolicy.from_env()
+        if not authority.can_approve(user_id):
+            raise SafetyError("named approver required")
+        if action == "auto":
+            _set_provider_override(thread_ts, None)
+        elif action != "status":
+            _set_provider_override(thread_ts, action)
+        selected = _get_provider_override(thread_ts) or "auto"
+    except (SafetyError, OSError) as exc:
+        slack_client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f"Provider control refused: {exc}",
+        )
+        return True
+    slack_client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text=f"Thread provider: {selected}",
+    )
+    audit_logger.info(format_audit_metadata(
+        "PROVIDER_CONTROL", user=user_id, channel=channel,
+        thread=thread_ts or "unknown", action=action, provider=selected,
+    ))
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Slack event handlers
 # ---------------------------------------------------------------------------
@@ -2433,6 +2499,8 @@ def handle_message(event, say):
         return
     if _maybe_delegation_budget_command(event):
         return
+    if _maybe_provider_command(event):
+        return
 
     # Process async — return immediately so Slack gets its 200
     threading.Thread(target=process_message_async, args=(event,), daemon=True).start()
@@ -2457,6 +2525,8 @@ def handle_mention(event, say):
     if _maybe_stop_from_message(event):
         return
     if _maybe_delegation_budget_command(event):
+        return
+    if _maybe_provider_command(event):
         return
 
     threading.Thread(target=process_message_async, args=(event,), daemon=True).start()

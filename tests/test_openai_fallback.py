@@ -17,6 +17,7 @@ class OpenAIFallbackTest(unittest.TestCase):
             "You've hit your limit · resets 4pm (UTC)",
             "You've hit your usage limit · resets at 4:00 pm",
             "You've hit your weekly limit · resets Sep 2 at 7pm (America/Los_Angeles)",
+            "You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your session limit resets 3:50pm (America/Los_Angeles)",
         ):
             with self.subTest(notice=notice):
                 self.assertTrue(is_claude_limit_notice(notice))
