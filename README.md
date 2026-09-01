@@ -30,6 +30,12 @@ route, Claude session ID, and activity timestamps across daemon restarts. Stale 
 removed after 14 days; live, recent, unrecognized, malformed, and symlinked entries are preserved
 fail-closed.
 
+Private escalations are round trips, not fire-and-forget messages. After the harness posts the
+substantive question to the configured private route, it persists an approver-only mapping back to
+the parked source thread. The first named-approver reply is atomically delivered to that original
+Claude or OpenAI session, including after a daemon restart. Duplicate, expired, malformed, and
+non-approver replies cannot start an unrelated DM task or consume the active decision route.
+
 Delegation is pinned by the harness rather than inherited from a machine default. Raw Claude Agent
 calls and Codex multi-agent are disabled; both providers use the same one-shot governed launcher.
 Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,

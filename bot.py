@@ -64,6 +64,7 @@ from cargo_chief_safety import (
     resolve_thread_bundle,
     ThreadWorkspace,
     validate_secret_env_path,
+    validate_existing_thread_workspace,
     validate_codex_runtime,
     write_private_json,
 )
@@ -85,6 +86,7 @@ from provider_control import (
     parse_provider_command,
     use_openai_provider,
 )
+from reply_routing import ReplyRouteStore
 from governed_delegation import (
     budget_status,
     delegation_audit_path,
@@ -518,61 +520,37 @@ def _set_provider_override(thread_ts: str, provider: str | None) -> None:
 
 FORWARDS_FILE = STATE_DIR / "forwards.json"
 FORWARDS_MAX_AGE_SECONDS = 14 * 24 * 3600
-_forwards_lock = threading.Lock()
-
-
-def _load_forwards() -> dict:
-    try:
-        return json.loads(FORWARDS_FILE.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def _write_forwards(fwds: dict) -> None:
-    write_private_json(FORWARDS_FILE, fwds)
+_reply_routes = ReplyRouteStore(FORWARDS_FILE, max_age_seconds=FORWARDS_MAX_AGE_SECONDS)
 
 
 def _add_forward(
+    from_channel: str,
     from_thread: str,
     to_thread: str,
     to_channel: str,
     session_id: str | None,
     user_id: str,
+    approver_only: bool = False,
 ) -> None:
-    with _forwards_lock:
-        fwds = _load_forwards()
-        fwds[from_thread] = {
-            "thread": to_thread,
-            "channel": to_channel,
-            "session_id": session_id,
-            "user_id": user_id,
-            "registered_at": time.time(),
-        }
-        _write_forwards(fwds)
-
-
-def _get_forward(from_thread: str) -> dict | None:
-    return _load_forwards().get(from_thread)
-
-
-def _remove_forward(from_thread: str) -> None:
-    with _forwards_lock:
-        fwds = _load_forwards()
-        if fwds.pop(from_thread, None) is not None:
-            _write_forwards(fwds)
+    _reply_routes.register(
+        from_channel=from_channel,
+        from_thread=from_thread,
+        to_thread=to_thread,
+        to_channel=to_channel,
+        session_id=session_id,
+        user_id=user_id,
+        approver_only=approver_only,
+    )
 
 
 def _gc_forwards() -> None:
-    cutoff = time.time() - FORWARDS_MAX_AGE_SECONDS
-    with _forwards_lock:
-        fwds = _load_forwards()
-        stale = [k for k, v in fwds.items() if v.get("registered_at", 0) < cutoff]
-        if not stale:
-            return
-        for k in stale:
-            del fwds[k]
-        _write_forwards(fwds)
-        logger.info(f"Garbage-collected {len(stale)} stale forward entries")
+    try:
+        removed = _reply_routes.gc()
+    except ValueError:
+        logger.error("Reply route store is invalid; leaving it untouched")
+        return
+    if removed:
+        logger.info(f"Garbage-collected {removed} stale forward entries")
 
 
 # ---------------------------------------------------------------------------
@@ -1660,7 +1638,11 @@ def send_dm(
         _save_session(effective_thread_ts, session_id)
 
     if forward_to and effective_thread_ts:
-        _register_forward_via_server(effective_thread_ts, forward_to)
+        _register_forward_via_server(
+            from_channel=channel_id,
+            from_thread=effective_thread_ts,
+            to_thread=forward_to,
+        )
 
     audit_logger.info(
         f"PROACTIVE_DM | USER:{user_id} | CHANNEL:{channel_id} "
@@ -1670,14 +1652,30 @@ def send_dm(
     return effective_thread_ts
 
 
-def _register_forward_via_server(from_thread: str, to_thread: str) -> None:
+def _register_forward_via_server(
+    *,
+    from_channel: str,
+    from_thread: str,
+    to_thread: str,
+    to_channel: str | None = None,
+    user_id: str | None = None,
+    approver_only: bool = False,
+) -> None:
     """Call the running bot server to register a forward.
 
-    The server has the in-memory live-session map and can resolve channel,
-    session_id, and user_id for the target thread. This CLI invocation can't.
+    The server resolves a live target itself. The exact escalation capability
+    may additionally name a validated saved source route for Claude/Codex
+    sessions that are no longer represented by a live process.
     """
     url = f"http://127.0.0.1:{PORT}/internal/forward"
-    payload = json.dumps({"from_thread": from_thread, "to_thread": to_thread}).encode()
+    payload = json.dumps({
+        "from_channel": from_channel,
+        "from_thread": from_thread,
+        "to_thread": to_thread,
+        "to_channel": to_channel,
+        "user_id": user_id,
+        "approver_only": approver_only,
+    }).encode()
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}, method="POST",
     )
@@ -2016,7 +2014,36 @@ def process_message_async(event: dict) -> None:
 
     # Resolve forwarding before room policy. Authorization belongs to the
     # current sender; execution policy belongs to the destination room.
-    forward = _get_forward(thread_ts)
+    # Escalation routes are approver-only and terminal: unauthorized replies
+    # do not consume them, while duplicate/stale replies never fall through
+    # into a new DM session.
+    route_result = _reply_routes.claim(
+        from_channel=channel,
+        from_thread=thread_ts,
+        user_id=user_id,
+        is_approver=authority.can_approve(user_id),
+    )
+    if route_result.status == "approver_required":
+        audit_logger.warning(
+            "ESCALATION_REPLY_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:approver_required",
+            user_id, channel, thread_ts,
+        )
+        slack_client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="This private decision requires a named approver.",
+        )
+        return
+    if route_result.status in {"consumed", "expired", "invalid"}:
+        audit_logger.info(
+            "ESCALATION_REPLY_IGNORED | USER:%s | CHANNEL:%s | THREAD:%s | STATUS:%s",
+            user_id, channel, thread_ts, route_result.status,
+        )
+        slack_client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="This private decision is already closed.",
+        )
+        return
+    forward = route_result.route if route_result.status == "routed" else None
     original_thread = None
     if forward:
         original_thread = thread_ts
@@ -2067,7 +2094,6 @@ def process_message_async(event: dict) -> None:
     # into the original conversation with attribution. The eyes reaction
     # below still goes on the original message in its original channel.
     if forward:
-        _remove_forward(original_thread)
         logger.info(
             f"Forwarded reply from {sender_name} in {original_thread} -> {thread_ts}"
         )
@@ -2689,34 +2715,72 @@ def register_forward_endpoint():
     """Register a cross-thread forward. Called by `bot.py --send --forward-to`.
 
     Localhost-only — same-machine CLI talking to the running server. Looks up
-    the target thread's live session for channel + session_id + user_id and
-    persists the forward to .forwards.json.
+    a live target or validates the exact saved escalation source, then persists
+    the terminal one-shot route to forwards.json.
     """
     if request.remote_addr not in ("127.0.0.1", "::1"):
         return jsonify({"error": "forbidden"}), 403
     data = request.get_json(silent=True) or {}
+    from_channel = data.get("from_channel")
     from_thread = data.get("from_thread")
     to_thread = data.get("to_thread")
-    if not from_thread or not to_thread:
-        return jsonify({"error": "from_thread and to_thread required"}), 400
+    requested_channel = data.get("to_channel")
+    requested_user = data.get("user_id")
+    approver_only = data.get("approver_only", False)
+    if not from_channel or not from_thread or not to_thread:
+        return jsonify({"error": "from_channel, from_thread and to_thread required"}), 400
+    if not re.fullmatch(r"[CDG][A-Z0-9]+", str(from_channel)):
+        return jsonify({"error": "invalid from_channel"}), 400
+    if not re.fullmatch(r"\d+\.\d+", str(from_thread)) or not re.fullmatch(
+        r"\d+\.\d+", str(to_thread)
+    ):
+        return jsonify({"error": "invalid thread timestamp"}), 400
+    if requested_channel and not re.fullmatch(r"[CDG][A-Z0-9]+", str(requested_channel)):
+        return jsonify({"error": "invalid to_channel"}), 400
+    if requested_user and not re.fullmatch(r"U[A-Z0-9]+", str(requested_user)):
+        return jsonify({"error": "invalid user_id"}), 400
+    if not isinstance(approver_only, bool):
+        return jsonify({"error": "approver_only must be boolean"}), 400
     with _live_sessions_lock:
         target = _live_sessions.get(to_thread)
         target_channel = target.channel if target else ""
         target_session_id = target.session_id if target else _get_session(to_thread)
         target_user_id = target.user_id if target else ""
     if not target_channel:
-        return jsonify({
-            "error": "no_live_session",
-            "detail": f"no live session for thread {to_thread} — forward requires the target to be alive at registration",
-        }), 404
+        # Codex turns and resumed Claude sessions may not have a live process at
+        # registration time. Accept explicit source routing only when it maps to
+        # an existing, regular thread-workspace state file and an authorized room.
+        if not requested_channel or not requested_user or not approver_only:
+            return jsonify({
+                "error": "no_live_session",
+                "detail": "saved route registration is restricted to approver-only escalation",
+            }), 404
+        try:
+            validate_existing_thread_workspace(
+                WORKSPACE_ROOT, channel=requested_channel, thread=to_thread
+            )
+            authority = AuthorityPolicy.from_env()
+            if not authority.allows(requested_user):
+                raise ValueError("source user is not authorized")
+            resolve_room_policy(_load_model_config(), requested_channel, requested_user)
+        except (SafetyError, ValueError) as exc:
+            return jsonify({"error": "invalid_saved_route", "detail": str(exc)}), 400
+        target_channel = requested_channel
+        target_user_id = requested_user
+        target_session_id = _get_session(to_thread) or _get_openai_session(to_thread)
     _add_forward(
+        from_channel=from_channel,
         from_thread=from_thread,
         to_thread=to_thread,
         to_channel=target_channel,
         session_id=target_session_id,
         user_id=target_user_id,
+        approver_only=approver_only,
     )
-    logger.info(f"Registered forward: {from_thread} -> {to_thread}")
+    logger.info(
+        "Registered forward: %s/%s -> %s/%s (approver_only=%s)",
+        from_channel, from_thread, target_channel, to_thread, approver_only,
+    )
     return jsonify({"ok": True})
 
 
@@ -2843,7 +2907,22 @@ def main():
         if not receipt_path_value:
             raise SystemExit("private escalation receipt path is unavailable")
         receipt_path = Path(receipt_path_value)
-        send_to_channel(escalation_channel, message)
+        source_channel = os.environ.get("CLAUDE_CHANNEL_ID", "")
+        source_thread = os.environ.get("CLAUDE_THREAD_TS", "")
+        source_user = os.environ.get("CARGO_CHIEF_CURRENT_USER", "")
+        if not source_channel or not source_thread or not source_user:
+            raise SystemExit("private escalation source route is unavailable")
+        private_thread = send_to_channel(escalation_channel, message)
+        if not private_thread:
+            raise SystemExit("private escalation delivery did not return a thread")
+        _register_forward_via_server(
+            from_channel=escalation_channel,
+            from_thread=private_thread,
+            to_channel=source_channel,
+            to_thread=source_thread,
+            user_id=source_user,
+            approver_only=True,
+        )
         receipt_path.write_text("delivered\n", encoding="utf-8")
         receipt_path.chmod(0o600)
         return
