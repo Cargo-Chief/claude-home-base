@@ -291,6 +291,15 @@ class ThreadWorkspace:
     escalation_message_file: Path
     escalation_receipt_file: Path
     bundle_claim_file: Path
+    parking_claim_file: Path
+
+
+@dataclass(frozen=True)
+class ParkingRecord:
+    """A validated durable record of work parked by an autonomous turn."""
+
+    kind: str
+    path: Path
 
 
 def thread_workspace_key(channel: str, thread: str) -> str:
@@ -355,6 +364,7 @@ def prepare_thread_workspace(
         escalation_message_file=path / "private-escalation.txt",
         escalation_receipt_file=path / "private-escalation.receipt",
         bundle_claim_file=path / "bundle-claim.txt",
+        parking_claim_file=path / "parking-claim.txt",
     )
 
 
@@ -419,6 +429,7 @@ def consume_bundle_claim(
                     escalation_message_file=state_file.parent / "private-escalation.txt",
                     escalation_receipt_file=state_file.parent / "private-escalation.receipt",
                     bundle_claim_file=state_file.parent / "bundle-claim.txt",
+                    parking_claim_file=state_file.parent / "parking-claim.txt",
                 )
                 _validated_bundle_path(other_workspace, other_bundle)
             except (OSError, json.JSONDecodeError, SafetyError):
@@ -442,6 +453,87 @@ def consume_bundle_claim(
             claim.unlink()
         except FileNotFoundError:
             pass
+
+
+def _read_parking_target(path: Path) -> str:
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > 1024 * 1024:
+        raise SafetyError("parking target is missing or unsafe")
+    return path.read_text(encoding="utf-8")
+
+
+def consume_parking_claim(workspace: ThreadWorkspace) -> ParkingRecord | None:
+    """Validate and consume a one-shot claim naming the durable parked-work record."""
+    claim = workspace.parking_claim_file
+    if not claim.exists():
+        return None
+    try:
+        if not claim.is_file() or claim.is_symlink() or claim.stat().st_size > 4096:
+            raise SafetyError("parking claim file is unsafe")
+        raw = claim.read_text(encoding="utf-8").strip()
+        if not raw or "\n" in raw:
+            raise SafetyError("parking claim must contain exactly one absolute path")
+        target = Path(raw)
+        if not target.is_absolute():
+            raise SafetyError("parking claim must contain exactly one absolute path")
+        resolved = target.resolve(strict=False)
+
+        allowed_tasks = {workspace.path.resolve() / "TASK.md"}
+        bundle = resolve_thread_bundle(workspace)
+        if bundle:
+            allowed_tasks.add(bundle / "TASK.md")
+        if resolved in allowed_tasks:
+            content = _read_parking_target(target)
+            blocked = re.search(r"(?im)^status:\s*blocked\s*$", content)
+            parked = re.search(r"(?im)^disposition:\s*parked\s*$", content)
+            if not blocked or not parked:
+                raise SafetyError(
+                    "TASK.md parking record must contain Status: blocked and Disposition: parked"
+                )
+            return ParkingRecord("task", resolved)
+
+        worktrees = workspace.root / "worktrees"
+        try:
+            relative = resolved.relative_to(worktrees.resolve())
+        except ValueError as exc:
+            raise SafetyError("parking target is outside an allowed durable record") from exc
+        parts = relative.parts
+        if len(parts) < 4 or parts[1] != "docs" or parts[2] != "plans" or resolved.suffix != ".md":
+            raise SafetyError("docs parking target must be a plan in a docs worktree")
+        docs_worktree = worktrees / parts[0] / "docs"
+        try:
+            top = Path(_git(docs_worktree, "rev-parse", "--show-toplevel")).resolve()
+            common = Path(
+                _git(docs_worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+            ).resolve()
+        except SafetyError as exc:
+            raise SafetyError("docs parking target is not in a valid docs worktree") from exc
+        if top != docs_worktree.resolve() or common != (workspace.root / "docs" / ".git").resolve():
+            raise SafetyError("docs parking target is not in the workspace docs worktree")
+        content = _read_parking_target(target)
+        frontmatter = content.split("---", 2) if content.startswith("---\n") else []
+        if len(frontmatter) != 3 or not re.search(
+            r"(?m)^readiness:\s*paused\s*$", frontmatter[1]
+        ):
+            raise SafetyError("docs plan parking record must have readiness: paused")
+        return ParkingRecord("docs-plan", resolved)
+    finally:
+        try:
+            claim.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def private_escalation_status(
+    *, delivered: bool, parking: ParkingRecord | None, parking_refused: bool
+) -> str:
+    """Return a content-free source-thread status for a blocked autonomous turn."""
+    if not delivered:
+        return "blocked, private escalation failed"
+    if parking_refused:
+        return "blocked, escalated privately; parking record refused"
+    if parking is None:
+        return "blocked, escalated privately; parking not recorded"
+    return "blocked, escalated privately"
 
 
 def cleanup_thread_workspaces(
@@ -658,6 +750,7 @@ def build_claude_command(
     transport_script: Path,
     escalation_message_file: Path,
     bundle_claim_file: Path,
+    parking_claim_file: Path,
     model_prompt: str = "",
     session_id: str | None = None,
 ) -> list[str]:
@@ -683,6 +776,11 @@ def build_claude_command(
         f"  {shlex.quote(str(transport_python))} "
         f"{shlex.quote(str(transport_script))} --escalate\n"
         "- Post only the policy-appropriate generic status in the source thread.\n"
+        "- Before reporting blocked or parked work, write durable state to either this thread's "
+        "TASK.md (with exact fields `Status: blocked` and `Disposition: parked`), its bound bundle "
+        "TASK.md, or a docs plan "
+        "in a real docs worktree with frontmatter readiness: paused. Then write only that record's "
+        f"absolute path to {parking_claim_file}. The harness validates the record at turn end.\n"
         "- Delegate only through these harness-defined agents: cargo-chief-bounded for bounded "
         "implementation or targeted verification; cargo-chief-mechanical for mechanical/high-volume "
         "work; cargo-chief-explore for read-only search. Do not invoke built-in Explore, Plan, or "

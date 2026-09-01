@@ -51,11 +51,13 @@ from cargo_chief_safety import (
     build_claude_command,
     cleanup_thread_workspaces,
     consume_bundle_claim,
+    consume_parking_claim,
     find_workspace_root,
     format_audit_metadata,
     preflight_room,
     resolve_room_policy,
     prepare_thread_workspace,
+    private_escalation_status,
     resolve_thread_bundle,
     ThreadWorkspace,
     validate_secret_env_path,
@@ -660,7 +662,9 @@ def _spawn_claude_process(
     )
     escalation_message_file = workspace.escalation_message_file
     escalation_receipt_file = workspace.escalation_receipt_file
-    for stale_path in (escalation_message_file, escalation_receipt_file):
+    for stale_path in (
+        escalation_message_file, escalation_receipt_file, workspace.parking_claim_file
+    ):
         try:
             stale_path.unlink()
         except FileNotFoundError:
@@ -672,6 +676,7 @@ def _spawn_claude_process(
         transport_script=SOURCE_DIR / "bot.py",
         escalation_message_file=escalation_message_file,
         bundle_claim_file=workspace.bundle_claim_file,
+        parking_claim_file=workspace.parking_claim_file,
         model_prompt=model_prompt,
         session_id=session_id,
     )
@@ -692,6 +697,7 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
     proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
     proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
+    proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
     bundle = resolve_thread_bundle(workspace)
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
@@ -909,6 +915,24 @@ def _reader_loop(session: LiveSession) -> None:
                                 "BUNDLE_BOUND | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s",
                                 session.user_id, session.channel, session.thread_ts, bundle.name,
                             )
+                parking = None
+                parking_refused = None
+                if session.workspace and session.workspace.parking_claim_file.exists():
+                    try:
+                        parking = consume_parking_claim(session.workspace)
+                    except SafetyError as exc:
+                        parking_refused = str(exc)
+                        audit_logger.warning(
+                            "PARKING_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+                            session.user_id, session.channel, session.thread_ts, parking_refused,
+                        )
+                    else:
+                        if parking:
+                            audit_logger.info(
+                                "WORK_PARKED | USER:%s | CHANNEL:%s | THREAD:%s | KIND:%s | RECORD:%s",
+                                session.user_id, session.channel, session.thread_ts,
+                                parking.kind, parking.path.relative_to(session.workspace.root),
+                            )
                 sid = data.get("session_id")
                 if sid:
                     session.session_id = sid
@@ -930,10 +954,10 @@ def _reader_loop(session: LiveSession) -> None:
                             session.escalation_receipt_file.unlink()
                         except OSError:
                             pass
-                    status = (
-                        "blocked, escalated privately"
-                        if delivered
-                        else "blocked, private escalation failed"
+                    status = private_escalation_status(
+                        delivered=delivered,
+                        parking=parking,
+                        parking_refused=bool(parking_refused),
                     )
                     if session._on_text:
                         session._on_text(status)

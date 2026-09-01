@@ -14,7 +14,9 @@ from cargo_chief_safety import (
     SafetyError,
     cleanup_thread_workspaces,
     consume_bundle_claim,
+    consume_parking_claim,
     prepare_thread_workspace,
+    private_escalation_status,
     resolve_thread_bundle,
     thread_workspace_key,
     build_authority_envelope,
@@ -390,6 +392,90 @@ class RuntimePolicyTest(unittest.TestCase):
         bundle.rmdir()
         self.assertIsNone(resolve_thread_bundle(workspace))
 
+    def test_parking_claim_accepts_thread_and_bound_bundle_tasks(self):
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="park")
+        task = workspace.path / "TASK.md"
+        task.write_text("Status: blocked\nDisposition: parked\n")
+        workspace.parking_claim_file.write_text(str(task))
+        record = consume_parking_claim(workspace)
+        self.assertEqual("task", record.kind)
+        self.assertEqual(task.resolve(), record.path)
+        self.assertFalse(workspace.parking_claim_file.exists())
+
+        bundle = self._make_bundle("CN-10-parked")
+        (bundle / "TASK.md").write_text("Status: blocked\nDisposition: parked\n")
+        workspace.bundle_claim_file.write_text("CN-10-parked")
+        consume_bundle_claim(workspace, max_live_bundles=3)
+        workspace.parking_claim_file.write_text(str(bundle / "TASK.md"))
+        self.assertEqual("task", consume_parking_claim(workspace).kind)
+
+    def test_parking_claim_refuses_unsafe_or_incomplete_task(self):
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="bad-park")
+        task = workspace.path / "TASK.md"
+        task.write_text("blocked\n")
+        workspace.parking_claim_file.write_text(str(task))
+        with self.assertRaisesRegex(SafetyError, "Status: blocked"):
+            consume_parking_claim(workspace)
+        self.assertFalse(workspace.parking_claim_file.exists())
+
+        task.write_text("Status: blocked\nDisposition: parked\n")
+        link = workspace.path / "linked-task.md"
+        link.symlink_to(task)
+        workspace.parking_claim_file.write_text(str(link))
+        with self.assertRaisesRegex(SafetyError, "missing or unsafe"):
+            consume_parking_claim(workspace)
+
+    def test_parking_claim_accepts_only_paused_plan_in_real_docs_worktree(self):
+        docs = self.workspace / "docs"
+        subprocess.run(["git", "init", "-b", "master", str(docs)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(docs), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(docs), "config", "user.name", "Test"], check=True)
+        (docs / "README.md").write_text("docs\n")
+        subprocess.run(["git", "-C", str(docs), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(docs), "commit", "-m", "fixture"], check=True, capture_output=True)
+        docs_worktree = self.workspace / "worktrees" / "park-plan" / "docs"
+        docs_worktree.parent.mkdir(parents=True)
+        subprocess.run(
+            ["git", "-C", str(docs), "worktree", "add", "-b", "park-plan", str(docs_worktree)],
+            check=True, capture_output=True,
+        )
+        plan = docs_worktree / "plans" / "parked.md"
+        plan.parent.mkdir()
+        plan.write_text("---\nreadiness: paused\n---\nBlocked pending approval.\n")
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="plan")
+        workspace.parking_claim_file.write_text(str(plan))
+        record = consume_parking_claim(workspace)
+        self.assertEqual("docs-plan", record.kind)
+        self.assertEqual(plan.resolve(), record.path)
+
+        plan.write_text("---\nreadiness: in-progress\n---\n")
+        workspace.parking_claim_file.write_text(str(plan))
+        with self.assertRaisesRegex(SafetyError, "readiness: paused"):
+            consume_parking_claim(workspace)
+
+    def test_private_escalation_status_requires_delivery_and_parking(self):
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="status")
+        task = workspace.path / "TASK.md"
+        task.write_text("Status: blocked\nDisposition: parked\n")
+        workspace.parking_claim_file.write_text(str(task))
+        parking = consume_parking_claim(workspace)
+        self.assertEqual(
+            "blocked, escalated privately",
+            private_escalation_status(delivered=True, parking=parking, parking_refused=False),
+        )
+        self.assertEqual(
+            "blocked, escalated privately; parking not recorded",
+            private_escalation_status(delivered=True, parking=None, parking_refused=False),
+        )
+        self.assertEqual(
+            "blocked, escalated privately; parking record refused",
+            private_escalation_status(delivered=True, parking=None, parking_refused=True),
+        )
+        self.assertEqual(
+            "blocked, private escalation failed",
+            private_escalation_status(delivered=False, parking=parking, parking_refused=False),
+        )
+
 
 class PreflightTest(unittest.TestCase):
     def setUp(self):
@@ -473,6 +559,7 @@ class PreflightTest(unittest.TestCase):
             transport_script=Path("/home-base/bot.py"),
             escalation_message_file=Path("/workspace/work/escalation.txt"),
             bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
+            parking_claim_file=Path("/workspace/work/parking-claim.txt"),
             model_prompt="room prompt",
             session_id="session-1",
         )
@@ -498,6 +585,7 @@ class PreflightTest(unittest.TestCase):
             "/venv/bin/python /home-base/bot.py --escalate",
             appended,
         )
+        self.assertIn("/workspace/work/parking-claim.txt", appended)
         self.assertIn("/workspace/work/escalation.txt", appended)
         self.assertIn("/workspace/work/bundle-claim.txt", appended)
         self.assertNotIn("--channel D1", appended)
