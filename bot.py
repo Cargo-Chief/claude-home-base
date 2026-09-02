@@ -88,7 +88,7 @@ from provider_control import (
     use_openai_provider,
 )
 from reply_routing import ReplyRouteStore
-from session_lifecycle import oldest_evictable_session
+from session_lifecycle import oldest_evictable_session, stop_timed_out_session
 from governed_delegation import (
     budget_status,
     delegation_audit_path,
@@ -2284,10 +2284,28 @@ def process_message_async(event: dict) -> None:
                 if not session._turn_done.wait(timeout=CLAUDE_TIMEOUT):
                     try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                     except Exception: pass
+                    while session.pending_reactions:
+                        ch, ts = session.pending_reactions.pop(0)
+                        try:
+                            slack_client.reactions_remove(channel=ch, name="eyes", timestamp=ts)
+                        except Exception:
+                            pass
+                    stopped_cleanly = stop_timed_out_session(session, _interrupt_session)
                     minutes = CLAUDE_TIMEOUT // 60
                     slack_client.chat_postMessage(
                         channel=channel, thread_ts=thread_ts,
-                        text=f"Sorry, that timed out after {minutes} minutes. Try a simpler question?",
+                        text=(
+                            f"Timed out after {minutes} minutes and stopped. "
+                            "Working files and thread continuity were preserved; "
+                            "tell me to resume when ready."
+                        ),
+                    )
+                    logger.warning(
+                        "TURN_TIMEOUT | USER:%s | CHANNEL:%s | THREAD:%s | "
+                        "STOP:%s | SESSION:%s",
+                        user_id, channel, thread_ts,
+                        "clean" if stopped_cleanly else "terminated",
+                        session.session_id or "none",
                     )
                     return
 
