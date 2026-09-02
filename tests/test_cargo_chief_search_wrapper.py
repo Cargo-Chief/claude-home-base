@@ -45,6 +45,41 @@ class CargoChiefSearchWrapperTest(unittest.TestCase):
             )
             self.assertEqual(0o700, state.stat().st_mode & 0o777)
 
+    def test_search_refreshes_index_before_query(self):
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            workspace = base / "cargo_chief"
+            (workspace / "docs").mkdir(parents=True)
+            capture = base / "calls"
+            fake_python = base / "python"
+            fake_python.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'CALL\\n' >> \"$CAPTURE\"\n"
+                "printf '%s\\n' \"$@\" >> \"$CAPTURE\"\n"
+            )
+            fake_python.chmod(0o700)
+            env = os.environ | {
+                "CARGO_CHIEF_ROOT": str(workspace),
+                "CARGO_CHIEF_SEARCH_DIR": str(base / "state"),
+                "CARGO_CHIEF_SEARCH_PYTHON": str(fake_python),
+                "CAPTURE": str(capture),
+            }
+            subprocess.run(
+                ["bash", str(WRAPPER), "search", "durable decisions", "--json"],
+                env=env,
+                check=True,
+            )
+
+            calls = (capture.read_text()).split("CALL\n")[1:]
+            parsed = [call.splitlines() for call in calls]
+            common = [
+                str(ROOT / "search" / "agent_search.py"),
+                "--config",
+                str(ROOT / "search" / "config.cargo-chief.yaml.example"),
+            ]
+            self.assertEqual(common + ["index"], parsed[0])
+            self.assertEqual(common + ["search", "durable decisions", "--json"], parsed[1])
+
 
 if __name__ == "__main__":
     unittest.main()

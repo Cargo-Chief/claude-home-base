@@ -23,5 +23,10 @@ export XDG_CACHE_HOME="$search_dir/cache"
 export HF_HOME="$search_dir/cache/huggingface"
 export FASTEMBED_CACHE_PATH="$search_dir/model"
 
+if [[ "${1:-}" == "search" ]]; then
+	"$python_bin" "$script_dir/agent_search.py" \
+		--config "$script_dir/config.cargo-chief.yaml.example" index >&2
+fi
+
 exec "$python_bin" "$script_dir/agent_search.py" \
 	--config "$script_dir/config.cargo-chief.yaml.example" "$@"

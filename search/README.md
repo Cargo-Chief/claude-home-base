@@ -111,7 +111,10 @@ bash search/cargo_chief_search.sh search "why did we choose this architecture?" 
 ```
 
 `CARGO_CHIEF_SEARCH_PYTHON`, `CARGO_CHIEF_SEARCH_VENV`, and `CARGO_CHIEF_SEARCH_DIR` override the
-defaults for testing or a nonstandard installation. The wrapper never enables transcript search.
+defaults for testing or a nonstandard installation. Before each `search`, the wrapper runs an
+incremental index refresh so changed, deleted, excluded, and superseded docs are reconciled before
+results are returned. Unchanged files are skipped by content hash. The wrapper never enables
+transcript search.
 
 ```bash
 bash search/cargo_chief_search.sh index
@@ -156,9 +159,11 @@ alias lsearch="/path/to/search/venv/bin/python3 /path/to/search/agent_search.py 
 
 Then: `lsearch "your query here"`
 
-## Nightly Re-indexing
+## Index maintenance
 
-Use launchd (macOS) to keep the index fresh. Create a wrapper script and plist — the indexer skips unchanged files automatically, so nightly runs are fast.
+Cargo Chief search refreshes incrementally before every query, so a nightly scheduler is not required
+for correctness. Run `cargo_chief_search.sh index` directly when you want to pre-warm the index after a
+large docs pull; changed files replace their prior chunks and removed files are purged.
 
 ## Performance
 
