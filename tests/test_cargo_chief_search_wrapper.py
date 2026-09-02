@@ -10,11 +10,22 @@ WRAPPER = ROOT / "search" / "cargo_chief_search.sh"
 
 
 class CargoChiefSearchWrapperTest(unittest.TestCase):
+    def _initialize_docs_repo(self, workspace):
+        docs = workspace / "docs"
+        docs.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(docs)], check=True)
+        subprocess.run(["git", "-C", str(docs), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(docs), "config", "user.email", "test@example.com"], check=True)
+        (docs / "README.md").write_text("initial\n")
+        subprocess.run(["git", "-C", str(docs), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(docs), "commit", "-qm", "initial"], check=True)
+        return docs
+
     def test_wrapper_supplies_private_cache_and_curated_config(self):
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)
             workspace = base / "cargo_chief"
-            (workspace / "docs").mkdir(parents=True)
+            self._initialize_docs_repo(workspace)
             state = base / "state"
             capture = base / "capture"
             fake_python = base / "python"
@@ -49,7 +60,7 @@ class CargoChiefSearchWrapperTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)
             workspace = base / "cargo_chief"
-            (workspace / "docs").mkdir(parents=True)
+            docs = self._initialize_docs_repo(workspace)
             capture = base / "calls"
             fake_python = base / "python"
             fake_python.write_text(
@@ -79,6 +90,29 @@ class CargoChiefSearchWrapperTest(unittest.TestCase):
             ]
             self.assertEqual(common + ["index"], parsed[0])
             self.assertEqual(common + ["search", "durable decisions", "--json"], parsed[1])
+
+            subprocess.run(
+                ["bash", str(WRAPPER), "search", "another query", "--json"],
+                env=env,
+                check=True,
+            )
+            calls = (capture.read_text()).split("CALL\n")[1:]
+            parsed = [call.splitlines() for call in calls]
+            self.assertEqual(common + ["search", "another query", "--json"], parsed[2])
+
+            (docs / "README.md").write_text("changed\n")
+            subprocess.run(["git", "-C", str(docs), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(docs), "commit", "-qm", "changed"], check=True)
+            subprocess.run(
+                ["bash", str(WRAPPER), "search", "after docs change", "--json"],
+                env=env,
+                check=True,
+            )
+            calls = (capture.read_text()).split("CALL\n")[1:]
+            parsed = [call.splitlines() for call in calls]
+            self.assertEqual(common + ["index"], parsed[3])
+            self.assertEqual(common + ["search", "after docs change", "--json"], parsed[4])
+            self.assertEqual(0o600, (base / "state" / "index-revision").stat().st_mode & 0o777)
 
 
 if __name__ == "__main__":

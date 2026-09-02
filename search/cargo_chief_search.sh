@@ -5,6 +5,8 @@ root="${CARGO_CHIEF_ROOT:?CARGO_CHIEF_ROOT must point to the Cargo Chief workspa
 search_dir="${CARGO_CHIEF_SEARCH_DIR:-$HOME/.local/state/cargo-chief/knowledge}"
 python_bin="${CARGO_CHIEF_SEARCH_PYTHON:-$HOME/.local/share/cargo-chief/knowledge-venv/bin/python}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+config_path="$script_dir/config.cargo-chief.yaml.example"
+search_program="$script_dir/agent_search.py"
 
 if [[ ! -d "$root/docs" ]]; then
 	echo "Cargo Chief docs not found at $root/docs" >&2
@@ -24,9 +26,23 @@ export HF_HOME="$search_dir/cache/huggingface"
 export FASTEMBED_CACHE_PATH="$search_dir/model"
 
 if [[ "${1:-}" == "search" ]]; then
-	"$python_bin" "$script_dir/agent_search.py" \
-		--config "$script_dir/config.cargo-chief.yaml.example" index >&2
+	docs_revision="$(git -C "$root/docs" rev-parse --verify HEAD)"
+	index_revision="$(shasum -a 256 "$config_path" "$search_program" | shasum -a 256 | awk '{print $1}')"
+	wanted_revision="$docs_revision:$index_revision"
+	revision_file="$search_dir/index-revision"
+	current_revision=""
+	if [[ -f "$revision_file" && ! -L "$revision_file" ]]; then
+		current_revision="$(<"$revision_file")"
+	fi
+	if [[ "$current_revision" != "$wanted_revision" ]]; then
+		"$python_bin" "$search_program" --config "$config_path" index >&2
+		revision_tmp="$(mktemp "$search_dir/.index-revision.XXXXXX")"
+		trap 'rm -f "$revision_tmp"' EXIT
+		printf '%s\n' "$wanted_revision" > "$revision_tmp"
+		chmod 600 "$revision_tmp"
+		mv "$revision_tmp" "$revision_file"
+		trap - EXIT
+	fi
 fi
 
-exec "$python_bin" "$script_dir/agent_search.py" \
-	--config "$script_dir/config.cargo-chief.yaml.example" "$@"
+exec "$python_bin" "$search_program" --config "$config_path" "$@"
