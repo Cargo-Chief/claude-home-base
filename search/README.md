@@ -47,7 +47,9 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Requires Python 3.12+ (macOS system Python 3.9 doesn't support SQLite extension loading). Install via `brew install python@3.12` if needed.
+Requires Python 3.12+ **built with SQLite extension loading**. Homebrew Python provides it; a stock
+pyenv build may not. Run `doctor` before installing or indexing. Install via
+`brew install python@3.12` if needed, or rebuild pyenv Python with loadable SQLite extension support.
 
 The embedding model (~130 MB) downloads automatically on first run.
 
@@ -83,6 +85,44 @@ directories:
 Supported types:
 - `markdown` — recursively scans for `.md` and `.txt` files
 - `jsonl` — extracts human/assistant messages from Claude Code session logs
+
+### Cargo Chief curated-knowledge mode
+
+Cargo Chief does **not** use the conversation example above. Start from
+`config.cargo-chief.yaml.example` and set `CARGO_CHIEF_ROOT` plus a private external
+`CARGO_CHIEF_SEARCH_DIR`. In `mode: cargo-chief-docs` the program fails closed unless every source
+is Markdown beneath the canonical docs root and the database is outside the Cargo Chief workspace.
+It rejects symlinked sources/files, JSONL, duplicate source ownership, and paths that escape the
+docs root.
+
+Every index refresh reconciles the database against the configured corpus: changed files replace
+their chunks, deleted or newly excluded files are removed, and removed source definitions are
+purged. Use `rebuild` for a clean regeneration and `purge` to delete the database and its SQLite
+sidecars. `status --json` exposes counts and paths without indexed content.
+
+Install the dedicated environment once, then use the wrapper. It pins the index, model, and cache
+under a private per-user state directory and supplies the canonical docs-only configuration:
+
+```bash
+bash search/install_cargo_chief_search.sh
+bash search/cargo_chief_search.sh doctor
+bash search/cargo_chief_search.sh index
+bash search/cargo_chief_search.sh search "why did we choose this architecture?" --json
+```
+
+`CARGO_CHIEF_SEARCH_PYTHON`, `CARGO_CHIEF_SEARCH_VENV`, and `CARGO_CHIEF_SEARCH_DIR` override the
+defaults for testing or a nonstandard installation. The wrapper never enables transcript search.
+
+```bash
+bash search/cargo_chief_search.sh index
+bash search/cargo_chief_search.sh doctor
+bash search/cargo_chief_search.sh status --json
+bash search/cargo_chief_search.sh rebuild
+bash search/cargo_chief_search.sh purge
+```
+
+Decision-record search results include lifecycle and supersession metadata so an obsolete decision
+is not presented as current merely because it matched strongly.
 
 ## Usage
 

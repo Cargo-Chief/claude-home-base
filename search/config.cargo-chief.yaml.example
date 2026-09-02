@@ -1,0 +1,41 @@
+# Cargo Chief curated knowledge — raw transcripts are intentionally unsupported here.
+mode: cargo-chief-docs
+docs_root: ${CARGO_CHIEF_ROOT}/docs
+database: ${CARGO_CHIEF_SEARCH_DIR}/knowledge.db
+
+directories:
+  - path: ${CARGO_CHIEF_ROOT}/docs
+    name: hubs
+    type: markdown
+    include:
+      - PRODUCT_OVERVIEW.md
+      - PRODUCT_DIRECTION.md
+      - PLATFORM_TECHNICAL_OVERVIEW.md
+      - CONCEPTS.md
+
+  - path: ${CARGO_CHIEF_ROOT}/docs/product
+    name: product
+    type: markdown
+
+  - path: ${CARGO_CHIEF_ROOT}/docs/platform
+    name: platform
+    type: markdown
+
+  - path: ${CARGO_CHIEF_ROOT}/docs/solutions
+    name: solutions
+    type: markdown
+
+  - path: ${CARGO_CHIEF_ROOT}/docs/plans
+    name: plans
+    type: markdown
+    exclude:
+      - archive
+
+  - path: ${CARGO_CHIEF_ROOT}/docs/decisions
+    name: decisions
+    type: markdown
+    exclude:
+      - templates
+
+chunk_size: 1000
+chunk_overlap: 200
