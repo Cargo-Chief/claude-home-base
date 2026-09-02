@@ -65,6 +65,7 @@ from cargo_chief_safety import (
     ThreadWorkspace,
     validate_secret_env_path,
     validate_existing_thread_workspace,
+    validate_parking_claim,
     validate_codex_runtime,
     write_private_json,
 )
@@ -1072,6 +1073,8 @@ def _reader_loop(session: LiveSession) -> None:
                             "PARKING_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
                             session.user_id, session.channel, session.thread_ts, parking_refused,
                         )
+                        if session._on_text and not session.private_escalation_pending:
+                            session._on_text(f"Parking record refused: {parking_refused}")
                     else:
                         if parking:
                             audit_logger.info(
@@ -2863,6 +2866,10 @@ def main():
         help="Post to the harness-configured private escalation route and exit",
     )
     parser.add_argument(
+        "--check-parking", action="store_true",
+        help="Validate the current thread's one-shot parking claim without consuming it",
+    )
+    parser.add_argument(
         "--history", metavar="CHANNEL_ID",
         help="Print recent messages from a channel (or a thread if --thread is set)",
     )
@@ -2976,6 +2983,32 @@ def main():
         )
         receipt_path.write_text("delivered\n", encoding="utf-8")
         receipt_path.chmod(0o600)
+        return
+
+    if args.check_parking:
+        root_value = os.environ.get("CARGO_CHIEF_ROOT", "")
+        channel = os.environ.get("CLAUDE_CHANNEL_ID", "")
+        thread = os.environ.get("CLAUDE_THREAD_TS", "")
+        if not root_value or not channel or not thread:
+            raise SystemExit("parking preflight route is unavailable")
+        root = Path(root_value)
+        workspace_path = validate_existing_thread_workspace(
+            root, channel=channel, thread=thread
+        )
+        state = json.loads((workspace_path / "state.json").read_text(encoding="utf-8"))
+        workspace = prepare_thread_workspace(
+            root,
+            channel=channel,
+            thread=thread,
+            session_id=state.get("session_id"),
+        )
+        try:
+            parking = validate_parking_claim(workspace)
+        except SafetyError as exc:
+            raise SystemExit(f"PARKING_REFUSED: {exc}") from exc
+        if parking is None:
+            raise SystemExit("PARKING_REFUSED: parking claim is missing")
+        print(f"PARKING_VALID: {parking.kind}")
         return
 
     if args.history:
