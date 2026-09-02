@@ -28,7 +28,9 @@ or transcript search.
 Cargo Chief does not use the upstream singleton `~/identity.md` design. Each Unix service principal
 may own a private local identity directory containing `identity.md`, `origin.md`, `voice.md`,
 `relationships.md`, and `diary/*.md`. Initialize it with `python3 agent_identity.py init`, configure
-its absolute path as `CARGO_CHIEF_IDENTITY_DIR`, and restart the service. A configured store fails
+`CARGO_CHIEF_IDENTITY_DIR` as the invariant path `$HOME/.local/share/cargo-chief/identity`, and
+restart the service. Alternate paths are refused because the permission rails deliberately grant
+only that principal-local directory. A configured store fails
 closed unless its directories are mode `0700` and files are mode `0600` regular non-symlinks.
 
 The four core files are injected into every new Claude process and every OpenAI fallback turn, so a
@@ -52,6 +54,8 @@ bash search/agent_identity_search.sh search "what have I learned about collabora
 It accepts only the configured principal's four core Markdown files and sanitized diary. It never
 accepts Claude JSONL or Slack transcript sources. The wrapper fingerprints the local corpus and
 incrementally reconciles changes and deletions before retrieval.
+The raw index at `$HOME/.local/state/cargo-chief/identity-search` is not directly readable or
+writable by an agent session; all access goes through the wrapper above.
 
 Each Slack thread runs from a stable private scratch directory under
 `$CARGO_CHIEF_ROOT/work/home-base/<routing-hash>/`. The hash includes both the channel and thread,

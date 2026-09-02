@@ -5,9 +5,20 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/.." && pwd)"
 identity_dir="${CARGO_CHIEF_IDENTITY_DIR:-$HOME/.local/share/cargo-chief/identity}"
 search_dir="${CARGO_CHIEF_IDENTITY_SEARCH_DIR:-$HOME/.local/state/cargo-chief/identity-search}"
+canonical_identity_dir="$HOME/.local/share/cargo-chief/identity"
+canonical_search_dir="$HOME/.local/state/cargo-chief/identity-search"
 python_bin="${CARGO_CHIEF_SEARCH_PYTHON:-$HOME/.local/share/cargo-chief/knowledge-venv/bin/python}"
 config_path="$script_dir/config.agent-identity.yaml.example"
 search_program="$script_dir/agent_search.py"
+
+if [[ "$identity_dir" != "$canonical_identity_dir" ]]; then
+	echo "CARGO_CHIEF_IDENTITY_DIR must equal $canonical_identity_dir" >&2
+	exit 2
+fi
+if [[ "$search_dir" != "$canonical_search_dir" ]]; then
+	echo "CARGO_CHIEF_IDENTITY_SEARCH_DIR must equal $canonical_search_dir" >&2
+	exit 2
+fi
 
 export CARGO_CHIEF_IDENTITY_DIR="$identity_dir"
 export CARGO_CHIEF_IDENTITY_SEARCH_DIR="$search_dir"

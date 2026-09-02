@@ -68,7 +68,7 @@ from cargo_chief_safety import (
     validate_codex_runtime,
     write_private_json,
 )
-from agent_identity import identity_root, load_identity_context, validate_store
+from agent_identity import canonical_identity_root, load_identity_context, validate_store
 from slack_prompting import (
     contains_private_escalation_action,
     needs_relevance_prefix,
@@ -113,7 +113,7 @@ load_dotenv(dotenv_path=ENV_FILE)
 
 os.umask(0o077)
 RUNTIME_POLICY = RuntimePolicy.from_env(source_dir=SOURCE_DIR, workspace_root=WORKSPACE_ROOT)
-IDENTITY_DIR = identity_root(os.environ["CARGO_CHIEF_IDENTITY_DIR"]) \
+IDENTITY_DIR = canonical_identity_root(os.environ["CARGO_CHIEF_IDENTITY_DIR"]) \
     if os.environ.get("CARGO_CHIEF_IDENTITY_DIR") else None
 
 

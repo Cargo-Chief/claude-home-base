@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from agent_identity import (
+    canonical_identity_root,
     IdentityError,
     initialize_store,
     load_identity_context,
@@ -14,6 +15,11 @@ from agent_identity import (
 
 
 class AgentIdentityTest(unittest.TestCase):
+    def test_runtime_root_refuses_noncanonical_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(IdentityError, "canonical path"):
+                canonical_identity_root(temp)
+
     def test_init_creates_private_per_principal_store(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "identity"

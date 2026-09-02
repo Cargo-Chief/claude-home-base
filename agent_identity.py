@@ -38,6 +38,15 @@ def identity_root(value: Optional[str] = None) -> Path:
     return root.absolute()
 
 
+def canonical_identity_root(value: Optional[str] = None) -> Path:
+    """Resolve the runtime identity root and enforce the permission-rail invariant."""
+    root = identity_root(value)
+    expected = DEFAULT_ROOT.expanduser().absolute()
+    if root != expected:
+        raise IdentityError(f"identity directory must equal the canonical path: {expected}")
+    return root
+
+
 def _secure_regular_file(path: Path) -> None:
     if path.is_symlink() or not path.is_file():
         raise IdentityError(f"identity file must be a regular non-symlink file: {path.name}")

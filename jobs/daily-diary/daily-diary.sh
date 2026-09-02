@@ -11,6 +11,12 @@ export HOME="/Users/YOUR_USERNAME"
 DATE=$(date +%Y-%m-%d)
 WORKSPACE_ROOT="${CARGO_CHIEF_ROOT:?CARGO_CHIEF_ROOT must be set for the governed diary session}"
 IDENTITY_DIR="${CARGO_CHIEF_IDENTITY_DIR:-$HOME/.local/share/cargo-chief/identity}"
+CANONICAL_IDENTITY_DIR="$HOME/.local/share/cargo-chief/identity"
+
+if [[ "$IDENTITY_DIR" != "$CANONICAL_IDENTITY_DIR" ]]; then
+	echo "CARGO_CHIEF_IDENTITY_DIR must equal $CANONICAL_IDENTITY_DIR" >&2
+	exit 2
+fi
 HOME_BASE_DIR="${CARGO_CHIEF_HOME_BASE_DIR:-$WORKSPACE_ROOT/claude-home-base}"
 DIARY_DIR="$IDENTITY_DIR/diary"
 DIARY_FILE="$DIARY_DIR/$DATE.md"
