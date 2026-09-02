@@ -87,6 +87,7 @@ from provider_control import (
     use_openai_provider,
 )
 from reply_routing import ReplyRouteStore
+from session_lifecycle import oldest_evictable_session
 from governed_delegation import (
     budget_status,
     delegation_audit_path,
@@ -1144,7 +1145,11 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
 
         # Evict oldest idle session if at capacity
         if len(_live_sessions) >= MAX_LIVE_SESSIONS:
-            oldest_ts = min(_live_sessions, key=lambda k: _live_sessions[k].last_activity)
+            oldest_ts = oldest_evictable_session(_live_sessions)
+            if oldest_ts is None:
+                raise SafetyError(
+                    "live session cap reached; every existing session is processing a turn"
+                )
             oldest = _live_sessions.pop(oldest_ts)
             logger.info(f"Evicting idle session for thread {oldest_ts} (pid={oldest.proc.pid})")
             try:
@@ -1204,7 +1209,10 @@ def _cleanup_idle_sessions() -> None:
         to_remove = []
         with _live_sessions_lock:
             for ts, session in list(_live_sessions.items()):
-                if now - session.last_activity > IDLE_TIMEOUT:
+                if (
+                    not session.turn_lock.locked()
+                    and now - session.last_activity > IDLE_TIMEOUT
+                ):
                     to_remove.append((ts, session))
 
         for ts, session in to_remove:
