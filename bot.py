@@ -68,6 +68,7 @@ from cargo_chief_safety import (
     validate_codex_runtime,
     write_private_json,
 )
+from agent_identity import canonical_identity_root, load_identity_context, validate_store
 from slack_prompting import (
     contains_private_escalation_action,
     needs_relevance_prefix,
@@ -112,7 +113,26 @@ load_dotenv(dotenv_path=ENV_FILE)
 
 os.umask(0o077)
 RUNTIME_POLICY = RuntimePolicy.from_env(source_dir=SOURCE_DIR, workspace_root=WORKSPACE_ROOT)
+IDENTITY_DIR = canonical_identity_root(os.environ["CARGO_CHIEF_IDENTITY_DIR"]) \
+    if os.environ.get("CARGO_CHIEF_IDENTITY_DIR") else None
+
+
+def _identity_prompt() -> str:
+    """Read the current agent-owned profile for each new provider process/turn."""
+    if IDENTITY_DIR is None:
+        return ""
+    context = load_identity_context(IDENTITY_DIR)
+    return (
+        f"Your writable local identity directory is {IDENTITY_DIR}. "
+        f"Search it with: bash {SOURCE_DIR / 'search' / 'agent_identity_search.sh'} search "
+        '"<personal-memory question>".\n\n'
+        f"{context}"
+    )
+
+
 RUNTIME_POLICY.prepare()
+if IDENTITY_DIR is not None:
+    validate_store(IDENTITY_DIR)
 LOG_DIR = RUNTIME_POLICY.log_dir
 STATE_DIR = RUNTIME_POLICY.state_dir
 TEMP_DIR = RUNTIME_POLICY.temp_dir
@@ -760,6 +780,7 @@ def _spawn_claude_process(
         parking_claim_file=workspace.parking_claim_file,
         delegation_request_file=workspace.delegation_request_file,
         implementation_claim_file=workspace.implementation_claim_file,
+        identity_prompt=_identity_prompt(),
         model_prompt=model_prompt,
         session_id=session_id,
     )
@@ -1847,6 +1868,7 @@ def _run_openai_fallback(
         parking_claim_file=workspace.parking_claim_file,
         delegation_request_file=workspace.delegation_request_file,
         implementation_claim_file=workspace.implementation_claim_file,
+        identity_prompt=_identity_prompt(),
     )
     proc_env = {**os.environ}
     proc_env.update({

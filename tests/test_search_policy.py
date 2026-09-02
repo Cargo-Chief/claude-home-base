@@ -162,6 +162,59 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
         finally:
             search.sqlite3.connect = original
 
+    def test_private_identity_mode_accepts_only_own_profile_and_diary(self):
+        identity = self.base / "identity"
+        diary = identity / "diary"
+        diary.mkdir(parents=True)
+        runtime = self.base / "identity-search"
+        cfg = {
+            "mode": "agent-identity",
+            "identity_root": str(identity),
+            "database": str(runtime / "identity.db"),
+            "directories": [
+                {"path": str(identity), "name": "profile", "type": "markdown", "include": [
+                    "identity.md", "origin.md", "voice.md", "relationships.md",
+                ]},
+                {"path": str(diary), "name": "diary", "type": "markdown"},
+            ],
+        }
+        search._validate_agent_identity_config(cfg, identity, runtime)
+        cfg["directories"][1]["type"] = "jsonl"
+        with self.assertRaisesRegex(ValueError, "profile and diary"):
+            search._validate_agent_identity_config(cfg, identity, runtime)
+
+    def test_private_identity_mode_rejects_cross_principal_source(self):
+        identity = self.base / "identity"
+        (identity / "diary").mkdir(parents=True)
+        other = self.base / "other-agent"
+        other.mkdir()
+        runtime = self.base / "identity-search"
+        cfg = {
+            "mode": "agent-identity",
+            "identity_root": str(identity),
+            "database": str(runtime / "identity.db"),
+            "directories": [
+                {"path": str(identity), "name": "profile", "type": "markdown", "include": [
+                    "identity.md", "origin.md", "voice.md", "relationships.md",
+                ]},
+                {"path": str(other), "name": "diary", "type": "markdown"},
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            search._validate_agent_identity_config(cfg, identity, runtime)
+
+    def test_private_identity_corpus_is_markdown_only(self):
+        identity = self.base / "identity"
+        diary = identity / "diary"
+        diary.mkdir(parents=True)
+        (diary / "entry.md").write_text("reflection")
+        (diary / "raw.txt").write_text("not admitted")
+        files = search.enumerate_markdown_files(
+            {"path": str(diary), "name": "diary", "type": "markdown"},
+            markdown_only=True,
+        )
+        self.assertEqual([str((diary / "entry.md").resolve())], files)
+
     def test_failed_refresh_rolls_back_file_and_fails_closed(self):
         document = self.docs / "record.md"
         document.write_text("# Replacement\n\nnew content\n")

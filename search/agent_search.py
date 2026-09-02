@@ -39,6 +39,8 @@ def load_config(path=CONFIG_PATH):
         d["path"] = os.path.expandvars(os.path.expanduser(d["path"]))
     if cfg.get("mode") == "cargo-chief-docs":
         _validate_cargo_chief_config(cfg)
+    elif cfg.get("mode") == "agent-identity":
+        _validate_agent_identity_config(cfg)
     return cfg
 
 
@@ -105,6 +107,60 @@ def _validate_cargo_chief_config(cfg, workspace_root=None, search_root=None):
         includes = source.get("include", [])
         if not isinstance(includes, list) or any(not isinstance(v, str) or not v for v in includes):
             raise ValueError(f"source {name} include must be a list of non-empty patterns")
+
+
+def _validate_agent_identity_config(cfg, identity_root=None, search_root=None):
+    """Restrict the private index to one principal's identity and diary Markdown."""
+    configured = cfg.get("identity_root", "")
+    if not configured:
+        raise ValueError("agent-identity mode requires identity_root")
+    configured_root = Path(os.path.expandvars(os.path.expanduser(configured)))
+    if identity_root is None:
+        env_root = os.environ.get("CARGO_CHIEF_IDENTITY_DIR")
+        if not env_root:
+            raise ValueError("agent-identity mode requires CARGO_CHIEF_IDENTITY_DIR")
+        identity_root = Path(env_root)
+    expected_path = Path(identity_root).expanduser().absolute()
+    if expected_path.is_symlink() or not expected_path.is_dir():
+        raise ValueError("identity_root must be a non-symlink directory")
+    expected = expected_path.resolve()
+    if configured_root.is_symlink() or configured_root.resolve() != expected:
+        raise ValueError("identity_root must match the configured per-principal identity directory")
+    cfg["identity_root"] = str(expected)
+
+    database = Path(cfg["database"]).resolve(strict=False)
+    if search_root is None:
+        value = os.environ.get("CARGO_CHIEF_IDENTITY_SEARCH_DIR")
+        if not value:
+            raise ValueError("agent-identity mode requires CARGO_CHIEF_IDENTITY_SEARCH_DIR")
+        search_root = Path(value)
+    search_root = Path(search_root).expanduser().resolve()
+    if database.parent != search_root or database.name != "identity.db":
+        raise ValueError("identity database must be identity.db in CARGO_CHIEF_IDENTITY_SEARCH_DIR")
+    cfg["database"] = str(database)
+
+    allowed = {
+        "profile": (expected, ("identity.md", "origin.md", "voice.md", "relationships.md")),
+        "diary": (expected / "diary", ()),
+    }
+    seen = set()
+    for source in cfg.get("directories", []):
+        name = source.get("name", "")
+        if name not in allowed or name in seen or source.get("type") != "markdown":
+            raise ValueError("agent-identity sources must be unique Markdown profile and diary sources")
+        seen.add(name)
+        source_value = Path(source["path"])
+        if source_value.is_symlink():
+            raise ValueError(f"source {name} must not be a symlink")
+        source_path = source_value.resolve()
+        wanted_path, wanted_include = allowed[name]
+        if source_path != wanted_path:
+            raise ValueError(f"source {name} escapes the per-principal identity directory")
+        if wanted_include and tuple(source.get("include", [])) != wanted_include:
+            raise ValueError("profile source must include only the four identity files")
+        source["path"] = str(source_path)
+    if seen != set(allowed):
+        raise ValueError("agent-identity mode requires profile and diary sources")
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +510,7 @@ def index_all(cfg, force=False):
     total_errors = 0
     source_files = {}
 
-    if cfg.get("mode") == "cargo-chief-docs":
+    if cfg.get("mode") in ("cargo-chief-docs", "agent-identity"):
         for source in cfg["directories"]:
             source_files[source["name"]] = set(enumerate_markdown_files(source, markdown_only=True))
         validate_source_file_ownership(source_files)

@@ -129,6 +129,22 @@ bash search/cargo_chief_search.sh purge
 Decision-record search results include lifecycle and supersession metadata so an obsolete decision
 is not presented as current merely because it matched strongly.
 
+### Private agent-identity mode
+
+`agent_identity_search.sh` uses a different database and a fail-closed configuration. It indexes
+only the current Unix principal's configured `identity.md`, `origin.md`, `voice.md`,
+`relationships.md`, and `diary/*.md`. This corpus is agent-writable personal continuity, not shared
+Cargo Chief truth, and is never available to another service principal.
+
+```bash
+python3 agent_identity.py init
+bash search/agent_identity_search.sh index
+bash search/agent_identity_search.sh search "how has my working relationship changed?" --json
+```
+
+The shared docs search and private identity search must not share a database or configuration. Raw
+conversation JSONL is prohibited in both Cargo Chief modes.
+
 ## Usage
 
 ```bash

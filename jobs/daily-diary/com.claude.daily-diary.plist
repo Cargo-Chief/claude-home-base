@@ -9,10 +9,16 @@
         <string>/bin/bash</string>
         <string>/Users/YOUR_USERNAME/scripts/daily-diary.sh</string>
     </array>
-    <!-- Always set WorkingDirectory to your home dir, or launchd defaults to /
-         and Claude Code spins up a split-brain project with separate memory. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CARGO_CHIEF_ROOT</key>
+        <string>CARGO_CHIEF_ROOT_PLACEHOLDER</string>
+        <key>CARGO_CHIEF_IDENTITY_DIR</key>
+        <string>/Users/YOUR_USERNAME/.local/share/cargo-chief/identity</string>
+    </dict>
+    <!-- Run from the governed workspace so the same AGENTS/CLAUDE instructions apply. -->
     <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USERNAME</string>
+    <string>CARGO_CHIEF_ROOT_PLACEHOLDER</string>
     <!-- Times are LOCAL. 3:30 AM keeps it off-peak. -->
     <key>StartCalendarInterval</key>
     <dict>

@@ -613,6 +613,7 @@ class PreflightTest(unittest.TestCase):
             parking_claim_file=Path("/workspace/work/parking-claim.txt"),
             delegation_request_file=Path("/workspace/work/delegation-request.json"),
             implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
+            identity_prompt="agent identity",
             model_prompt="room prompt",
             session_id="session-1",
         )
@@ -638,6 +639,7 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("/workspace/work/implementation-claim.txt", appended)
         self.assertNotIn("--channel D1", appended)
         self.assertIn("Do not invoke Agent, Task, Explore, Plan", appended)
+        self.assertIn("agent identity", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
 
@@ -670,10 +672,12 @@ class PreflightTest(unittest.TestCase):
             parking_claim_file=Path("/workspace/parking.txt"),
             delegation_request_file=Path("/workspace/delegation-request.json"),
             implementation_claim_file=Path("/workspace/implementation-claim.txt"),
+            identity_prompt="agent identity",
         )
         self.assertTrue(prompt.startswith("autonomous\n\nCargo Chief harness"))
         self.assertIn("raw Codex collaboration is disabled", prompt)
         self.assertIn("governed_delegation.py", prompt)
+        self.assertIn("agent identity", prompt)
         self.assertTrue(prompt.endswith("authority envelope"))
 
     def test_codex_runtime_requires_cli_and_generated_profile(self):
