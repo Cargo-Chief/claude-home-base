@@ -16,6 +16,7 @@ from cargo_chief_safety import (
     cleanup_thread_workspaces,
     consume_bundle_claim,
     consume_parking_claim,
+    validate_parking_claim,
     prepare_thread_workspace,
     private_escalation_status,
     resolve_thread_bundle,
@@ -475,6 +476,22 @@ class RuntimePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "missing or unsafe"):
             consume_parking_claim(workspace)
 
+    def test_parking_preflight_allows_correction_then_final_consumption(self):
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="preflight")
+        task = workspace.path / "TASK.md"
+        task.write_text("Status: paused\nDisposition: parked\n")
+        workspace.parking_claim_file.write_text(str(task))
+
+        with self.assertRaisesRegex(SafetyError, "Status: blocked"):
+            validate_parking_claim(workspace)
+        self.assertTrue(workspace.parking_claim_file.exists())
+
+        task.write_text("Status: blocked\nDisposition: parked\n")
+        self.assertEqual("task", validate_parking_claim(workspace).kind)
+        self.assertTrue(workspace.parking_claim_file.exists())
+        self.assertEqual("task", consume_parking_claim(workspace).kind)
+        self.assertFalse(workspace.parking_claim_file.exists())
+
     def test_parking_claim_accepts_only_paused_plan_in_real_docs_worktree(self):
         docs = self.workspace / "docs"
         subprocess.run(["git", "init", "-b", "master", str(docs)], check=True, capture_output=True)
@@ -630,6 +647,10 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("private escalation route is Slack channel D1", appended)
         self.assertIn(
             "/venv/bin/python /home-base/bot.py --escalate",
+            appended,
+        )
+        self.assertIn(
+            "/venv/bin/python /home-base/bot.py --check-parking",
             appended,
         )
         self.assertIn("/workspace/work/parking-claim.txt", appended)

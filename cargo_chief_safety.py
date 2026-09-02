@@ -508,61 +508,69 @@ def _read_parking_target(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def validate_parking_claim(workspace: ThreadWorkspace) -> ParkingRecord | None:
+    """Validate a parking claim without consuming it."""
+    claim = workspace.parking_claim_file
+    if not claim.exists():
+        return None
+    if not claim.is_file() or claim.is_symlink() or claim.stat().st_size > 4096:
+        raise SafetyError("parking claim file is unsafe")
+    raw = claim.read_text(encoding="utf-8").strip()
+    if not raw or "\n" in raw:
+        raise SafetyError("parking claim must contain exactly one absolute path")
+    target = Path(raw)
+    if not target.is_absolute():
+        raise SafetyError("parking claim must contain exactly one absolute path")
+    resolved = target.resolve(strict=False)
+
+    allowed_tasks = {workspace.path.resolve() / "TASK.md"}
+    bundle = resolve_thread_bundle(workspace)
+    if bundle:
+        allowed_tasks.add(bundle / "TASK.md")
+    if resolved in allowed_tasks:
+        content = _read_parking_target(target)
+        blocked = re.search(r"(?im)^status:\s*blocked\s*$", content)
+        parked = re.search(r"(?im)^disposition:\s*parked\s*$", content)
+        if not blocked or not parked:
+            raise SafetyError(
+                "TASK.md parking record must contain Status: blocked and Disposition: parked"
+            )
+        return ParkingRecord("task", resolved)
+
+    worktrees = workspace.root / "worktrees"
+    try:
+        relative = resolved.relative_to(worktrees.resolve())
+    except ValueError as exc:
+        raise SafetyError("parking target is outside an allowed durable record") from exc
+    parts = relative.parts
+    if len(parts) < 4 or parts[1] != "docs" or parts[2] != "plans" or resolved.suffix != ".md":
+        raise SafetyError("docs parking target must be a plan in a docs worktree")
+    docs_worktree = worktrees / parts[0] / "docs"
+    try:
+        top = Path(_git(docs_worktree, "rev-parse", "--show-toplevel")).resolve()
+        common = Path(
+            _git(docs_worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ).resolve()
+    except SafetyError as exc:
+        raise SafetyError("docs parking target is not in a valid docs worktree") from exc
+    if top != docs_worktree.resolve() or common != (workspace.root / "docs" / ".git").resolve():
+        raise SafetyError("docs parking target is not in the workspace docs worktree")
+    content = _read_parking_target(target)
+    frontmatter = content.split("---", 2) if content.startswith("---\n") else []
+    if len(frontmatter) != 3 or not re.search(
+        r"(?m)^readiness:\s*paused\s*$", frontmatter[1]
+    ):
+        raise SafetyError("docs plan parking record must have readiness: paused")
+    return ParkingRecord("docs-plan", resolved)
+
+
 def consume_parking_claim(workspace: ThreadWorkspace) -> ParkingRecord | None:
     """Validate and consume a one-shot claim naming the durable parked-work record."""
     claim = workspace.parking_claim_file
     if not claim.exists():
         return None
     try:
-        if not claim.is_file() or claim.is_symlink() or claim.stat().st_size > 4096:
-            raise SafetyError("parking claim file is unsafe")
-        raw = claim.read_text(encoding="utf-8").strip()
-        if not raw or "\n" in raw:
-            raise SafetyError("parking claim must contain exactly one absolute path")
-        target = Path(raw)
-        if not target.is_absolute():
-            raise SafetyError("parking claim must contain exactly one absolute path")
-        resolved = target.resolve(strict=False)
-
-        allowed_tasks = {workspace.path.resolve() / "TASK.md"}
-        bundle = resolve_thread_bundle(workspace)
-        if bundle:
-            allowed_tasks.add(bundle / "TASK.md")
-        if resolved in allowed_tasks:
-            content = _read_parking_target(target)
-            blocked = re.search(r"(?im)^status:\s*blocked\s*$", content)
-            parked = re.search(r"(?im)^disposition:\s*parked\s*$", content)
-            if not blocked or not parked:
-                raise SafetyError(
-                    "TASK.md parking record must contain Status: blocked and Disposition: parked"
-                )
-            return ParkingRecord("task", resolved)
-
-        worktrees = workspace.root / "worktrees"
-        try:
-            relative = resolved.relative_to(worktrees.resolve())
-        except ValueError as exc:
-            raise SafetyError("parking target is outside an allowed durable record") from exc
-        parts = relative.parts
-        if len(parts) < 4 or parts[1] != "docs" or parts[2] != "plans" or resolved.suffix != ".md":
-            raise SafetyError("docs parking target must be a plan in a docs worktree")
-        docs_worktree = worktrees / parts[0] / "docs"
-        try:
-            top = Path(_git(docs_worktree, "rev-parse", "--show-toplevel")).resolve()
-            common = Path(
-                _git(docs_worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
-            ).resolve()
-        except SafetyError as exc:
-            raise SafetyError("docs parking target is not in a valid docs worktree") from exc
-        if top != docs_worktree.resolve() or common != (workspace.root / "docs" / ".git").resolve():
-            raise SafetyError("docs parking target is not in the workspace docs worktree")
-        content = _read_parking_target(target)
-        frontmatter = content.split("---", 2) if content.startswith("---\n") else []
-        if len(frontmatter) != 3 or not re.search(
-            r"(?m)^readiness:\s*paused\s*$", frontmatter[1]
-        ):
-            raise SafetyError("docs plan parking record must have readiness: paused")
-        return ParkingRecord("docs-plan", resolved)
+        return validate_parking_claim(workspace)
     finally:
         try:
             claim.unlink()
@@ -932,7 +940,11 @@ def _build_harness_prompt(
         "TASK.md (with exact fields `Status: blocked` and `Disposition: parked`), its bound bundle "
         "TASK.md, or a docs plan "
         "in a real docs worktree with frontmatter readiness: paused. Then write only that record's "
-        f"absolute path to {parking_claim_file}. The harness validates the record at turn end.\n"
+        f"absolute path to {parking_claim_file}. Before reporting parked, run this exact "
+        "non-consuming preflight and correct any refusal:\n"
+        f"  {shlex.quote(str(transport_python))} "
+        f"{shlex.quote(str(transport_script))} --check-parking\n"
+        "The harness validates and consumes the same claim at turn end.\n"
         "- To delegate, write exactly one JSON object with only `tier`, `prompt`, and boolean "
         "`mutation` keys to "
         f"{delegation_request_file}. Allowed tiers are implementation, bounded, mechanical, and "
