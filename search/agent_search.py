@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Luoji Search — hybrid FTS5 + vector search over local files.
+Agent Search — hybrid FTS5 + vector search over local files.
 
 Usage:
-    python luoji_search.py index          # Index all configured directories
-    python luoji_search.py search "query" # Search across all indexed content
-    python luoji_search.py search "query" --source diary  # Filter by source
-    python luoji_search.py status         # Show index stats
+    python agent_search.py index          # Index all configured directories
+    python agent_search.py search "query" # Search across all indexed content
+    python agent_search.py search "query" --source diary  # Filter by source
+    python agent_search.py status         # Show index stats
 """
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -21,10 +22,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import sqlite_vec
-import yaml
-
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -32,13 +29,82 @@ import yaml
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
 
-def load_config():
-    with open(CONFIG_PATH) as f:
+def load_config(path=CONFIG_PATH):
+    import yaml
+
+    with open(path) as f:
         cfg = yaml.safe_load(f)
-    cfg["database"] = os.path.expanduser(cfg["database"])
+    cfg["database"] = os.path.expandvars(os.path.expanduser(cfg["database"]))
     for d in cfg["directories"]:
-        d["path"] = os.path.expanduser(d["path"])
+        d["path"] = os.path.expandvars(os.path.expanduser(d["path"]))
+    if cfg.get("mode") == "cargo-chief-docs":
+        _validate_cargo_chief_config(cfg)
     return cfg
+
+
+def _is_within(path, root):
+    try:
+        Path(path).relative_to(Path(root))
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_cargo_chief_config(cfg, workspace_root=None, search_root=None):
+    """Fail closed when the curated Cargo Chief corpus crosses its docs boundary."""
+    docs_value = cfg.get("docs_root", "")
+    if not docs_value:
+        raise ValueError("cargo-chief-docs mode requires docs_root")
+
+    docs_path = Path(os.path.expandvars(os.path.expanduser(docs_value)))
+    if not docs_path.is_absolute() or not docs_path.is_dir() or docs_path.is_symlink():
+        raise ValueError("docs_root must be an existing absolute non-symlink directory")
+    docs_root = docs_path.resolve()
+    cfg["docs_root"] = str(docs_root)
+
+    if workspace_root is None:
+        workspace_value = os.environ.get("CARGO_CHIEF_ROOT")
+        if not workspace_value:
+            raise ValueError("cargo-chief-docs mode requires CARGO_CHIEF_ROOT")
+        workspace_root = Path(workspace_value)
+    workspace_root = Path(workspace_root).resolve()
+    if docs_root != workspace_root / "docs":
+        raise ValueError("docs_root must be the canonical CARGO_CHIEF_ROOT/docs directory")
+
+    database = Path(cfg["database"])
+    if not database.is_absolute():
+        raise ValueError("database must be absolute in cargo-chief-docs mode")
+    database = database.resolve(strict=False)
+    if _is_within(database, workspace_root):
+        raise ValueError("database must live outside the Cargo Chief workspace")
+    if search_root is None:
+        search_value = os.environ.get("CARGO_CHIEF_SEARCH_DIR")
+        if not search_value:
+            raise ValueError("cargo-chief-docs mode requires CARGO_CHIEF_SEARCH_DIR")
+        search_root = Path(search_value)
+    search_root = Path(search_root).resolve()
+    if database.parent != search_root:
+        raise ValueError("database must live directly in CARGO_CHIEF_SEARCH_DIR")
+    cfg["database"] = str(database)
+
+    names = set()
+    for source in cfg.get("directories", []):
+        name = source.get("name", "").strip()
+        if not name or name in names:
+            raise ValueError("each curated source needs a unique non-empty name")
+        names.add(name)
+        if source.get("type") != "markdown":
+            raise ValueError("cargo-chief-docs mode permits markdown sources only")
+        source_path = Path(source["path"])
+        if not source_path.is_absolute() or not source_path.exists() or source_path.is_symlink():
+            raise ValueError(f"source {name} must be an existing absolute non-symlink path")
+        resolved = source_path.resolve()
+        if not _is_within(resolved, docs_root):
+            raise ValueError(f"source {name} is outside docs_root")
+        source["path"] = str(resolved)
+        includes = source.get("include", [])
+        if not isinstance(includes, list) or any(not isinstance(v, str) or not v for v in includes):
+            raise ValueError(f"source {name} include must be a list of non-empty patterns")
 
 
 # ---------------------------------------------------------------------------
@@ -46,14 +112,42 @@ def load_config():
 # ---------------------------------------------------------------------------
 
 def get_db(cfg):
+    import sqlite_vec
+
+    check_runtime()
     db_path = cfg["database"]
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    os.makedirs(os.path.dirname(db_path), mode=0o700, exist_ok=True)
+    os.chmod(os.path.dirname(db_path), 0o700)
+    if not os.path.exists(db_path):
+        fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
     db = sqlite3.connect(db_path)
+    os.chmod(db_path, 0o600)
     db.enable_load_extension(True)
     sqlite_vec.load(db)
     db.execute("PRAGMA journal_mode=WAL")
     _create_tables(db)
     return db
+
+
+def check_runtime():
+    """Verify the Python SQLite build can load sqlite-vec before touching the database."""
+    if sys.version_info < (3, 12):
+        raise RuntimeError("knowledge search requires Python 3.12+")
+    connection = sqlite3.connect(":memory:")
+    try:
+        if not hasattr(connection, "enable_load_extension"):
+            raise RuntimeError(
+                "this Python SQLite build cannot load extensions; use Homebrew Python 3.12+ "
+                "or rebuild pyenv Python with loadable SQLite extension support"
+            )
+    finally:
+        connection.close()
+    return {
+        "python": sys.version.split()[0],
+        "sqlite": sqlite3.sqlite_version,
+        "loadable_extensions": True,
+    }
 
 
 def _create_tables(db):
@@ -186,6 +280,24 @@ def extract_markdown(path):
     return title, text
 
 
+def extract_markdown_metadata(path):
+    """Expose decision lifecycle fields without retaining arbitrary frontmatter."""
+    if "decisions" not in Path(path).parts:
+        return None
+    import yaml
+
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---"):
+        return None
+    end = text.find("---", 3)
+    if end < 0:
+        return None
+    value = yaml.safe_load(text[3:end]) or {}
+    allowed = ("decision_type", "decision_status", "date", "owners", "supersedes", "superseded_by")
+    metadata = {key: value[key] for key in allowed if key in value}
+    return json.dumps(metadata, default=str) if metadata else None
+
+
 def extract_jsonl_conversations(path):
     """Extract conversations from a Claude Code JSONL session file."""
     docs = []
@@ -262,6 +374,39 @@ def should_exclude(path, excludes):
     return False
 
 
+def enumerate_markdown_files(source, markdown_only=False):
+    """Return regular, non-symlink Markdown/text files admitted by one source."""
+    root = Path(source["path"])
+    includes = source.get("include", [])
+    excludes = source.get("exclude", [])
+    candidates = [root] if root.is_file() else root.rglob("*")
+    files = []
+    for candidate in candidates:
+        allowed_suffixes = (".md",) if markdown_only else (".md", ".txt")
+        if candidate.suffix not in allowed_suffixes:
+            continue
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        relative = candidate.name if root.is_file() else candidate.relative_to(root).as_posix()
+        if includes and not any(fnmatch.fnmatch(relative, pattern) for pattern in includes):
+            continue
+        if should_exclude(candidate, excludes):
+            continue
+        files.append(str(candidate.resolve()))
+    return sorted(files)
+
+
+def validate_source_file_ownership(source_files):
+    owners = {}
+    for source, files in source_files.items():
+        for file_path in files:
+            previous = owners.setdefault(file_path, source)
+            if previous != source:
+                raise ValueError(
+                    f"file is admitted by multiple sources: {file_path} ({previous}, {source})"
+                )
+
+
 # ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
@@ -307,6 +452,15 @@ def index_all(cfg, force=False):
     total_new = 0
     total_skipped = 0
     total_errors = 0
+    source_files = {}
+
+    if cfg.get("mode") == "cargo-chief-docs":
+        for source in cfg["directories"]:
+            source_files[source["name"]] = set(enumerate_markdown_files(source, markdown_only=True))
+        validate_source_file_ownership(source_files)
+        removed = reconcile_sources(db, source_files)
+        if removed:
+            print(f"Removed {removed} stale chunk(s) for missing or excluded sources")
 
     for dir_cfg in cfg["directories"]:
         dir_path = dir_cfg["path"]
@@ -321,18 +475,12 @@ def index_all(cfg, force=False):
         print(f"\nIndexing [{source}] from {dir_path}")
 
         if file_type == "markdown":
-            files = []
-            for root, dirs, filenames in os.walk(dir_path):
-                # Filter excluded dirs in-place
-                dirs[:] = [d for d in dirs if d not in excludes]
-                for fn in filenames:
-                    if fn.endswith((".md", ".txt")):
-                        full_path = os.path.join(root, fn)
-                        if not should_exclude(full_path, excludes):
-                            files.append(full_path)
+            files = (sorted(source_files[source]) if source in source_files
+                     else enumerate_markdown_files(dir_cfg))
 
             for fpath in files:
                 try:
+                    db.execute("SAVEPOINT index_file")
                     fhash = file_hash(fpath)
                     if not force:
                         existing = db.execute(
@@ -340,6 +488,7 @@ def index_all(cfg, force=False):
                             (fpath,)
                         ).fetchone()
                         if existing and existing[0] == fhash:
+                            db.execute("RELEASE index_file")
                             total_skipped += 1
                             continue
 
@@ -347,7 +496,9 @@ def index_all(cfg, force=False):
                     _delete_file_entries(db, fpath)
 
                     title, text = extract_markdown(fpath)
+                    metadata = extract_markdown_metadata(fpath)
                     if not text.strip():
+                        db.execute("RELEASE index_file")
                         continue
 
                     chunks = chunk_text(text, chunk_size, chunk_overlap)
@@ -356,7 +507,7 @@ def index_all(cfg, force=False):
 
                     for i, chunk in enumerate(chunks):
                         rows.append((fpath, source, title, i, chunk, fhash,
-                                     datetime.now().isoformat(), None))
+                                     datetime.now().isoformat(), metadata))
                         texts_to_embed.append(chunk)
 
                     # Insert document rows
@@ -378,11 +529,16 @@ def index_all(cfg, force=False):
                             (doc_id, serialize_vec(emb))
                         )
 
-                    db.commit()
+                    db.execute("RELEASE index_file")
                     total_new += len(chunks)
                     print(f"  + {Path(fpath).name} ({len(chunks)} chunks)")
 
                 except Exception as e:
+                    try:
+                        db.execute("ROLLBACK TO index_file")
+                        db.execute("RELEASE index_file")
+                    except sqlite3.Error:
+                        pass
                     total_errors += 1
                     print(f"  ! Error indexing {fpath}: {e}")
 
@@ -392,6 +548,7 @@ def index_all(cfg, force=False):
 
             for fpath in files:
                 try:
+                    db.execute("SAVEPOINT index_file")
                     fhash = file_hash(fpath)
                     if not force:
                         existing = db.execute(
@@ -399,12 +556,14 @@ def index_all(cfg, force=False):
                             (fpath,)
                         ).fetchone()
                         if existing and existing[0] == fhash:
+                            db.execute("RELEASE index_file")
                             total_skipped += 1
                             continue
 
                     _delete_file_entries(db, fpath)
 
                     conversations = extract_jsonl_conversations(fpath)
+                    file_chunks = 0
                     for title, text, metadata in conversations:
                         if not text.strip():
                             continue
@@ -435,17 +594,26 @@ def index_all(cfg, force=False):
                                 (doc_id, serialize_vec(emb))
                             )
 
-                        db.commit()
-                        total_new += len(chunks)
+                        file_chunks += len(chunks)
 
+                    db.execute("RELEASE index_file")
+                    total_new += file_chunks
                     print(f"  + {Path(fpath).name}")
 
                 except Exception as e:
+                    try:
+                        db.execute("ROLLBACK TO index_file")
+                        db.execute("RELEASE index_file")
+                    except sqlite3.Error:
+                        pass
                     total_errors += 1
                     print(f"  ! Error indexing {fpath}: {e}")
 
     print(f"\nDone! {total_new} chunks indexed, {total_skipped} unchanged files skipped, {total_errors} errors")
     db.close()
+    if total_errors and cfg.get("mode") == "cargo-chief-docs":
+        raise RuntimeError(f"curated index refresh failed with {total_errors} error(s)")
+    return {"indexed": total_new, "skipped": total_skipped, "errors": total_errors}
 
 
 def _delete_file_entries(db, file_path):
@@ -454,6 +622,26 @@ def _delete_file_entries(db, file_path):
     for (doc_id,) in ids:
         db.execute("DELETE FROM documents_vec WHERE rowid = ?", (doc_id,))
     db.execute("DELETE FROM documents WHERE file_path = ?", (file_path,))
+
+
+def reconcile_sources(db, source_files):
+    """Remove chunks whose source or file is no longer admitted by configuration."""
+    configured = set(source_files)
+    rows = db.execute("SELECT DISTINCT source, file_path FROM documents").fetchall()
+    stale_paths = {
+        file_path
+        for source, file_path in rows
+        if source not in configured or file_path not in source_files[source]
+    }
+    removed = 0
+    for file_path in stale_paths:
+        count = db.execute(
+            "SELECT COUNT(*) FROM documents WHERE file_path = ?", (file_path,)
+        ).fetchone()[0]
+        _delete_file_entries(db, file_path)
+        removed += count
+    db.commit()
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -472,12 +660,13 @@ def search(cfg, query, source=None, limit=10):
 
     # --- FTS5 search ---
     fts_results = {}
+    search_errors = []
     try:
         fts_query = _build_fts_query(query)
         rows = db.execute(f"""
             SELECT d.id, d.file_path, d.source, d.title, d.chunk_index,
                    snippet(documents_fts, 1, '>>>', '<<<', '...', 40) as snippet,
-                   bm25(documents_fts) as score
+                   bm25(documents_fts) as score, d.metadata
             FROM documents_fts f
             JOIN documents d ON d.id = f.rowid
             WHERE documents_fts MATCH ?
@@ -496,9 +685,11 @@ def search(cfg, query, source=None, limit=10):
                 "chunk_index": row[4],
                 "snippet": row[5],
                 "fts_score": -row[6],  # BM25 returns negative scores
+                "metadata": row[7],
             }
     except Exception as e:
         print(f"FTS search error: {e}")
+        search_errors.append(("FTS", e))
 
     # --- Vector search ---
     vec_results = {}
@@ -509,7 +700,7 @@ def search(cfg, query, source=None, limit=10):
         rows = db.execute(f"""
             SELECT v.rowid, v.distance,
                    d.file_path, d.source, d.title, d.chunk_index,
-                   substr(d.content, 1, 300) as snippet
+                   substr(d.content, 1, 300) as snippet, d.metadata
             FROM documents_vec v
             JOIN documents d ON d.id = v.rowid
             WHERE embedding MATCH ?
@@ -529,9 +720,16 @@ def search(cfg, query, source=None, limit=10):
                 "chunk_index": row[5],
                 "snippet": row[6],
                 "vec_score": 1 - row[1],  # Convert distance to similarity
+                "metadata": row[7],
             }
     except Exception as e:
         print(f"Vector search error: {e}")
+        search_errors.append(("vector", e))
+
+    if search_errors and cfg.get("mode") == "cargo-chief-docs":
+        db.close()
+        kinds = ", ".join(kind for kind, _ in search_errors)
+        raise RuntimeError(f"curated search failed in {kinds} retrieval")
 
     # --- Merge results ---
     all_ids = set(fts_results.keys()) | set(vec_results.keys())
@@ -563,6 +761,12 @@ def search(cfg, query, source=None, limit=10):
             "vec_score": vec.get("vec_score", 0),
             "match_type": _match_type(fts, vec),
         }
+        metadata = fts.get("metadata") or vec.get("metadata")
+        if metadata:
+            try:
+                result["decision"] = json.loads(metadata)
+            except json.JSONDecodeError:
+                pass
         merged.append(result)
 
     merged.sort(key=lambda x: x["combined_score"], reverse=True)
@@ -591,7 +795,7 @@ def _match_type(fts, vec):
 # Status
 # ---------------------------------------------------------------------------
 
-def show_status(cfg):
+def index_status(cfg):
     db = get_db(cfg)
     total = db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     sources = db.execute(
@@ -600,20 +804,51 @@ def show_status(cfg):
     files = db.execute("SELECT COUNT(DISTINCT file_path) FROM documents").fetchone()[0]
     vec_count = db.execute("SELECT COUNT(*) FROM documents_vec").fetchone()[0]
 
-    print(f"Luoji Search Index Status")
-    print(f"{'='*40}")
-    print(f"Total chunks:  {total}")
-    print(f"Total files:   {files}")
-    print(f"Vector count:  {vec_count}")
-    print(f"\nBy source:")
+    result = {
+        "database": cfg["database"],
+        "mode": cfg.get("mode", "standard"),
+        "total_chunks": total,
+        "total_files": files,
+        "vector_count": vec_count,
+        "sources": {},
+    }
     for source, count in sources:
         file_count = db.execute(
             "SELECT COUNT(DISTINCT file_path) FROM documents WHERE source = ?",
             (source,)
         ).fetchone()[0]
-        print(f"  {source:20s} {count:5d} chunks from {file_count} files")
-
+        result["sources"][source] = {"chunks": count, "files": file_count}
     db.close()
+    return result
+
+
+def show_status(cfg, as_json=False):
+    result = index_status(cfg)
+    if as_json:
+        print(json.dumps(result, indent=2))
+        return
+    print("Agent Search Index Status")
+    print(f"{'='*40}")
+    print(f"Mode:          {result['mode']}")
+    print(f"Total chunks:  {result['total_chunks']}")
+    print(f"Total files:   {result['total_files']}")
+    print(f"Vector count:  {result['vector_count']}")
+    print(f"\nBy source:")
+    for source, values in result["sources"].items():
+        print(f"  {source:20s} {values['chunks']:5d} chunks from {values['files']} files")
+
+
+def purge_index(cfg):
+    """Remove the configured database and SQLite sidecars without following symlinks."""
+    database = Path(cfg["database"])
+    removed = []
+    for path in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
+        if path.is_symlink():
+            raise ValueError(f"refusing to purge symlink: {path}")
+        if path.exists():
+            path.unlink()
+            removed.append(str(path))
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -638,17 +873,25 @@ def format_results(results):
         print(f"[{i}] {r['title']}  ({r['match_type']})")
         print(f"    Source: {r['source']} | Score: {r['combined_score']:.3f} ({scores})")
         print(f"    File: {r['file_path']}")
+        decision = r.get("decision", {})
+        if decision:
+            successor = decision.get("superseded_by") or []
+            suffix = f" | Superseded by: {', '.join(successor)}" if successor else ""
+            print(f"    Decision: {decision.get('decision_status', 'unknown')}{suffix}")
         snippet = r['snippet'].replace('\n', ' ')[:200]
         print(f"    {snippet}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Luoji Search")
+    parser = argparse.ArgumentParser(description="Agent Search")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Configuration file")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Index command
     idx_parser = subparsers.add_parser("index", help="Index configured directories")
     idx_parser.add_argument("--force", action="store_true", help="Re-index all files")
+
+    subparsers.add_parser("rebuild", help="Purge and rebuild the configured index")
 
     # Search command
     search_parser = subparsers.add_parser("search", help="Search indexed content")
@@ -658,13 +901,19 @@ def main():
     search_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     # Status command
-    subparsers.add_parser("status", help="Show index stats")
+    status_parser = subparsers.add_parser("status", help="Show index stats")
+    status_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    subparsers.add_parser("purge", help="Delete the configured index and SQLite sidecars")
+    subparsers.add_parser("doctor", help="Validate config and SQLite extension support")
 
     args = parser.parse_args()
-    cfg = load_config()
+    cfg = load_config(args.config)
 
     if args.command == "index":
         index_all(cfg, force=args.force)
+    elif args.command == "rebuild":
+        purge_index(cfg)
+        index_all(cfg, force=True)
     elif args.command == "search":
         results = search(cfg, args.query, source=args.source, limit=args.limit)
         if args.json:
@@ -672,7 +921,14 @@ def main():
         else:
             format_results(results)
     elif args.command == "status":
-        show_status(cfg)
+        show_status(cfg, as_json=args.json)
+    elif args.command == "purge":
+        removed = purge_index(cfg)
+        print(json.dumps({"removed": removed}))
+    elif args.command == "doctor":
+        result = check_runtime()
+        result.update({"mode": cfg.get("mode", "standard"), "config": str(args.config)})
+        print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
