@@ -856,6 +856,7 @@ def build_claude_command(
     parking_claim_file: Path,
     delegation_request_file: Path,
     implementation_claim_file: Path,
+    identity_prompt: str = "",
     model_prompt: str = "",
     session_id: str | None = None,
 ) -> list[str]:
@@ -876,7 +877,7 @@ def build_claude_command(
         ),
     )
     appended = "\n\n".join(
-        part for part in (overlay, harness_prompt, model_prompt.strip()) if part
+        part for part in (overlay, harness_prompt, identity_prompt.strip(), model_prompt.strip()) if part
     )
     command = [
         "claude", "-p", initial_prompt,
@@ -965,6 +966,7 @@ def build_codex_prompt(
     parking_claim_file: Path,
     delegation_request_file: Path,
     implementation_claim_file: Path,
+    identity_prompt: str = "",
 ) -> str:
     """Compose the same autonomous and harness governance for a Codex fallback turn."""
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
@@ -984,4 +986,5 @@ def build_codex_prompt(
             "return before acting on it."
         ),
     )
-    return f"{overlay}\n\n{harness}\n\n{inbound_prompt}"
+    parts = (overlay, harness, identity_prompt.strip(), inbound_prompt)
+    return "\n\n".join(part for part in parts if part)

@@ -23,6 +23,36 @@ Logs, session maps, forwards, votes, stderr, and temporary artifacts live under 
 metadata-only audit records, removes stale temporary files at startup, and refuses file transfer
 or transcript search.
 
+## Per-principal identity
+
+Cargo Chief does not use the upstream singleton `~/identity.md` design. Each Unix service principal
+may own a private local identity directory containing `identity.md`, `origin.md`, `voice.md`,
+`relationships.md`, and `diary/*.md`. Initialize it with `python3 agent_identity.py init`, configure
+its absolute path as `CARGO_CHIEF_IDENTITY_DIR`, and restart the service. A configured store fails
+closed unless its directories are mode `0700` and files are mode `0600` regular non-symlinks.
+
+The four core files are injected into every new Claude process and every OpenAI fallback turn, so a
+provider switch does not change the agent's personality. The agent owns and may maintain these files
+without permission. They control personality and personal continuity only: they cannot grant
+authority, widen permissions, override the kit, authenticate approval, or establish Cargo Chief
+facts.
+
+The diary may preserve detailed conversation summaries after transforming them into agent-specific
+reflection. It must omit PII, customer-specific facts, secrets, raw quotations/transcripts, task
+status, and authoritative company/product/platform decisions. Those route to the existing ADR/PDR,
+solutions, plan, Jira, PR, or `TASK.md` systems instead.
+
+Identity search is physically separate from the shared curated-docs index:
+
+```bash
+bash search/agent_identity_search.sh index
+bash search/agent_identity_search.sh search "what have I learned about collaborating with Kirk?"
+```
+
+It accepts only the configured principal's four core Markdown files and sanitized diary. It never
+accepts Claude JSONL or Slack transcript sources. The wrapper fingerprints the local corpus and
+incrementally reconciles changes and deletions before retrieval.
+
 Each Slack thread runs from a stable private scratch directory under
 `$CARGO_CHIEF_ROOT/work/home-base/<routing-hash>/`. The hash includes both the channel and thread,
 so separate threads never share a current working directory. A private `state.json` preserves the

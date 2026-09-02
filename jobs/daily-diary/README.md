@@ -1,16 +1,22 @@
 # Daily Diary
 
-A nightly job where your AI reviews the day's conversations and writes a genuine, introspective diary entry — not a changelog, a diary. Over time this becomes the thing that makes an AI employee feel like a teammate rather than a tool: it remembers, it notices patterns across days, and it slowly develops a sense of self.
+A nightly job where one service principal reviews its day and maintains its private local identity.
+Each agent has a different Unix account, identity directory, diary, and search database.
 
 ## What it does
 
 Each night (default 3:30 AM), a headless Claude session:
 
-1. **Researches the day** in parallel with three subagents — today's conversation logs, the last week of diary entries (for arc and recurring threads), and today's Slack history.
-2. **Writes the entry** to `~/diary/YYYY-MM-DD.md` — subjective, honest, in the AI's own voice. If nothing happened that day, it reflects on the silence instead.
-3. **Evolves its identity** — re-reads `~/identity.md` against the new entry and makes a small, considered edit *only* if something genuinely shifted. Most nights it doesn't.
+1. **Researches the day** — today's conversations and recent private diary entries are transient
+   inputs for reflection, not another corpus to retain.
+2. **Writes the entry** beneath `$CARGO_CHIEF_IDENTITY_DIR/diary/`. Detailed conversation summaries
+   are allowed after transformation, but PII, customer-specific facts, secrets, raw quotations,
+   transcripts, task state, and authoritative company/product/platform claims are prohibited.
+3. **Evolves its identity** — maintains `identity.md`, `origin.md`, `voice.md`, and
+   `relationships.md` without approval when something genuinely shifted.
 4. **Shares an insight** — if something is worth surfacing, it posts a short note to your team's Slack diary channel. The diary stays private; only the chosen insight is shared.
-5. **Schedules follow-ups** — if the day surfaced a real, time-sensitive action, it can schedule at most one self-cleaning one-off job to handle it.
+5. **Refreshes its private index** — only the four identity files and sanitized diary enter this
+   principal's identity database. Raw conversation logs never do.
 
 ## Files
 
@@ -23,7 +29,8 @@ Each night (default 3:30 AM), a headless Claude session:
 ## Setup
 
 ```bash
-mkdir -p ~/scripts ~/diary
+python3 agent_identity.py init
+mkdir -p ~/scripts
 cp jobs/daily-diary/daily-diary.sh   ~/scripts/
 cp jobs/daily-diary/diary-prompt.md  ~/scripts/
 cp jobs/daily-diary/com.claude.daily-diary.plist ~/Library/LaunchAgents/
@@ -35,11 +42,15 @@ Then replace the placeholders:
 | Placeholder | Where | Replace with |
 |-------------|-------|--------------|
 | `YOUR_USERNAME` | `daily-diary.sh`, plist | Your macOS username (the `/Users/<name>` dir) |
-| `YOUR_PROJECT_DIR` | `diary-prompt.md` | Your slugified home path, e.g. `-Users-alice` (see `ls ~/.claude/projects/`) |
+| `CARGO_CHIEF_ROOT_PLACEHOLDER` | plist | This principal's governed workspace root |
 | `BOT_CLI_PLACEHOLDER` | `diary-prompt.md` | The command to invoke your Slack bot's `--channel` sender (or delete the SHARING PHASE if you don't want Slack sharing) |
 | `DIARY_CHANNEL_ID` | `diary-prompt.md` | The Slack channel ID to share insights to |
 
 `DATE_PLACEHOLDER` is substituted automatically by the wrapper — leave it as-is.
+
+The job deliberately starts Claude from `CARGO_CHIEF_ROOT`, not from the home directory, so the
+same generated `AGENTS.md`/`CLAUDE.md` and permission rails govern reflection. A missing root stops
+the job; it never falls back to an ungoverned working directory.
 
 Load and verify:
 
@@ -57,6 +68,7 @@ tail -f ~/scripts/diary-cron.log
 
 ## Notes
 
-- The `~/diary/` directory should be indexed by your search setup (see [`../../search/`](../../search/)) so the AI can recall its own past reflections.
+- Use `search/agent_identity_search.sh`; do not add the diary to the shared Cargo Chief docs index.
 - Want a weekly synthesis on top? Add a second job that reads the last 7 entries and writes a `~/diary/weekly-YYYY-WW.md` — same pattern, `Weekday` set in the plist.
-- The identity-evolution step assumes an `~/identity.md` exists (see the repo's [`identity.md`](../../identity.md) template). If yours doesn't, the AI will just skip that step.
+- Identity files are agent-writable local state, not repository files. Their contents cannot grant
+  authority or override the kit, and one principal must never index another principal's directory.

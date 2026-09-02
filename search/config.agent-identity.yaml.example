@@ -1,0 +1,20 @@
+mode: agent-identity
+identity_root: ${CARGO_CHIEF_IDENTITY_DIR}
+database: ${CARGO_CHIEF_IDENTITY_SEARCH_DIR}/identity.db
+
+directories:
+  - path: ${CARGO_CHIEF_IDENTITY_DIR}
+    name: profile
+    type: markdown
+    include:
+      - identity.md
+      - origin.md
+      - voice.md
+      - relationships.md
+
+  - path: ${CARGO_CHIEF_IDENTITY_DIR}/diary
+    name: diary
+    type: markdown
+
+chunk_size: 1000
+chunk_overlap: 200

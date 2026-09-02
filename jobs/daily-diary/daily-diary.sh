@@ -9,7 +9,10 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export HOME="/Users/YOUR_USERNAME"
 
 DATE=$(date +%Y-%m-%d)
-DIARY_DIR="$HOME/diary"
+WORKSPACE_ROOT="${CARGO_CHIEF_ROOT:?CARGO_CHIEF_ROOT must be set for the governed diary session}"
+IDENTITY_DIR="${CARGO_CHIEF_IDENTITY_DIR:-$HOME/.local/share/cargo-chief/identity}"
+HOME_BASE_DIR="${CARGO_CHIEF_HOME_BASE_DIR:-$WORKSPACE_ROOT/claude-home-base}"
+DIARY_DIR="$IDENTITY_DIR/diary"
 DIARY_FILE="$DIARY_DIR/$DATE.md"
 PROMPT_FILE="$HOME/scripts/diary-prompt.md"
 LOG_FILE="$HOME/scripts/diary-cron.log"
@@ -26,9 +29,10 @@ fi
 echo "[$DATE] Starting diary generation..." >> "$LOG_FILE"
 
 # Substitute today's date into the prompt template, then run headless.
-PROMPT=$(sed "s/DATE_PLACEHOLDER/$DATE/g" "$PROMPT_FILE")
+PROMPT=$(sed -e "s/DATE_PLACEHOLDER/$DATE/g" \
+    -e "s|IDENTITY_DIR_PLACEHOLDER|$IDENTITY_DIR|g" "$PROMPT_FILE")
 
-(claude -p --dangerously-skip-permissions "$PROMPT" 2>> "$LOG_FILE") &
+(cd "$WORKSPACE_ROOT" && claude -p --permission-mode auto "$PROMPT" 2>> "$LOG_FILE") &
 CLAUDE_PID=$!
 (sleep $TIMEOUT && kill -TERM $CLAUDE_PID 2>/dev/null && \
     echo "[$DATE] TIMEOUT: Diary killed after ${TIMEOUT}s" >> "$LOG_FILE") &
@@ -36,5 +40,11 @@ WATCHDOG_PID=$!
 wait $CLAUDE_PID 2>/dev/null
 kill $WATCHDOG_PID 2>/dev/null
 wait $WATCHDOG_PID 2>/dev/null
+
+if [ -x "$HOME/.local/share/cargo-chief/knowledge-venv/bin/python" ]; then
+    CARGO_CHIEF_IDENTITY_DIR="$IDENTITY_DIR" \
+        "$HOME_BASE_DIR/search/agent_identity_search.sh" index \
+        >> "$LOG_FILE" 2>&1 || echo "[$DATE] WARNING: private identity indexing failed" >> "$LOG_FILE"
+fi
 
 echo "[$DATE] Diary generation complete." >> "$LOG_FILE"
