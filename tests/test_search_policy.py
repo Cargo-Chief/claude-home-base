@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).parents[1] / "search" / "luoji_search.py"
-SPEC = importlib.util.spec_from_file_location("luoji_search", MODULE_PATH)
+MODULE_PATH = Path(__file__).parents[1] / "search" / "agent_search.py"
+SPEC = importlib.util.spec_from_file_location("agent_search", MODULE_PATH)
 search = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(search)
 

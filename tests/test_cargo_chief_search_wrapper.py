@@ -35,7 +35,7 @@ class CargoChiefSearchWrapperTest(unittest.TestCase):
             subprocess.run(["bash", str(WRAPPER), "status", "--json"], env=env, check=True)
 
             args = (capture / "args").read_text().splitlines()
-            self.assertEqual(str(ROOT / "search" / "luoji_search.py"), args[0])
+            self.assertEqual(str(ROOT / "search" / "agent_search.py"), args[0])
             self.assertEqual("--config", args[1])
             self.assertEqual(str(ROOT / "search" / "config.cargo-chief.yaml.example"), args[2])
             self.assertEqual(["status", "--json"], args[3:])

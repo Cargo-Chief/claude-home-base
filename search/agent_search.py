@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Luoji Search — hybrid FTS5 + vector search over local files.
+Agent Search — hybrid FTS5 + vector search over local files.
 
 Usage:
-    python luoji_search.py index          # Index all configured directories
-    python luoji_search.py search "query" # Search across all indexed content
-    python luoji_search.py search "query" --source diary  # Filter by source
-    python luoji_search.py status         # Show index stats
+    python agent_search.py index          # Index all configured directories
+    python agent_search.py search "query" # Search across all indexed content
+    python agent_search.py search "query" --source diary  # Filter by source
+    python agent_search.py status         # Show index stats
 """
 
 import argparse
@@ -827,7 +827,7 @@ def show_status(cfg, as_json=False):
     if as_json:
         print(json.dumps(result, indent=2))
         return
-    print(f"Luoji Search Index Status")
+    print("Agent Search Index Status")
     print(f"{'='*40}")
     print(f"Mode:          {result['mode']}")
     print(f"Total chunks:  {result['total_chunks']}")
@@ -883,7 +883,7 @@ def format_results(results):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Luoji Search")
+    parser = argparse.ArgumentParser(description="Agent Search")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Configuration file")
     subparsers = parser.add_subparsers(dest="command", required=True)
 

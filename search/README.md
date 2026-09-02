@@ -128,22 +128,22 @@ is not presented as current merely because it matched strongly.
 
 ```bash
 # Index all configured directories (skip unchanged files)
-python3 luoji_search.py index
+python3 agent_search.py index
 
 # Force re-index everything
-python3 luoji_search.py index --force
+python3 agent_search.py index --force
 
 # Search
-python3 luoji_search.py search "what did we discuss about pricing"
+python3 agent_search.py search "what did we discuss about pricing"
 
 # Filter by source
-python3 luoji_search.py search "auth bug" --source conversations
+python3 agent_search.py search "auth bug" --source conversations
 
 # JSON output (for programmatic use)
-python3 luoji_search.py search "revenue strategy" --json
+python3 agent_search.py search "revenue strategy" --json
 
 # Check index stats
-python3 luoji_search.py status
+python3 agent_search.py status
 ```
 
 ### Shell alias (optional)
@@ -151,7 +151,7 @@ python3 luoji_search.py status
 Add to your `.zshrc`:
 
 ```bash
-alias lsearch="/path/to/search/venv/bin/python3 /path/to/search/luoji_search.py search"
+alias lsearch="/path/to/search/venv/bin/python3 /path/to/search/agent_search.py search"
 ```
 
 Then: `lsearch "your query here"`

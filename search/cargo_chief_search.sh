@@ -23,5 +23,5 @@ export XDG_CACHE_HOME="$search_dir/cache"
 export HF_HOME="$search_dir/cache/huggingface"
 export FASTEMBED_CACHE_PATH="$search_dir/model"
 
-exec "$python_bin" "$script_dir/luoji_search.py" \
+exec "$python_bin" "$script_dir/agent_search.py" \
 	--config "$script_dir/config.cargo-chief.yaml.example" "$@"
