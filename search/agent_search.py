@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import fnmatch
+import gc
 import hashlib
 import json
 import os
@@ -495,6 +496,16 @@ def embed_texts(texts, batch_size=64):
     return all_embeddings
 
 
+def release_model():
+    """Destroy native embedding resources before Python begins interpreter teardown."""
+    global _model
+    model = _model
+    _model = None
+    if model is not None:
+        del model
+        gc.collect()
+
+
 def serialize_vec(vec):
     """Pack a numpy array into bytes for sqlite-vec."""
     return struct.pack(f"{len(vec)}f", *vec)
@@ -943,7 +954,7 @@ def format_results(results):
         print(f"    {snippet}")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Agent Search")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Configuration file")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -967,29 +978,31 @@ def main():
     subparsers.add_parser("purge", help="Delete the configured index and SQLite sidecars")
     subparsers.add_parser("doctor", help="Validate config and SQLite extension support")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     cfg = load_config(args.config)
-
-    if args.command == "index":
-        index_all(cfg, force=args.force)
-    elif args.command == "rebuild":
-        purge_index(cfg)
-        index_all(cfg, force=True)
-    elif args.command == "search":
-        results = search(cfg, args.query, source=args.source, limit=args.limit)
-        if args.json:
-            print(json.dumps(results, indent=2))
-        else:
-            format_results(results)
-    elif args.command == "status":
-        show_status(cfg, as_json=args.json)
-    elif args.command == "purge":
-        removed = purge_index(cfg)
-        print(json.dumps({"removed": removed}))
-    elif args.command == "doctor":
-        result = check_runtime()
-        result.update({"mode": cfg.get("mode", "standard"), "config": str(args.config)})
-        print(json.dumps(result, indent=2))
+    try:
+        if args.command == "index":
+            index_all(cfg, force=args.force)
+        elif args.command == "rebuild":
+            purge_index(cfg)
+            index_all(cfg, force=True)
+        elif args.command == "search":
+            results = search(cfg, args.query, source=args.source, limit=args.limit)
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                format_results(results)
+        elif args.command == "status":
+            show_status(cfg, as_json=args.json)
+        elif args.command == "purge":
+            removed = purge_index(cfg)
+            print(json.dumps({"removed": removed}))
+        elif args.command == "doctor":
+            result = check_runtime()
+            result.update({"mode": cfg.get("mode", "standard"), "config": str(args.config)})
+            print(json.dumps(result, indent=2))
+    finally:
+        release_model()
 
 
 if __name__ == "__main__":
