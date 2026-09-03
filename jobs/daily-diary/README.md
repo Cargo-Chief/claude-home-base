@@ -14,8 +14,7 @@ Each night (default 3:30 AM), a headless Claude session:
    transcripts, task state, and authoritative company/product/platform claims are prohibited.
 3. **Evolves its identity** — maintains `identity.md`, `origin.md`, `voice.md`, and
    `relationships.md` without approval when something genuinely shifted.
-4. **Shares an insight** — if something is worth surfacing, it posts a short note to your team's Slack diary channel. The diary stays private; only the chosen insight is shared.
-5. **Refreshes its private index** — only founding principles, the four agent-owned identity files,
+4. **Refreshes its private index** — only founding principles, the four agent-owned identity files,
    and sanitized diary enter this principal's identity database. Raw conversation logs never do.
 
 ## Files
@@ -43,9 +42,6 @@ Then replace the placeholders:
 |-------------|-------|--------------|
 | `YOUR_USERNAME` | `daily-diary.sh`, plist | Your macOS username (the `/Users/<name>` dir) |
 | `CARGO_CHIEF_ROOT_PLACEHOLDER` | plist | This principal's governed workspace root |
-| `BOT_CLI_PLACEHOLDER` | `diary-prompt.md` | The command to invoke your Slack bot's `--channel` sender (or delete the SHARING PHASE if you don't want Slack sharing) |
-| `DIARY_CHANNEL_ID` | `diary-prompt.md` | The Slack channel ID to share insights to |
-
 `DATE_PLACEHOLDER` is substituted automatically by the wrapper — leave it as-is.
 
 The job deliberately starts Claude from `CARGO_CHIEF_ROOT`, not from the home directory, so the
@@ -77,6 +73,11 @@ tail -f ~/scripts/diary-cron.log
 The live acceptance passes only when the entry exists, the complete identity store validates, and
 the private index refresh succeeds. A model, validation, or indexing failure exits nonzero and logs
 `ERROR`; it must never be reported as a completed diary run.
+
+Model prose goes only into the private identity files, not scheduler stdout. The operational log is
+mode 0600, contains process and error status rather than the model's reflective summary, and rotates
+at 1 MiB with one retained predecessor. The launchd plist also sets umask 077 for its own stdout and
+stderr files.
 
 ## Notes
 

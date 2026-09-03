@@ -9,6 +9,7 @@ export HOME="/Users/YOUR_USERNAME"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 set -uo pipefail
+umask 077
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -56,6 +57,14 @@ if $DRY_RUN; then
     exit 0
 fi
 
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+if [[ $(wc -c < "$LOG_FILE") -gt 1048576 ]]; then
+    mv "$LOG_FILE" "$LOG_FILE.1"
+    : > "$LOG_FILE"
+    chmod 600 "$LOG_FILE" "$LOG_FILE.1"
+fi
+
 # Idempotency guard: skip if today's diary already exists (e.g. re-fire, manual run)
 if [ -f "$DIARY_FILE" ]; then
     echo "[$DATE] Diary already exists, skipping." >> "$LOG_FILE"
@@ -68,7 +77,8 @@ echo "[$DATE] Starting diary generation..." >> "$LOG_FILE"
 PROMPT=$(sed -e "s/DATE_PLACEHOLDER/$DATE/g" \
     -e "s|IDENTITY_DIR_PLACEHOLDER|$IDENTITY_DIR|g" "$PROMPT_FILE")
 
-(cd "$WORKSPACE_ROOT" && claude -p --permission-mode auto "$PROMPT" 2>> "$LOG_FILE") &
+(cd "$WORKSPACE_ROOT" && claude -p --permission-mode auto "$PROMPT" \
+    >/dev/null 2>> "$LOG_FILE") &
 CLAUDE_PID=$!
 (sleep $TIMEOUT && kill -TERM $CLAUDE_PID 2>/dev/null && \
     echo "[$DATE] TIMEOUT: Diary killed after ${TIMEOUT}s" >> "$LOG_FILE") &

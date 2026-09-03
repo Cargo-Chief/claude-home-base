@@ -19,6 +19,8 @@
     <!-- Run from the governed workspace so the same AGENTS/CLAUDE instructions apply. -->
     <key>WorkingDirectory</key>
     <string>CARGO_CHIEF_ROOT_PLACEHOLDER</string>
+    <key>Umask</key>
+    <integer>63</integer>
     <!-- Times are LOCAL. 3:30 AM keeps it off-peak. -->
     <key>StartCalendarInterval</key>
     <dict>
