@@ -23,6 +23,13 @@ Logs, session maps, forwards, votes, stderr, and temporary artifacts live under 
 metadata-only audit records, removes stale temporary files at startup, and refuses file transfer
 or transcript search.
 
+Lifecycle reporting is optional and installation-specific. During setup, create or select the
+Slack channel you want to use, invite the app, and put its stable channel ID in
+`AGENT_STATUS_CHANNEL_ID`. Home-base then posts fixed, privacy-safe ready and fatal-runtime notices;
+an agent can post the fixed reboot-needed notice with `bot.py --request-reboot-status`. These
+messages never accept task text, customer data, exception messages, or tracebacks. With the setting
+empty, home-base sends no lifecycle messages.
+
 ## Per-principal identity
 
 Cargo Chief does not use the upstream singleton `~/identity.md` design. Each Unix service principal

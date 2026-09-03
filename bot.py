@@ -76,6 +76,11 @@ from slack_prompting import (
     relevance_prefix,
 )
 from http_server import serve_http
+from agent_status import (
+    AgentStatusReporter,
+    configured_status_channel,
+    reboot_request_is_exact,
+)
 from delegation_observability import DelegationTracker, format_delegation_audit
 from openai_fallback import (
     fallback_error_kind,
@@ -2870,6 +2875,10 @@ def main():
         help="Validate the current thread's one-shot parking claim without consuming it",
     )
     parser.add_argument(
+        "--request-reboot-status", action="store_true",
+        help="Post the fixed, privacy-safe reboot-needed status and exit",
+    )
+    parser.add_argument(
         "--history", metavar="CHANNEL_ID",
         help="Print recent messages from a channel (or a thread if --thread is set)",
     )
@@ -2894,6 +2903,9 @@ def main():
         help="Register this Claude session_id as the resume target for replies in this DM thread. Use for cron jobs that DM someone, exit, and want to continue where they left off when the person replies.",
     )
     args = parser.parse_args()
+
+    if args.request_reboot_status and not reboot_request_is_exact(sys.argv[1:]):
+        parser.error("--request-reboot-status accepts no other argument")
 
     # CLI modes — send and exit
     if args.send:
@@ -3011,6 +3023,22 @@ def main():
         print(f"PARKING_VALID: {parking.kind}")
         return
 
+    if args.request_reboot_status:
+        try:
+            status_channel = configured_status_channel()
+        except ValueError as exc:
+            raise SystemExit(f"agent status configuration is invalid: {exc}") from exc
+        status_reporter = AgentStatusReporter(
+            WebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
+            status_channel,
+            logger=logger,
+        )
+        if not status_reporter.enabled:
+            raise SystemExit("agent status channel is not configured")
+        if not status_reporter.reboot_needed():
+            raise SystemExit("agent reboot-needed status delivery failed")
+        return
+
     if args.history:
         print(fetch_channel_history(args.history, limit=args.limit, thread_ts=args.thread))
         return
@@ -3018,6 +3046,17 @@ def main():
     if args.find_channel:
         print(find_channel(args.find_channel))
         return
+
+    try:
+        status_channel = configured_status_channel()
+    except ValueError as exc:
+        logger.error("Agent status configuration refused startup: %s", exc)
+        raise SystemExit(1) from exc
+    status_reporter = AgentStatusReporter(
+        WebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
+        status_channel,
+        logger=logger,
+    )
 
     # Server mode.  An empty allowlist is a startup error, never "allow all".
     try:
@@ -3058,7 +3097,19 @@ def main():
     # Start idle session cleanup thread
     threading.Thread(target=_cleanup_idle_sessions, daemon=True).start()
 
-    serve_http(flask_app, PORT)
+    runtime_ready = False
+
+    def announce_ready():
+        nonlocal runtime_ready
+        runtime_ready = True
+        status_reporter.ready_async()
+
+    try:
+        serve_http(flask_app, PORT, on_ready=announce_ready)
+    except Exception:
+        if runtime_ready:
+            status_reporter.fatal()
+        raise
 
 
 if __name__ == "__main__":

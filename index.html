@@ -675,9 +675,12 @@
                         <span class="cmd">source</span> venv/bin/activate<br>
                         <span class="cmd">pip install</span> <span class="flag">-r</span> requirements.txt<br><br>
                         <span class="comment"># Configure environment variables</span><br>
-                        <span class="cmd">cp</span> .env.example .env<br>
-                        <span class="cmd">nano</span> .env  <span class="comment"># Add your Slack tokens, Signing Secret, user IDs</span>
+                        <span class="cmd">mkdir</span> <span class="flag">-p</span> ~/.config/cargo-chief<br>
+                        <span class="cmd">cp</span> <span class="flag">-n</span> .env.example ~/.config/cargo-chief/home-base.env  <span class="comment"># Preserve an existing configuration</span><br>
+                        <span class="cmd">chmod</span> 600 ~/.config/cargo-chief/home-base.env<br>
+                        <span class="cmd">nano</span> ~/.config/cargo-chief/home-base.env  <span class="comment"># Add your Slack tokens, Signing Secret, user IDs</span>
                     </div>
+                    <p class="text-slate-500 dark:text-slate-400 text-[0.85rem] mt-3">Optional: create or choose a Slack channel for agent lifecycle notices, invite the app, and set its channel ID as <code class="bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-xs font-mono">AGENT_STATUS_CHANNEL_ID</code>. Each installation chooses its own channel; no channel name is hard-coded.</p>
                     <div class="mt-3 text-xs text-slate-400 dark:text-slate-500 bg-amber-50 dark:bg-amber-950/30 border border-amber-100 dark:border-amber-900 rounded-lg px-3 py-2">
                         <strong class="text-amber-800 dark:text-amber-400">Note:</strong> macOS restricts launchd access to certain folders (like Documents). Running the bot from <code class="bg-amber-100/50 dark:bg-amber-900/50 px-1 py-0.5 rounded text-xs font-mono">~/Projects/</code> avoids permission errors.
                     </div>
@@ -1125,7 +1128,7 @@
                 <div class="border border-slate-200 dark:border-slate-700 rounded-xl p-5">
                     <h3 class="font-semibold mb-2">Give it accounts and credentials</h3>
                     <p class="text-slate-500 dark:text-slate-400 text-[0.92rem]">
-                        Create dedicated accounts for your AI cofounder — email, GitHub, task tracker. The more tools it can access, the more it can do autonomously. Store API keys in the bot's <code class="bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-xs font-mono">.env</code> file.
+                        Create dedicated accounts for your AI cofounder — email, GitHub, task tracker. The more tools it can access, the more it can do autonomously. Store API keys in <code class="bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-xs font-mono">~/.config/cargo-chief/home-base.env</code>, outside the checkout, and keep that file mode <code class="bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-xs font-mono">600</code>.
                     </p>
                 </div>
 
