@@ -19,10 +19,10 @@ harness recognizes Claude's account credit-limit response.
 
 Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
-`CARGO_CHIEF_RUNTIME_DIR`. Gate A permits one live session, caps turns at 15 minutes, writes
+`CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live sessions, caps turns at 15 minutes, writes
 metadata-only audit records, removes stale temporary files at startup, and refuses file transfer
-or transcript search. Requests for a different Slack thread wait behind the active turn and start
-automatically when capacity is available; they are not discarded at the session cap.
+or transcript search. Additional Slack threads wait behind the two active turns and start
+automatically when capacity is available; requests are not discarded at the session cap.
 
 Lifecycle reporting is optional and installation-specific. During setup, create or select the
 Slack channel you want to use, invite the app, and put its stable channel ID in

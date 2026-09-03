@@ -41,6 +41,28 @@ class SessionLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             TurnAdmission(0)
 
+    def test_turn_admission_uses_all_configured_slots_before_queueing(self):
+        admission = TurnAdmission(2)
+        self.assertFalse(admission.acquire())
+        self.assertFalse(admission.acquire())
+        queued = threading.Event()
+        admitted = threading.Event()
+
+        def wait_for_turn():
+            admission.acquire(queued.set)
+            admitted.set()
+            admission.release()
+
+        waiter = threading.Thread(target=wait_for_turn)
+        waiter.start()
+        self.assertTrue(queued.wait(timeout=1))
+        self.assertFalse(admitted.is_set())
+        admission.release()
+        self.assertTrue(admitted.wait(timeout=1))
+        admission.release()
+        waiter.join(timeout=1)
+        self.assertFalse(waiter.is_alive())
+
     def test_selects_oldest_unlocked_session(self):
         sessions = {
             "new-idle": FakeSession(30),

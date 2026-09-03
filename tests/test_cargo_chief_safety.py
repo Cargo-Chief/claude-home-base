@@ -182,7 +182,7 @@ class RuntimePolicyTest(unittest.TestCase):
         value = {
             "CARGO_CHIEF_RUNTIME_DIR": str(self.runtime),
             "CLAUDE_TIMEOUT": "600",
-            "MAX_LIVE_SESSIONS": "1",
+            "MAX_LIVE_SESSIONS": "2",
             "ENABLE_FILE_TRANSFER": "false",
             "ENABLE_TRANSCRIPT_SEARCH": "false",
         }
@@ -228,11 +228,13 @@ class RuntimePolicyTest(unittest.TestCase):
                 env, source_dir=self.source, workspace_root=self.workspace, home=self.base
             )
 
-    def test_rejects_long_timeout_or_parallel_sessions(self):
+    def test_rejects_long_timeout_or_excess_parallel_sessions(self):
         with self.assertRaisesRegex(SafetyError, "CLAUDE_TIMEOUT"):
             RuntimePolicy.from_env(self.env(CLAUDE_TIMEOUT="901"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
         with self.assertRaisesRegex(SafetyError, "MAX_LIVE_SESSIONS"):
-            RuntimePolicy.from_env(self.env(MAX_LIVE_SESSIONS="2"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+            RuntimePolicy.from_env(self.env(MAX_LIVE_SESSIONS="3"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        with self.assertRaisesRegex(SafetyError, "MAX_LIVE_SESSIONS"):
+            RuntimePolicy.from_env(self.env(MAX_LIVE_SESSIONS="0"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
         with self.assertRaisesRegex(SafetyError, "MAX_LIVE_BUNDLES"):
             RuntimePolicy.from_env(self.env(MAX_LIVE_BUNDLES="0"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
         with self.assertRaisesRegex(SafetyError, "MAX_LIVE_BUNDLES"):
