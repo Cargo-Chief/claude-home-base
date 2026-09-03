@@ -76,7 +76,11 @@ from slack_prompting import (
     relevance_prefix,
 )
 from http_server import serve_http
-from agent_status import AgentStatusReporter, configured_status_channel
+from agent_status import (
+    AgentStatusReporter,
+    configured_status_channel,
+    reboot_request_has_conflict,
+)
 from delegation_observability import DelegationTracker, format_delegation_audit
 from openai_fallback import (
     fallback_error_kind,
@@ -2899,6 +2903,9 @@ def main():
         help="Register this Claude session_id as the resume target for replies in this DM thread. Use for cron jobs that DM someone, exit, and want to continue where they left off when the person replies.",
     )
     args = parser.parse_args()
+
+    if reboot_request_has_conflict(args):
+        parser.error("--request-reboot-status accepts no other bot operation or routing argument")
 
     # CLI modes — send and exit
     if args.send:

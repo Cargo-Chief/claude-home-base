@@ -9,6 +9,10 @@ import threading
 
 
 CHANNEL_ID_RE = re.compile(r"[CG][A-Z0-9]+")
+REBOOT_CONFLICT_FIELDS = (
+    "send", "send_result", "thread", "channel", "escalate", "check_parking",
+    "history", "find_channel", "with_votes", "forward_to", "session_id",
+)
 
 
 def configured_status_channel(env: dict[str, str] | None = None) -> str:
@@ -18,6 +22,13 @@ def configured_status_channel(env: dict[str, str] | None = None) -> str:
     if channel and not CHANNEL_ID_RE.fullmatch(channel):
         raise ValueError("AGENT_STATUS_CHANNEL_ID must be a Slack channel ID beginning with C or G")
     return channel
+
+
+def reboot_request_has_conflict(args) -> bool:
+    """Refuse combining the fixed reboot signal with any general bot operation."""
+    return bool(args.request_reboot_status and any(
+        getattr(args, field, None) for field in REBOOT_CONFLICT_FIELDS
+    ))
 
 
 class AgentStatusReporter:

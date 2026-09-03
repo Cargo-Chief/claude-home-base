@@ -1,7 +1,12 @@
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
-from agent_status import AgentStatusReporter, configured_status_channel
+from agent_status import (
+    AgentStatusReporter,
+    configured_status_channel,
+    reboot_request_has_conflict,
+)
 
 
 class FakeClient:
@@ -35,6 +40,17 @@ class AgentStatusConfigurationTests(unittest.TestCase):
         for value in ("agent-status", "#agent-status", "D012ABC34", "C1;unsafe"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 configured_status_channel({"AGENT_STATUS_CHANNEL_ID": value})
+
+    def test_reboot_mode_rejects_other_bot_operations(self):
+        args = SimpleNamespace(
+            request_reboot_status=True,
+            channel=["C123", "sensitive detail"],
+        )
+        self.assertTrue(reboot_request_has_conflict(args))
+
+    def test_bare_reboot_mode_has_no_conflict(self):
+        args = SimpleNamespace(request_reboot_status=True)
+        self.assertFalse(reboot_request_has_conflict(args))
 
 
 class AgentStatusReporterTests(unittest.TestCase):
