@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -275,6 +276,26 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
         finally:
             search.get_db = original_get_db
             search.embed_texts = original_embed
+
+    def test_main_releases_embedding_model_after_success(self):
+        model = object()
+        search._model = model
+        with mock.patch.object(search, "load_config", return_value={}), \
+             mock.patch.object(search, "show_status"), \
+             mock.patch.object(search.gc, "collect") as collect:
+            search.main(["status"])
+        self.assertIsNone(search._model)
+        collect.assert_called_once_with()
+
+    def test_main_releases_embedding_model_after_command_failure(self):
+        search._model = object()
+        with mock.patch.object(search, "load_config", return_value={}), \
+             mock.patch.object(search, "index_all", side_effect=RuntimeError("index failed")), \
+             mock.patch.object(search.gc, "collect") as collect:
+            with self.assertRaisesRegex(RuntimeError, "index failed"):
+                search.main(["index"])
+        self.assertIsNone(search._model)
+        collect.assert_called_once_with()
 
 
 if __name__ == "__main__":
