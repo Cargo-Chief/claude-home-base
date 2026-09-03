@@ -22,7 +22,7 @@ Each night (default 3:30 AM), a headless Claude session:
 
 | File | Purpose |
 |------|---------|
-| `daily-diary.sh` | Wrapper script: idempotency guard, timeout watchdog, logging, runs `claude -p` |
+| `daily-diary.sh` | Wrapper script: validation, non-mutating dry run, idempotency, timeout, truthful exit handling, logging, and `claude -p` |
 | `diary-prompt.md` | The diary-writing instructions (the wrapper substitutes the date and passes this to Claude) |
 | `com.claude.daily-diary.plist` | launchd schedule (3:30 AM local) |
 
@@ -52,6 +52,14 @@ The job deliberately starts Claude from `CARGO_CHIEF_ROOT`, not from the home di
 same generated `AGENTS.md`/`CLAUDE.md` and permission rails govern reflection. A missing root stops
 the job; it never falls back to an ungoverned working directory.
 
+Run the non-mutating preflight before loading launchd. It validates paths, the identity store,
+required commands, and the target date without invoking a model or writing a diary entry:
+
+```bash
+~/scripts/daily-diary.sh --dry-run
+# DIARY_DRY_RUN_OK date=YYYY-MM-DD target=/Users/<principal>/.../diary/YYYY-MM-DD.md
+```
+
 Load and verify:
 
 ```bash
@@ -59,12 +67,16 @@ launchctl load ~/Library/LaunchAgents/com.claude.daily-diary.plist
 launchctl list | grep com.claude.daily-diary
 ```
 
-Test it right now (writes today's entry, or skips if one already exists):
+Run one explicit live acceptance (this writes today's entry, or skips if one already exists):
 
 ```bash
 launchctl start com.claude.daily-diary
 tail -f ~/scripts/diary-cron.log
 ```
+
+The live acceptance passes only when the entry exists, the complete identity store validates, and
+the private index refresh succeeds. A model, validation, or indexing failure exits nonzero and logs
+`ERROR`; it must never be reported as a completed diary run.
 
 ## Notes
 

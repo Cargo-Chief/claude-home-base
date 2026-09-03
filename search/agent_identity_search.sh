@@ -36,7 +36,24 @@ mkdir -p "$search_dir" "$search_dir/cache" "$search_dir/model"
 chmod 700 "$search_dir" "$search_dir/cache" "$search_dir/model"
 "$python_bin" "$repo_dir/agent_identity.py" --root "$identity_dir" check >/dev/null
 
-if [[ "${1:-}" == "search" ]]; then
+write_revision() {
+	local content_revision index_revision wanted_revision revision_tmp
+	content_revision="$("$python_bin" "$repo_dir/agent_identity.py" --root "$identity_dir" revision)"
+	index_revision="$(shasum -a 256 "$config_path" "$search_program" | shasum -a 256 | awk '{print $1}')"
+	wanted_revision="$content_revision:$index_revision"
+	revision_tmp="$(mktemp "$search_dir/.index-revision.XXXXXX")"
+	trap 'rm -f "$revision_tmp"' EXIT
+	printf '%s\n' "$wanted_revision" > "$revision_tmp"
+	chmod 600 "$revision_tmp"
+	mv "$revision_tmp" "$search_dir/index-revision"
+	trap - EXIT
+}
+
+if [[ "${1:-}" == "index" ]]; then
+	"$python_bin" "$search_program" --config "$config_path" "$@"
+	write_revision
+	exit 0
+elif [[ "${1:-}" == "search" ]]; then
 	content_revision="$("$python_bin" "$repo_dir/agent_identity.py" --root "$identity_dir" revision)"
 	index_revision="$(shasum -a 256 "$config_path" "$search_program" | shasum -a 256 | awk '{print $1}')"
 	wanted_revision="$content_revision:$index_revision"
@@ -47,12 +64,7 @@ if [[ "${1:-}" == "search" ]]; then
 	fi
 	if [[ "$current_revision" != "$wanted_revision" ]]; then
 		"$python_bin" "$search_program" --config "$config_path" index >&2
-		revision_tmp="$(mktemp "$search_dir/.index-revision.XXXXXX")"
-		trap 'rm -f "$revision_tmp"' EXIT
-		printf '%s\n' "$wanted_revision" > "$revision_tmp"
-		chmod 600 "$revision_tmp"
-		mv "$revision_tmp" "$revision_file"
-		trap - EXIT
+		write_revision
 	fi
 fi
 
