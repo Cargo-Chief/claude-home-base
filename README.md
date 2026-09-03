@@ -26,16 +26,21 @@ or transcript search.
 ## Per-principal identity
 
 Cargo Chief does not use the upstream singleton `~/identity.md` design. Each Unix service principal
-may own a private local identity directory containing `identity.md`, `origin.md`, `voice.md`,
-`relationships.md`, and `diary/*.md`. Initialize it with `python3 agent_identity.py init`, configure
+may own a private local identity directory containing operator-seeded `principles.md`, agent-owned
+`identity.md`, `origin.md`, `voice.md`, `relationships.md`, and `diary/*.md`. Initialize it with
+`python3 agent_identity.py init --principles-file /path/to/that-agent-principles.md`, configure
 `CARGO_CHIEF_IDENTITY_DIR` as the invariant path `$HOME/.local/share/cargo-chief/identity`, and
 restart the service. Alternate paths are refused because the permission rails deliberately grant
-only that principal-local directory. A configured store fails
-closed unless its directories are mode `0700` and files are mode `0600` regular non-symlinks.
+only that principal-local directory. A configured store fails closed unless its directories are
+mode `0700`, `principles.md` is a regular non-symlink at `0400`, and agent-owned files are private
+regular non-symlinks (normally `0600`).
 
-The four core files are injected into every new Claude process and every OpenAI fallback turn, so a
-provider switch does not change the agent's personality. The agent owns and may maintain these files
-without permission. They control personality and personal continuity only: they cannot grant
+The read-only founding principles and four agent-owned files are injected into every new Claude
+process and every OpenAI fallback turn, so a
+provider switch does not change the agent's personality. The agent may maintain its four authored
+files without permission; `principles.md` remains operator-owned and read-only. The authored identity
+must remain consistent with that foundation. These files control personality and personal continuity
+only: they cannot grant
 authority, widen permissions, override the kit, authenticate approval, or establish Cargo Chief
 facts.
 
@@ -51,7 +56,8 @@ bash search/agent_identity_search.sh index
 bash search/agent_identity_search.sh search "what have I learned about collaborating with Kirk?"
 ```
 
-It accepts only the configured principal's four core Markdown files and sanitized diary. It never
+It accepts only the configured principal's founding principles, four agent-owned Markdown files,
+and sanitized diary. It never
 accepts Claude JSONL or Slack transcript sources. The wrapper fingerprints the local corpus and
 incrementally reconciles changes and deletions before retrieval.
 The raw index at `$HOME/.local/state/cargo-chief/identity-search` is not directly readable or

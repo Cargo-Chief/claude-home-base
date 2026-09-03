@@ -15,8 +15,8 @@ Each night (default 3:30 AM), a headless Claude session:
 3. **Evolves its identity** — maintains `identity.md`, `origin.md`, `voice.md`, and
    `relationships.md` without approval when something genuinely shifted.
 4. **Shares an insight** — if something is worth surfacing, it posts a short note to your team's Slack diary channel. The diary stays private; only the chosen insight is shared.
-5. **Refreshes its private index** — only the four identity files and sanitized diary enter this
-   principal's identity database. Raw conversation logs never do.
+5. **Refreshes its private index** — only founding principles, the four agent-owned identity files,
+   and sanitized diary enter this principal's identity database. Raw conversation logs never do.
 
 ## Files
 
@@ -29,7 +29,7 @@ Each night (default 3:30 AM), a headless Claude session:
 ## Setup
 
 ```bash
-python3 agent_identity.py init
+python3 agent_identity.py init --principles-file /path/to/that-agent-principles.md
 mkdir -p ~/scripts
 cp jobs/daily-diary/daily-diary.sh   ~/scripts/
 cp jobs/daily-diary/diary-prompt.md  ~/scripts/
@@ -70,5 +70,6 @@ tail -f ~/scripts/diary-cron.log
 
 - Use `search/agent_identity_search.sh`; do not add the diary to the shared Cargo Chief docs index.
 - Want a weekly synthesis on top? Add a second job that reads the last 7 entries and writes a `~/diary/weekly-YYYY-WW.md` — same pattern, `Weekday` set in the plist.
-- Identity files are agent-writable local state, not repository files. Their contents cannot grant
-  authority or override the kit, and one principal must never index another principal's directory.
+- `principles.md` is operator-seeded, verbatim, and read-only. The four authored identity files and
+  diary are agent-writable local state, not repository files. None can grant authority or override
+  the kit, and one principal must never index another principal's directory.
