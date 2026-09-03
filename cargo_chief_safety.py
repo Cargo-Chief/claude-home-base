@@ -227,7 +227,7 @@ class RuntimePolicy:
 
         try:
             timeout = int(env.get("CLAUDE_TIMEOUT", "600"))
-            max_sessions = int(env.get("MAX_LIVE_SESSIONS", "1"))
+            max_sessions = int(env.get("MAX_LIVE_SESSIONS", "2"))
             max_bundles = int(env.get("MAX_LIVE_BUNDLES", "3"))
         except ValueError as exc:
             raise SafetyError(
@@ -235,8 +235,8 @@ class RuntimePolicy:
             ) from exc
         if not 1 <= timeout <= 900:
             raise SafetyError("CLAUDE_TIMEOUT must be between 1 and 900 seconds for Gate A")
-        if max_sessions != 1:
-            raise SafetyError("MAX_LIVE_SESSIONS must be 1 for Gate A")
+        if not 1 <= max_sessions <= 2:
+            raise SafetyError("MAX_LIVE_SESSIONS must be between 1 and 2 for Gate A")
         if not 1 <= max_bundles <= 5:
             raise SafetyError("MAX_LIVE_BUNDLES must be between 1 and 5")
 

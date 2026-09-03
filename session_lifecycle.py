@@ -2,8 +2,30 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Callable
+
+
+class TurnAdmission:
+    """Bound concurrent turns while allowing callers to wait for capacity."""
+
+    def __init__(self, limit: int):
+        if limit < 1:
+            raise ValueError("turn admission limit must be positive")
+        self._semaphore = threading.BoundedSemaphore(limit)
+
+    def acquire(self, on_queued: Callable[[], None] | None = None) -> bool:
+        """Wait for a slot and return whether the caller had to queue."""
+        if self._semaphore.acquire(blocking=False):
+            return False
+        if on_queued is not None:
+            on_queued()
+        self._semaphore.acquire()
+        return True
+
+    def release(self) -> None:
+        self._semaphore.release()
 
 
 def oldest_evictable_session(sessions: Mapping[str, Any]) -> str | None:
