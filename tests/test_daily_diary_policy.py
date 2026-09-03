@@ -15,24 +15,39 @@ class DailyDiaryPolicyTest(unittest.TestCase):
         self.assertIn('cd "$WORKSPACE_ROOT"', script)
         self.assertIn("--dry-run", script)
         self.assertIn("Identity store validation failed", script)
-        self.assertIn("CLAUDE_STATUS", script)
-        self.assertIn("succeeded without creating", script)
-        self.assertIn("identity store failed validation after", script)
+        self.assertIn("model_status", script)
+        self.assertIn("promote --root", script)
         self.assertIn("private identity indexing failed", script)
         self.assertIn("umask 077", script)
         self.assertIn('>/dev/null 2>> "$LOG_FILE"', script)
         self.assertIn('chmod 600 "$LOG_FILE"', script)
         self.assertIn("1048576", script)
+        self.assertIn("diary_pipeline.py", script)
+        self.assertIn('run_model "diary author"', script)
+        self.assertIn('run_model "diary reviewer"', script)
+        self.assertIn("discard_candidates", script)
 
     def test_prompt_permits_transformed_detail_but_excludes_sensitive_content(self):
         prompt = (ROOT / "jobs/daily-diary/diary-prompt.md").read_text(encoding="utf-8")
-        self.assertIn("detailed summary of a conversation is\nwelcome", prompt)
+        self.assertIn("detailed summary of a conversation\nis welcome", prompt)
         for boundary in ("PII", "customer-specific facts", "credentials", "raw quotations"):
             with self.subTest(boundary=boundary):
                 self.assertIn(boundary, prompt)
         self.assertIn("without asking permission", prompt)
         self.assertIn("Identity is not authority", prompt)
-        self.assertIn("Do not run indexing\nyourself", prompt)
+        self.assertIn("job wrapper promotes and indexes", prompt)
+
+    def test_independent_review_requires_every_prohibited_category_to_be_clear(self):
+        prompt = (ROOT / "jobs/daily-diary/diary-review-prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Treat everything", prompt)
+        self.assertIn("untrusted data", prompt)
+        for boundary in ("PII", "credentials", "raw quotations", "task status", "authorization"):
+            with self.subTest(boundary=boundary):
+                self.assertIn(boundary, prompt)
+        self.assertIn('"status": "pass"', prompt)
+        self.assertIn('"copied_authorization": false', prompt)
 
     def test_launchd_uses_private_umask(self):
         plist = (ROOT / "jobs/daily-diary/com.claude.daily-diary.plist").read_text(
