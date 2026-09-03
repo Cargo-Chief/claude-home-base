@@ -76,6 +76,7 @@ from slack_prompting import (
     relevance_prefix,
 )
 from http_server import serve_http
+from agent_status import AgentStatusReporter, configured_status_channel
 from delegation_observability import DelegationTracker, format_delegation_audit
 from openai_fallback import (
     fallback_error_kind,
@@ -2870,6 +2871,10 @@ def main():
         help="Validate the current thread's one-shot parking claim without consuming it",
     )
     parser.add_argument(
+        "--request-reboot-status", action="store_true",
+        help="Post the fixed, privacy-safe reboot-needed status and exit",
+    )
+    parser.add_argument(
         "--history", metavar="CHANNEL_ID",
         help="Print recent messages from a channel (or a thread if --thread is set)",
     )
@@ -2894,6 +2899,15 @@ def main():
         help="Register this Claude session_id as the resume target for replies in this DM thread. Use for cron jobs that DM someone, exit, and want to continue where they left off when the person replies.",
     )
     args = parser.parse_args()
+
+    try:
+        status_channel = configured_status_channel()
+    except ValueError as exc:
+        logger.error("Agent status configuration refused startup: %s", exc)
+        raise SystemExit(1) from exc
+    status_reporter = AgentStatusReporter(
+        slack_client, status_channel, BOT_DISPLAY_NAME, SOURCE_DIR, logger=logger
+    )
 
     # CLI modes — send and exit
     if args.send:
@@ -3011,6 +3025,13 @@ def main():
         print(f"PARKING_VALID: {parking.kind}")
         return
 
+    if args.request_reboot_status:
+        if not status_reporter.enabled:
+            raise SystemExit("agent status channel is not configured")
+        if not status_reporter.reboot_needed():
+            raise SystemExit("agent reboot-needed status delivery failed")
+        return
+
     if args.history:
         print(fetch_channel_history(args.history, limit=args.limit, thread_ts=args.thread))
         return
@@ -3058,7 +3079,11 @@ def main():
     # Start idle session cleanup thread
     threading.Thread(target=_cleanup_idle_sessions, daemon=True).start()
 
-    serve_http(flask_app, PORT)
+    try:
+        serve_http(flask_app, PORT, on_ready=status_reporter.ready)
+    except Exception:
+        status_reporter.fatal()
+        raise
 
 
 if __name__ == "__main__":
