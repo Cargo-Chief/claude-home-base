@@ -1,7 +1,7 @@
 import threading
 import unittest
 
-from session_lifecycle import oldest_evictable_session, stop_timed_out_session
+from session_lifecycle import TurnAdmission, oldest_evictable_session, stop_timed_out_session
 
 
 class FakeSession:
@@ -15,6 +15,32 @@ class FakeSession:
 
 
 class SessionLifecycleTests(unittest.TestCase):
+    def test_turn_admission_queues_until_capacity_is_released(self):
+        admission = TurnAdmission(1)
+        self.assertFalse(admission.acquire())
+        queued = threading.Event()
+        admitted = threading.Event()
+        waited = []
+
+        def wait_for_turn():
+            waited.append(admission.acquire(queued.set))
+            admitted.set()
+            admission.release()
+
+        waiter = threading.Thread(target=wait_for_turn)
+        waiter.start()
+        self.assertTrue(queued.wait(timeout=1))
+        self.assertFalse(admitted.is_set())
+        admission.release()
+        self.assertTrue(admitted.wait(timeout=1))
+        waiter.join(timeout=1)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual([True], waited)
+
+    def test_turn_admission_rejects_non_positive_limit(self):
+        with self.assertRaisesRegex(ValueError, "positive"):
+            TurnAdmission(0)
+
     def test_selects_oldest_unlocked_session(self):
         sessions = {
             "new-idle": FakeSession(30),

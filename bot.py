@@ -94,7 +94,7 @@ from provider_control import (
     use_openai_provider,
 )
 from reply_routing import ReplyRouteStore
-from session_lifecycle import oldest_evictable_session, stop_timed_out_session
+from session_lifecycle import TurnAdmission, oldest_evictable_session, stop_timed_out_session
 from governed_delegation import (
     budget_status,
     delegation_audit_path,
@@ -591,6 +591,7 @@ def _gc_forwards() -> None:
 
 IDLE_TIMEOUT = 10800  # 3 hours — kill process if no messages
 MAX_LIVE_SESSIONS = RUNTIME_POLICY.max_live_sessions
+_turn_admission = TurnAdmission(MAX_LIVE_SESSIONS)
 
 
 @dataclass
@@ -875,6 +876,20 @@ def _post_skill_notice(session: LiveSession, skill: str, args_str: str) -> None:
         )
     except Exception as e:
         logger.warning(f"Failed to post skill notice: {e}")
+
+
+def _post_queue_notice(channel: str, thread_ts: str) -> None:
+    """Tell the requester that admission is delayed, without dropping the turn."""
+    try:
+        note = "queued — Ned is finishing another thread; this request will start automatically"
+        slack_client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=note,
+            blocks=[{"type": "context", "elements": [
+                {"type": "mrkdwn", "text": f":hourglass_flowing_sand: _{note}_"}]}],
+        )
+    except Exception as e:
+        logger.warning(f"Failed to post queue notice: {e}")
 
 
 def _post_model_notice_to_thread(
@@ -2248,6 +2263,7 @@ def process_message_async(event: dict) -> None:
 
     start = time.time()
     audit_session_id = _get_openai_session(thread_ts) if use_openai else None
+    turn_admitted = False
 
     try:
         if use_openai:
@@ -2262,7 +2278,21 @@ def process_message_async(event: dict) -> None:
                 )
             session = None
         else:
-            session = _get_or_create_live_session(thread_ts, channel, user_id=user_id)
+            # Preserve same-thread steering while a turn is active. A request for
+            # another thread waits for bounded turn capacity instead of being
+            # discarded when every live session is busy.
+            with _live_sessions_lock:
+                session = _live_sessions.get(thread_ts)
+                if session and session.proc.poll() is not None:
+                    session = None
+            if not (session and session.turn_lock.locked()):
+                _turn_admission.acquire(
+                    lambda: _post_queue_notice(channel, thread_ts)
+                )
+                turn_admitted = True
+                session = _get_or_create_live_session(
+                    thread_ts, channel, user_id=user_id
+                )
 
         # Real-time steering: a Claude turn is already running in this thread — don't
         # hold the message until it finishes. Write it to stdin now; the CLI
@@ -2356,6 +2386,9 @@ def process_message_async(event: dict) -> None:
             text=f"Something went wrong: {e}",
         )
         return
+    finally:
+        if turn_admitted:
+            _turn_admission.release()
 
     duration = time.time() - start
 
