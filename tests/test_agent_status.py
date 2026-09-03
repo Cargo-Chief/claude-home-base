@@ -1,11 +1,10 @@
 import unittest
 from unittest import mock
-from types import SimpleNamespace
 
 from agent_status import (
     AgentStatusReporter,
     configured_status_channel,
-    reboot_request_has_conflict,
+    reboot_request_is_exact,
 )
 
 
@@ -41,22 +40,22 @@ class AgentStatusConfigurationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 configured_status_channel({"AGENT_STATUS_CHANNEL_ID": value})
 
-    def test_reboot_mode_rejects_other_bot_operations(self):
-        args = SimpleNamespace(
-            request_reboot_status=True,
-            channel=["C123", "sensitive detail"],
-        )
-        self.assertTrue(reboot_request_has_conflict(args))
+    def test_reboot_mode_rejects_every_additional_argument(self):
+        self.assertFalse(reboot_request_is_exact([
+            "--request-reboot-status", "--limit", "1",
+        ]))
+        self.assertFalse(reboot_request_is_exact([
+            "--request-reboot-status", "--future-option",
+        ]))
 
     def test_bare_reboot_mode_has_no_conflict(self):
-        args = SimpleNamespace(request_reboot_status=True)
-        self.assertFalse(reboot_request_has_conflict(args))
+        self.assertTrue(reboot_request_is_exact(["--request-reboot-status"]))
 
 
 class AgentStatusReporterTests(unittest.TestCase):
     def reporter(self, client, channel="C012ABC34"):
         return AgentStatusReporter(
-            client, channel, "Ned", logger=mock.Mock()
+            client, channel, logger=mock.Mock()
         )
 
     def test_ready_message_contains_only_agent_identity(self):
@@ -64,16 +63,8 @@ class AgentStatusReporterTests(unittest.TestCase):
         self.assertTrue(self.reporter(client).ready())
         self.assertEqual(client.calls, [{
             "channel": "C012ABC34",
-            "text": "🟢 Ned is online and ready.",
+            "text": "🟢 Online and ready.",
         }])
-
-    def test_unsafe_display_name_is_not_posted(self):
-        client = FakeClient()
-        reporter = AgentStatusReporter(
-            client, "C012ABC34", "<!channel> customer"
-        )
-        reporter.ready()
-        self.assertEqual(client.calls[0]["text"], "🟢 Agent is online and ready.")
 
     @mock.patch("agent_status.threading.Thread")
     def test_ready_async_uses_daemon_thread(self, thread):
@@ -103,19 +94,39 @@ class AgentStatusReporterTests(unittest.TestCase):
         self.assertTrue(self.reporter(client).reboot_needed())
         self.assertEqual(
             client.calls[0]["text"],
-            "🟡 Ned needs an operator reboot. No task or customer details were included.",
+            "🟡 Operator reboot needed. No task or customer details were included.",
         )
 
     def test_delivery_failure_is_nonfatal_and_logs_only_exception_class(self):
         logger = mock.Mock()
         reporter = AgentStatusReporter(
             FakeClient(RuntimeError("secret request body")),
-            "C012ABC34", "Ned", logger=logger,
+            "C012ABC34", logger=logger,
         )
         self.assertFalse(reporter.fatal())
         logger.warning.assert_called_once_with(
             "Agent status delivery failed (%s)", "RuntimeError"
         )
+
+    def test_thread_start_failure_does_not_abort_server_startup(self):
+        reporter = self.reporter(FakeClient())
+        with mock.patch("agent_status.threading.Thread") as thread:
+            thread.return_value.start.side_effect = RuntimeError("thread limit")
+            reporter.ready_async()
+        self.assertIsNone(reporter._ready_thread)
+        reporter.logger.warning.assert_called_once_with(
+            "Agent status delivery thread could not start"
+        )
+
+    def test_fatal_waits_for_ready_delivery_to_preserve_order(self):
+        client = FakeClient()
+        reporter = self.reporter(client)
+        ready_thread = mock.Mock()
+        ready_thread.is_alive.return_value = False
+        reporter._ready_thread = ready_thread
+        reporter.fatal()
+        ready_thread.join.assert_called_once_with(timeout=4)
+        self.assertIn("fatal runtime error", client.calls[0]["text"])
 
 
 if __name__ == "__main__":

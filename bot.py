@@ -79,7 +79,7 @@ from http_server import serve_http
 from agent_status import (
     AgentStatusReporter,
     configured_status_channel,
-    reboot_request_has_conflict,
+    reboot_request_is_exact,
 )
 from delegation_observability import DelegationTracker, format_delegation_audit
 from openai_fallback import (
@@ -2904,8 +2904,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if reboot_request_has_conflict(args):
-        parser.error("--request-reboot-status accepts no other bot operation or routing argument")
+    if args.request_reboot_status and not reboot_request_is_exact(sys.argv[1:]):
+        parser.error("--request-reboot-status accepts no other argument")
 
     # CLI modes — send and exit
     if args.send:
@@ -3029,7 +3029,9 @@ def main():
         except ValueError as exc:
             raise SystemExit(f"agent status configuration is invalid: {exc}") from exc
         status_reporter = AgentStatusReporter(
-            slack_client, status_channel, BOT_DISPLAY_NAME, logger=logger
+            WebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
+            status_channel,
+            logger=logger,
         )
         if not status_reporter.enabled:
             raise SystemExit("agent status channel is not configured")
@@ -3051,7 +3053,9 @@ def main():
         logger.error("Agent status configuration refused startup: %s", exc)
         raise SystemExit(1) from exc
     status_reporter = AgentStatusReporter(
-        slack_client, status_channel, BOT_DISPLAY_NAME, logger=logger
+        WebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
+        status_channel,
+        logger=logger,
     )
 
     # Server mode.  An empty allowlist is a startup error, never "allow all".

@@ -9,10 +9,6 @@ import threading
 
 
 CHANNEL_ID_RE = re.compile(r"[CG][A-Z0-9]+")
-REBOOT_CONFLICT_FIELDS = (
-    "send", "send_result", "thread", "channel", "escalate", "check_parking",
-    "history", "find_channel", "with_votes", "forward_to", "session_id",
-)
 
 
 def configured_status_channel(env: dict[str, str] | None = None) -> str:
@@ -24,26 +20,19 @@ def configured_status_channel(env: dict[str, str] | None = None) -> str:
     return channel
 
 
-def reboot_request_has_conflict(args) -> bool:
-    """Refuse combining the fixed reboot signal with any general bot operation."""
-    return bool(args.request_reboot_status and any(
-        getattr(args, field, None) for field in REBOOT_CONFLICT_FIELDS
-    ))
+def reboot_request_is_exact(argv: list[str]) -> bool:
+    """The trusted reboot capability is exactly one flag, now and after future CLI additions."""
+    return argv == ["--request-reboot-status"]
 
 
 class AgentStatusReporter:
     """Post fixed lifecycle messages; never accept task or customer detail."""
 
-    def __init__(self, client, channel: str, agent_name: str, *, logger=None):
+    def __init__(self, client, channel: str, *, logger=None):
         self.client = client
         self.channel = channel
-        configured_name = agent_name.strip()
-        self.agent_name = (
-            configured_name
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", configured_name)
-            else "Agent"
-        )
         self.logger = logger or logging.getLogger(__name__)
+        self._ready_thread = None
 
     @property
     def enabled(self) -> bool:
@@ -61,21 +50,31 @@ class AgentStatusReporter:
             return False
 
     def ready(self) -> bool:
-        return self._post(f"🟢 {self.agent_name} is online and ready.")
+        return self._post("🟢 Online and ready.")
 
     def ready_async(self) -> None:
         """Start delivery without delaying the newly bound HTTP listener."""
         if self.enabled:
-            threading.Thread(target=self.ready, daemon=True).start()
+            try:
+                self._ready_thread = threading.Thread(target=self.ready, daemon=True)
+                self._ready_thread.start()
+            except RuntimeError:
+                self._ready_thread = None
+                self.logger.warning("Agent status delivery thread could not start")
 
     def fatal(self) -> bool:
+        if self._ready_thread is not None:
+            self._ready_thread.join(timeout=4)
+            if self._ready_thread.is_alive():
+                self.logger.warning("Fatal status skipped while ready delivery is still pending")
+                return False
         return self._post(
-            f"🔴 {self.agent_name} stopped after a fatal runtime error. "
+            "🔴 Stopped after a fatal runtime error. "
             "No task or customer details were included; check the private service logs."
         )
 
     def reboot_needed(self) -> bool:
         return self._post(
-            f"🟡 {self.agent_name} needs an operator reboot. "
+            "🟡 Operator reboot needed. "
             "No task or customer details were included."
         )
