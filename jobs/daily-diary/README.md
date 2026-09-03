@@ -28,7 +28,8 @@ Each night (default 3:30 AM), a headless Claude session:
 | `daily-diary.sh` | Wrapper script: validation, non-mutating dry run, idempotency, timeout, truthful exit handling, logging, and `claude -p` |
 | `diary-prompt.md` | The diary-writing instructions (the wrapper substitutes the date and passes this to Claude) |
 | `diary-review-prompt.md` | A separate strict review/sanitization turn over quarantined candidates |
-| `com.claude.daily-diary.plist` | launchd schedule (3:30 AM local) |
+| `com.claude.daily-diary.plist` | LaunchAgent schedule for a principal with its own macOS login session |
+| `com.cargo-chief.daily-diary.daemon.plist` | LaunchDaemon schedule for a headless service principal |
 
 ## Setup
 
@@ -38,7 +39,6 @@ mkdir -p ~/scripts
 cp jobs/daily-diary/daily-diary.sh   ~/scripts/
 cp jobs/daily-diary/diary-prompt.md  ~/scripts/
 cp jobs/daily-diary/diary-review-prompt.md ~/scripts/
-cp jobs/daily-diary/com.claude.daily-diary.plist ~/Library/LaunchAgents/
 chmod +x ~/scripts/daily-diary.sh
 ```
 
@@ -62,12 +62,37 @@ required commands, and the target date without invoking a model or writing a dia
 # DIARY_DRY_RUN_OK date=YYYY-MM-DD target=/Users/<principal>/.../diary/YYYY-MM-DD.md
 ```
 
-Load and verify:
+### Scheduling a logged-in desktop principal
+
+Only a principal with its own macOS login session has a `gui/<uid>` launchd domain. For that case,
+copy and render `com.claude.daily-diary.plist` beneath `~/Library/LaunchAgents`, then load and verify:
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.claude.daily-diary.plist
 launchctl list | grep com.claude.daily-diary
 ```
+
+### Scheduling a headless service principal
+
+An account reached through `sudo -iu`, SSH, or another user's terminal has no GUI launchd domain.
+Do not bootstrap its LaunchAgent into another user's domain, and never load that LaunchAgent as
+root: without an explicit `UserName`, the diary would run as root.
+
+Instead, render `com.cargo-chief.daily-diary.daemon.plist`, replacing `YOUR_USERNAME`, `YOUR_GROUP`,
+and `CARGO_CHIEF_ROOT_PLACEHOLDER`. Validate the rendered copy, then install it as a root-owned
+LaunchDaemon and bootstrap the system domain:
+
+```bash
+plutil -lint /path/to/rendered-diary-daemon.plist
+sudo install -o root -g wheel -m 644 /path/to/rendered-diary-daemon.plist \
+  /Library/LaunchDaemons/com.cargo-chief.daily-diary.plist
+sudo launchctl bootstrap system \
+  /Library/LaunchDaemons/com.cargo-chief.daily-diary.plist
+sudo launchctl print system/com.cargo-chief.daily-diary
+```
+
+The daemon explicitly drops privileges to the configured service user and group before invoking
+the diary script. The schedule is still 3:30 AM local and runs without an interactive login.
 
 Run one explicit live acceptance (this writes today's entry, or skips if one already exists):
 
