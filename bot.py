@@ -96,9 +96,11 @@ from provider_control import (
 from reply_routing import ReplyRouteStore
 from session_lifecycle import TurnAdmission, oldest_evictable_session, stop_timed_out_session
 from governed_delegation import (
+    consume_budget_exhaustion,
     budget_status,
     delegation_audit_path,
     delegation_verification_status,
+    parse_budget_command,
     update_budget,
 )
 
@@ -1142,21 +1144,31 @@ def _reader_loop(session: LiveSession) -> None:
                     )
                     if session._on_text:
                         session._on_text(status)
-                elif verification_status == "budget_exhausted":
-                    if session._on_text:
-                        session._on_text(
-                            "Delegate result withheld: thread delegation budget exhausted; "
-                            "a named approver must reset or raise the budget."
-                        )
                 elif verification_missing:
                     if session._on_text:
                         session._on_text(
                             "Delegate result withheld: independent owner verification is missing."
                         )
-                else:
+                elif verification_status != "budget_exhausted":
                     for text in session.pre_tool_text:
                         if session._on_text:
                             session._on_text(text)
+                if verification_status == "budget_exhausted" and session.workspace:
+                    consumed = consume_budget_exhaustion(
+                        session.workspace.delegate_verification_file
+                    )
+                    if session._on_text:
+                        recovery = (
+                            "Owner-only replies remain available."
+                            if consumed else
+                            "The exhaustion notice could not be cleared; retry an owner-only "
+                            "reply or ask a named approver to reset the budget."
+                        )
+                        session._on_text(
+                            "Delegate result withheld: thread delegation budget exhausted; "
+                            "further delegation requires a named approver to reset or raise "
+                            f"the budget. {recovery}"
+                        )
                 session.private_escalation_pending = False
                 session.first_tool_seen = False
                 session.pre_tool_text.clear()
@@ -2015,10 +2027,7 @@ def _run_openai_fallback(
         )
         on_text("OpenAI fallback could not complete this turn.")
     elif verification_status == "budget_exhausted":
-        on_text(
-            "Delegate result withheld: thread delegation budget exhausted; "
-            "a named approver must reset or raise the budget."
-        )
+        pass
     elif verification_missing:
         audit_logger.warning(
             "DELEGATION_VERIFICATION | PROVIDER:openai | USER:%s | CHANNEL:%s | "
@@ -2029,6 +2038,18 @@ def _run_openai_fallback(
     else:
         for text_block in result.texts:
             on_text(text_block)
+    if verification_status == "budget_exhausted":
+        consumed = consume_budget_exhaustion(workspace.delegate_verification_file)
+        recovery = (
+            "Owner-only replies remain available."
+            if consumed else
+            "The exhaustion notice could not be cleared; retry an owner-only reply or ask a "
+            "named approver to reset the budget."
+        )
+        on_text(
+            "Delegate result withheld: thread delegation budget exhausted; further delegation "
+            f"requires a named approver to reset or raise the budget. {recovery}"
+        )
 
     audit_logger.info(
         "FALLBACK_INTERACTION | PROVIDER:openai | MODEL:%s | EFFORT:%s | USER:%s | CHANNEL:%s "
@@ -2515,10 +2536,10 @@ def _maybe_stop_from_message(event: dict) -> bool:
 
 def _maybe_delegation_budget_command(event: dict) -> bool:
     """Handle exact per-thread budget controls from a named approver."""
-    text = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip().lower()
-    match = re.fullmatch(r"delegation budget (status|reset|set\s+([1-9][0-9]*))", text)
-    if not match:
+    command = parse_budget_command(event.get("text", ""))
+    if not command:
         return False
+    action, limit = command
     user_id = event.get("user", "")
     try:
         authority = AuthorityPolicy.from_env()
@@ -2530,23 +2551,14 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
         workspace = prepare_thread_workspace(
             policy.root, channel=channel, thread=thread_ts
         )
-        action = match.group(1)
         if action == "status":
             state = budget_status(workspace.delegation_budget_file)
         elif action == "reset":
             state = update_budget(workspace.delegation_budget_file, reset=True)
         else:
             state = update_budget(
-                workspace.delegation_budget_file, limit=int(match.group(2))
+                workspace.delegation_budget_file, limit=limit
             )
-        if state["used"] < state["limit"]:
-            marker = workspace.delegate_verification_file
-            try:
-                metadata = json.loads(marker.read_text(encoding="utf-8"))
-                if metadata.get("status") == "budget_exhausted":
-                    marker.unlink()
-            except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError):
-                pass
     except (SafetyError, ValueError, OSError) as exc:
         slack_client.chat_postMessage(
             channel=event.get("channel"),
@@ -2562,7 +2574,7 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
     audit_logger.info(format_audit_metadata(
         "DELEGATION_BUDGET", user=user_id, channel=event.get("channel", ""),
         thread=event.get("thread_ts") or event.get("ts") or "unknown",
-        action=match.group(1).split()[0], used=state["used"], limit=state["limit"],
+        action=action.split()[0], used=state["used"], limit=state["limit"],
     ))
     return True
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import json
@@ -344,8 +345,17 @@ def delegation_audit_path(root: Path) -> Path:
     return path
 
 
-def delegation_verification_status(path: Path) -> str | None:
-    """Read only the fail-closed status of a pending delegation marker."""
+@contextmanager
+def _verification_marker_lock(path: Path):
+    lock = path.with_suffix(path.suffix + ".lock")
+    lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock.open("a", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def _delegation_verification_status_unlocked(path: Path) -> str | None:
     try:
         if not path.exists() and not path.is_symlink():
             return None
@@ -358,6 +368,37 @@ def delegation_verification_status(path: Path) -> str | None:
         return "invalid"
     status = metadata.get("status")
     return status if status in {"pending", "budget_exhausted"} else "invalid"
+
+
+def delegation_verification_status(path: Path) -> str | None:
+    """Read only the fail-closed status of a pending delegation marker."""
+    with _verification_marker_lock(path):
+        return _delegation_verification_status_unlocked(path)
+
+
+def consume_budget_exhaustion(path: Path) -> bool:
+    """Consume one valid exhaustion notice without weakening verification failures."""
+    with _verification_marker_lock(path):
+        if _delegation_verification_status_unlocked(path) != "budget_exhausted":
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+
+
+def parse_budget_command(text: str) -> tuple[str, int | None] | None:
+    """Parse the two supported exact spellings of a delegation-budget command."""
+    normalized = re.sub(r"<@[A-Z0-9]+>", "", text).strip().lower()
+    match = re.fullmatch(
+        r"(?:delegation|delegate) budget (status|reset|set\s+([1-9][0-9]{0,17}))",
+        normalized,
+    )
+    if not match:
+        return None
+    action = match.group(1)
+    return action, int(match.group(2)) if match.group(2) else None
 
 
 def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
@@ -451,18 +492,20 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         raise DelegationError(result.error)
     verification_file = Path(env["CARGO_CHIEF_DELEGATE_VERIFICATION_FILE"])
     if exhausted:
+        with _verification_marker_lock(verification_file):
+            verification_file.write_text(json.dumps({
+                "status": "budget_exhausted", "tier": request.tier,
+                "provider": provider, "model": model, "effort": effort,
+                "tokens": result.tokens,
+            }, separators=(",", ":")) + "\n", encoding="utf-8")
+            verification_file.chmod(0o600)
+        raise DelegationError("thread delegation budget exhausted; delegate return withheld")
+    with _verification_marker_lock(verification_file):
         verification_file.write_text(json.dumps({
-            "status": "budget_exhausted", "tier": request.tier,
-            "provider": provider, "model": model, "effort": effort,
-            "tokens": result.tokens,
+            "status": "pending", "tier": request.tier, "provider": provider, "model": model,
+            "effort": effort, "tokens": result.tokens, "mutation": request.mutation,
         }, separators=(",", ":")) + "\n", encoding="utf-8")
         verification_file.chmod(0o600)
-        raise DelegationError("thread delegation budget exhausted; delegate return withheld")
-    verification_file.write_text(json.dumps({
-        "status": "pending", "tier": request.tier, "provider": provider, "model": model,
-        "effort": effort, "tokens": result.tokens, "mutation": request.mutation,
-    }, separators=(",", ":")) + "\n", encoding="utf-8")
-    verification_file.chmod(0o600)
     print(result.text)
     return 0
 
@@ -493,17 +536,18 @@ def verify_from_environment(env: Mapping[str, str] | None = None) -> int:
     if any(not values.get(key) for key in required):
         raise DelegationError("governed verification environment is incomplete")
     marker = Path(values["CARGO_CHIEF_DELEGATE_VERIFICATION_FILE"])
-    try:
-        if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
-            raise DelegationError("no safe pending delegate verification exists")
-        metadata = json.loads(marker.read_text(encoding="utf-8"))
-        if not isinstance(metadata, dict):
-            raise DelegationError("pending delegate verification is invalid")
-    except (FileNotFoundError, json.JSONDecodeError) as exc:
-        raise DelegationError("no safe pending delegate verification exists") from exc
-    if metadata.get("status") != "pending":
-        raise DelegationError("thread delegation budget must be reset by a named approver")
-    marker.unlink()
+    with _verification_marker_lock(marker):
+        try:
+            if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+                raise DelegationError("no safe pending delegate verification exists")
+            metadata = json.loads(marker.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                raise DelegationError("pending delegate verification is invalid")
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            raise DelegationError("no safe pending delegate verification exists") from exc
+        if metadata.get("status") != "pending":
+            raise DelegationError("thread delegation budget must be reset by a named approver")
+        marker.unlink()
     _append_audit(Path(values["CARGO_CHIEF_AUDIT_LOG"]), {
         "USER": values["CARGO_CHIEF_CURRENT_USER"],
         "CHANNEL": values["CLAUDE_CHANNEL_ID"],

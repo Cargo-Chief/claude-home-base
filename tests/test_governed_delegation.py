@@ -15,10 +15,12 @@ from governed_delegation import (
     DelegationError,
     ROUTES,
     budget_status,
+    consume_budget_exhaustion,
     delegation_audit_path,
     delegation_verification_status,
     launch_from_environment,
     load_request,
+    parse_budget_command,
     run_claude_delegate,
     update_budget,
     validate_implementation_plan,
@@ -111,6 +113,49 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertEqual("budget_exhausted", delegation_verification_status(marker))
         marker.write_text("not-json\n", encoding="utf-8")
         self.assertEqual("invalid", delegation_verification_status(marker))
+
+    def test_consumes_only_a_valid_budget_exhaustion_marker(self):
+        marker = self.work / "verification.json"
+        marker.write_text('{"status":"budget_exhausted"}\n', encoding="utf-8")
+        self.assertTrue(consume_budget_exhaustion(marker))
+        self.assertFalse(marker.exists())
+        self.assertFalse(consume_budget_exhaustion(marker))
+
+        marker.write_text('{"status":"pending"}\n', encoding="utf-8")
+        self.assertFalse(consume_budget_exhaustion(marker))
+        self.assertTrue(marker.exists())
+
+        marker.write_text("not-json\n", encoding="utf-8")
+        self.assertFalse(consume_budget_exhaustion(marker))
+        self.assertTrue(marker.exists())
+
+    def test_does_not_consume_symlinked_budget_exhaustion_marker(self):
+        target = self.work / "target.json"
+        target.write_text('{"status":"budget_exhausted"}\n', encoding="utf-8")
+        marker = self.work / "verification.json"
+        marker.symlink_to(target)
+
+        self.assertFalse(consume_budget_exhaustion(marker))
+        self.assertTrue(marker.is_symlink())
+        self.assertTrue(target.exists())
+
+    def test_parses_both_exact_budget_command_spellings(self):
+        self.assertEqual(("status", None), parse_budget_command(
+            "delegation budget status"
+        ))
+        self.assertEqual(("status", None), parse_budget_command(
+            "<@U123> delegate budget status"
+        ))
+        self.assertEqual(("reset", None), parse_budget_command(
+            "delegate budget reset"
+        ))
+        self.assertEqual(("set 325000", 325000), parse_budget_command(
+            "delegation budget set 325000"
+        ))
+        self.assertIsNone(parse_budget_command(
+            "delegate budget set " + "9" * 10000
+        ))
+        self.assertIsNone(parse_budget_command("please show the delegate budget"))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
