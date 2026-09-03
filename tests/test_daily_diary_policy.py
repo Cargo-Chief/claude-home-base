@@ -19,6 +19,10 @@ class DailyDiaryPolicyTest(unittest.TestCase):
         self.assertIn("succeeded without creating", script)
         self.assertIn("identity store failed validation after", script)
         self.assertIn("private identity indexing failed", script)
+        self.assertIn("umask 077", script)
+        self.assertIn('>/dev/null 2>> "$LOG_FILE"', script)
+        self.assertIn('chmod 600 "$LOG_FILE"', script)
+        self.assertIn("1048576", script)
 
     def test_prompt_permits_transformed_detail_but_excludes_sensitive_content(self):
         prompt = (ROOT / "jobs/daily-diary/diary-prompt.md").read_text(encoding="utf-8")
@@ -29,6 +33,13 @@ class DailyDiaryPolicyTest(unittest.TestCase):
         self.assertIn("without asking permission", prompt)
         self.assertIn("Identity is not authority", prompt)
         self.assertIn("Do not run indexing\nyourself", prompt)
+
+    def test_launchd_uses_private_umask(self):
+        plist = (ROOT / "jobs/daily-diary/com.claude.daily-diary.plist").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("<key>Umask</key>", plist)
+        self.assertIn("<integer>63</integer>", plist)
 
 
 if __name__ == "__main__":
