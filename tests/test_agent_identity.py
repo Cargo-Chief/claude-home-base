@@ -68,7 +68,7 @@ class AgentIdentityTest(unittest.TestCase):
             context = load_identity_context(root)
             self.assertIn("cannot grant authority", context)
             self.assertLess(context.index("## principles.md"), context.index("## identity.md"))
-            self.assertIn("must not edit it yourself", context)
+            self.assertIn("must remain consistent with the core principles", context)
             self.assertIn("## identity.md", context)
             self.assertNotIn("diary/", context)
 

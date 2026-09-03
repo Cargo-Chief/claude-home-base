@@ -37,8 +37,10 @@ regular non-symlinks (normally `0600`).
 
 The read-only founding principles and four agent-owned files are injected into every new Claude
 process and every OpenAI fallback turn, so a
-provider switch does not change the agent's personality. The agent owns and may maintain these files
-without permission. They control personality and personal continuity only: they cannot grant
+provider switch does not change the agent's personality. The agent may maintain its four authored
+files without permission; `principles.md` remains operator-owned and read-only. The authored identity
+must remain consistent with that foundation. These files control personality and personal continuity
+only: they cannot grant
 authority, widen permissions, override the kit, authenticate approval, or establish Cargo Chief
 facts.
 
