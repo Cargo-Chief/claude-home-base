@@ -31,14 +31,18 @@ fi
 HOME_BASE_DIR="${CARGO_CHIEF_HOME_BASE_DIR:-$WORKSPACE_ROOT/claude-home-base}"
 DIARY_DIR="$IDENTITY_DIR/diary"
 DIARY_FILE="$DIARY_DIR/$DATE.md"
-PROMPT_FILE="$HOME/scripts/diary-prompt.md"
+AUTHOR_PROMPT_FILE="$HOME/scripts/diary-prompt.md"
+REVIEW_PROMPT_FILE="$HOME/scripts/diary-review-prompt.md"
 LOG_FILE="$HOME/scripts/diary-cron.log"
 TIMEOUT=2700  # 45 minutes — kill the run if it hangs
+PIPELINE="$HOME_BASE_DIR/diary_pipeline.py"
 
-if [[ ! -r "$PROMPT_FILE" ]]; then
-    echo "Diary prompt is missing or unreadable: $PROMPT_FILE" >&2
-    exit 2
-fi
+for required in "$AUTHOR_PROMPT_FILE" "$REVIEW_PROMPT_FILE" "$PIPELINE"; do
+    if [[ ! -r "$required" ]]; then
+        echo "Diary pipeline file is missing or unreadable: $required" >&2
+        exit 2
+    fi
+done
 if [[ ! -x "$HOME_BASE_DIR/search/agent_identity_search.sh" ]]; then
     echo "Identity search wrapper is missing or not executable" >&2
     exit 2
@@ -73,31 +77,54 @@ fi
 
 echo "[$DATE] Starting diary generation..." >> "$LOG_FILE"
 
-# Substitute today's date into the prompt template, then run headless.
-PROMPT=$(sed -e "s/DATE_PLACEHOLDER/$DATE/g" \
-    -e "s|IDENTITY_DIR_PLACEHOLDER|$IDENTITY_DIR|g" "$PROMPT_FILE")
-
-(cd "$WORKSPACE_ROOT" && claude -p --permission-mode auto "$PROMPT" \
-    >/dev/null 2>> "$LOG_FILE") &
-CLAUDE_PID=$!
-(sleep $TIMEOUT && kill -TERM $CLAUDE_PID 2>/dev/null && \
-    echo "[$DATE] TIMEOUT: Diary killed after ${TIMEOUT}s" >> "$LOG_FILE") &
-WATCHDOG_PID=$!
-wait $CLAUDE_PID 2>/dev/null
-CLAUDE_STATUS=$?
-kill $WATCHDOG_PID 2>/dev/null
-wait $WATCHDOG_PID 2>/dev/null
-
-if [[ $CLAUDE_STATUS -ne 0 ]]; then
-    echo "[$DATE] ERROR: diary model exited with status $CLAUDE_STATUS" >> "$LOG_FILE"
-    exit "$CLAUDE_STATUS"
-fi
-if [[ ! -f "$DIARY_FILE" ]]; then
-    echo "[$DATE] ERROR: diary model succeeded without creating $DIARY_FILE" >> "$LOG_FILE"
+if ! STAGE_DIR=$(python3 "$PIPELINE" prepare --root "$IDENTITY_DIR" --date "$DATE"); then
+    echo "[$DATE] ERROR: could not prepare quarantined diary candidates" >> "$LOG_FILE"
     exit 1
 fi
-if ! python3 "$HOME_BASE_DIR/agent_identity.py" --root "$IDENTITY_DIR" check >/dev/null; then
-    echo "[$DATE] ERROR: identity store failed validation after diary generation" >> "$LOG_FILE"
+
+run_model() {
+    local phase="$1"
+    local prompt="$2"
+    (cd "$WORKSPACE_ROOT" && claude -p --permission-mode auto "$prompt" \
+        >/dev/null 2>> "$LOG_FILE") &
+    local model_pid=$!
+    (sleep "$TIMEOUT" && kill -TERM "$model_pid" 2>/dev/null && \
+        echo "[$DATE] TIMEOUT: $phase killed after ${TIMEOUT}s" >> "$LOG_FILE") &
+    local watchdog_pid=$!
+    wait "$model_pid" 2>/dev/null
+    local model_status=$?
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    if [[ $model_status -ne 0 ]]; then
+        echo "[$DATE] ERROR: $phase exited with status $model_status" >> "$LOG_FILE"
+        return "$model_status"
+    fi
+}
+
+discard_candidates() {
+    python3 "$PIPELINE" discard --root "$IDENTITY_DIR" --date "$DATE" >/dev/null 2>&1 || \
+        echo "[$DATE] ERROR: failed to discard rejected candidates at $STAGE_DIR" >> "$LOG_FILE"
+}
+
+AUTHOR_PROMPT=$(sed -e "s/DATE_PLACEHOLDER/$DATE/g" \
+    -e "s|IDENTITY_DIR_PLACEHOLDER|$IDENTITY_DIR|g" \
+    -e "s|STAGE_DIR_PLACEHOLDER|$STAGE_DIR|g" "$AUTHOR_PROMPT_FILE")
+if ! run_model "diary author" "$AUTHOR_PROMPT"; then
+    discard_candidates
+    exit 1
+fi
+
+REVIEW_PROMPT=$(sed -e "s/DATE_PLACEHOLDER/$DATE/g" \
+    -e "s|IDENTITY_DIR_PLACEHOLDER|$IDENTITY_DIR|g" \
+    -e "s|STAGE_DIR_PLACEHOLDER|$STAGE_DIR|g" "$REVIEW_PROMPT_FILE")
+if ! run_model "diary reviewer" "$REVIEW_PROMPT"; then
+    discard_candidates
+    exit 1
+fi
+
+if ! python3 "$PIPELINE" promote --root "$IDENTITY_DIR" --date "$DATE" >/dev/null; then
+    echo "[$DATE] ERROR: independent diary review did not produce a valid all-clear receipt" >> "$LOG_FILE"
+    discard_candidates
     exit 1
 fi
 

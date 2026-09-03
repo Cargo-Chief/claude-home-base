@@ -9,12 +9,16 @@ Each night (default 3:30 AM), a headless Claude session:
 
 1. **Researches the day** — today's conversations and recent private diary entries are transient
    inputs for reflection, not another corpus to retain.
-2. **Writes the entry** beneath `$CARGO_CHIEF_IDENTITY_DIR/diary/`. Detailed conversation summaries
+2. **Authors in quarantine** beneath `$CARGO_CHIEF_IDENTITY_DIR/.diary-staging/`. Detailed conversation summaries
    are allowed after transformation, but PII, customer-specific facts, secrets, raw quotations,
    transcripts, task state, and authoritative company/product/platform claims are prohibited.
-3. **Evolves its identity** — maintains `identity.md`, `origin.md`, `voice.md`, and
-   `relationships.md` without approval when something genuinely shifted.
-4. **Refreshes its private index** — only founding principles, the four agent-owned identity files,
+3. **Reviews independently** — a fresh model turn sanitizes all five candidate files and emits a
+   strict, machine-validated all-clear receipt. A missing, malformed, incomplete, or failing receipt
+   leaves the live profile untouched and deletes the rejected candidate set so prohibited material
+   does not become a second private archive.
+4. **Promotes atomically** — only reviewed candidates replace the diary/core files. A failed
+   promotion restores the prior core profile.
+5. **Refreshes its private index** — only founding principles, the four agent-owned identity files,
    and sanitized diary enter this principal's identity database. Raw conversation logs never do.
 
 ## Files
@@ -23,6 +27,7 @@ Each night (default 3:30 AM), a headless Claude session:
 |------|---------|
 | `daily-diary.sh` | Wrapper script: validation, non-mutating dry run, idempotency, timeout, truthful exit handling, logging, and `claude -p` |
 | `diary-prompt.md` | The diary-writing instructions (the wrapper substitutes the date and passes this to Claude) |
+| `diary-review-prompt.md` | A separate strict review/sanitization turn over quarantined candidates |
 | `com.claude.daily-diary.plist` | launchd schedule (3:30 AM local) |
 
 ## Setup
@@ -32,6 +37,7 @@ python3 agent_identity.py init --principles-file /path/to/that-agent-principles.
 mkdir -p ~/scripts
 cp jobs/daily-diary/daily-diary.sh   ~/scripts/
 cp jobs/daily-diary/diary-prompt.md  ~/scripts/
+cp jobs/daily-diary/diary-review-prompt.md ~/scripts/
 cp jobs/daily-diary/com.claude.daily-diary.plist ~/Library/LaunchAgents/
 chmod +x ~/scripts/daily-diary.sh
 ```
