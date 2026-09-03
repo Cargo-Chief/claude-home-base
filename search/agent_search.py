@@ -140,7 +140,10 @@ def _validate_agent_identity_config(cfg, identity_root=None, search_root=None):
     cfg["database"] = str(database)
 
     allowed = {
-        "profile": (expected, ("identity.md", "origin.md", "voice.md", "relationships.md")),
+        "profile": (
+            expected,
+            ("principles.md", "identity.md", "origin.md", "voice.md", "relationships.md"),
+        ),
         "diary": (expected / "diary", ()),
     }
     seen = set()
@@ -157,7 +160,9 @@ def _validate_agent_identity_config(cfg, identity_root=None, search_root=None):
         if source_path != wanted_path:
             raise ValueError(f"source {name} escapes the per-principal identity directory")
         if wanted_include and tuple(source.get("include", [])) != wanted_include:
-            raise ValueError("profile source must include only the four identity files")
+            raise ValueError(
+                "profile source must include only founding principles and the four agent files"
+            )
         source["path"] = str(source_path)
     if seen != set(allowed):
         raise ValueError("agent-identity mode requires profile and diary sources")

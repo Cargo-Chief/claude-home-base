@@ -173,7 +173,7 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
             "database": str(runtime / "identity.db"),
             "directories": [
                 {"path": str(identity), "name": "profile", "type": "markdown", "include": [
-                    "identity.md", "origin.md", "voice.md", "relationships.md",
+                    "principles.md", "identity.md", "origin.md", "voice.md", "relationships.md",
                 ]},
                 {"path": str(diary), "name": "diary", "type": "markdown"},
             ],
@@ -195,7 +195,7 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
             "database": str(runtime / "identity.db"),
             "directories": [
                 {"path": str(identity), "name": "profile", "type": "markdown", "include": [
-                    "identity.md", "origin.md", "voice.md", "relationships.md",
+                    "principles.md", "identity.md", "origin.md", "voice.md", "relationships.md",
                 ]},
                 {"path": str(other), "name": "diary", "type": "markdown"},
             ],

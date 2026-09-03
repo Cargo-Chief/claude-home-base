@@ -132,12 +132,13 @@ is not presented as current merely because it matched strongly.
 ### Private agent-identity mode
 
 `agent_identity_search.sh` uses a different database and a fail-closed configuration. It indexes
-only the current Unix principal's configured `identity.md`, `origin.md`, `voice.md`,
-`relationships.md`, and `diary/*.md`. This corpus is agent-writable personal continuity, not shared
+only the current Unix principal's configured read-only `principles.md`, agent-owned `identity.md`,
+`origin.md`, `voice.md`, `relationships.md`, and `diary/*.md`. This corpus is private personal
+continuity, not shared
 Cargo Chief truth, and is never available to another service principal.
 
 ```bash
-python3 agent_identity.py init
+python3 agent_identity.py init --principles-file /path/to/that-agent-principles.md
 bash search/agent_identity_search.sh index
 bash search/agent_identity_search.sh search "how has my working relationship changed?" --json
 ```
