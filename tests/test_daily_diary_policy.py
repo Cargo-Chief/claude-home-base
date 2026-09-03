@@ -56,6 +56,17 @@ class DailyDiaryPolicyTest(unittest.TestCase):
         self.assertIn("<key>Umask</key>", plist)
         self.assertIn("<integer>63</integer>", plist)
 
+    def test_headless_daemon_drops_privileges_to_configured_principal(self):
+        plist = (ROOT / "jobs/daily-diary/com.cargo-chief.daily-diary.daemon.plist").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("<key>UserName</key>", plist)
+        self.assertIn("<string>YOUR_USERNAME</string>", plist)
+        self.assertIn("<key>GroupName</key>", plist)
+        self.assertIn("<string>YOUR_GROUP</string>", plist)
+        self.assertIn("<key>Umask</key>", plist)
+        self.assertNotIn("RunAtLoad", plist)
+
 
 if __name__ == "__main__":
     unittest.main()
