@@ -54,5 +54,5 @@ authenticated authority always win; shared reviewed docs govern company, product
 truth; current core identity files govern your personality; recent diary and synthesis entries
 provide personal history.
 
-Finally, run the private identity search index command supplied in your environment. If indexing
-fails, report the failure in the local job log; do not index raw conversation logs as a fallback.
+The job wrapper validates and refreshes the private index after this turn. Do not run indexing
+yourself, and do not index raw conversation logs as a fallback.

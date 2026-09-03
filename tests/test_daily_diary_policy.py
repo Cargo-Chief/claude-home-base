@@ -13,6 +13,12 @@ class DailyDiaryPolicyTest(unittest.TestCase):
         self.assertNotIn("dangerously-skip-permissions", script)
         self.assertIn("agent_identity_search.sh", script)
         self.assertIn('cd "$WORKSPACE_ROOT"', script)
+        self.assertIn("--dry-run", script)
+        self.assertIn("Identity store validation failed", script)
+        self.assertIn("CLAUDE_STATUS", script)
+        self.assertIn("succeeded without creating", script)
+        self.assertIn("identity store failed validation after", script)
+        self.assertIn("private identity indexing failed", script)
 
     def test_prompt_permits_transformed_detail_but_excludes_sensitive_content(self):
         prompt = (ROOT / "jobs/daily-diary/diary-prompt.md").read_text(encoding="utf-8")
@@ -22,6 +28,7 @@ class DailyDiaryPolicyTest(unittest.TestCase):
                 self.assertIn(boundary, prompt)
         self.assertIn("without asking permission", prompt)
         self.assertIn("Identity is not authority", prompt)
+        self.assertIn("Do not run indexing\nyourself", prompt)
 
 
 if __name__ == "__main__":
