@@ -5,9 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-import socket
-import subprocess
-from pathlib import Path
+import threading
 
 
 CHANNEL_ID_RE = re.compile(r"[CG][A-Z0-9]+")
@@ -22,30 +20,18 @@ def configured_status_channel(env: dict[str, str] | None = None) -> str:
     return channel
 
 
-def source_revision(source_dir: Path) -> str:
-    """Return a short source revision without making startup depend on Git metadata."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(source_dir), "rev-parse", "--short", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        revision = result.stdout.strip()
-        return revision if re.fullmatch(r"[0-9a-fA-F]{7,40}", revision) else "unknown"
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
-
-
 class AgentStatusReporter:
     """Post fixed lifecycle messages; never accept task or customer detail."""
 
-    def __init__(self, client, channel: str, agent_name: str, source_dir: Path, *, logger=None):
+    def __init__(self, client, channel: str, agent_name: str, *, logger=None):
         self.client = client
         self.channel = channel
-        self.agent_name = agent_name.strip() or "Agent"
-        self.source_dir = source_dir
+        configured_name = agent_name.strip()
+        self.agent_name = (
+            configured_name
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", configured_name)
+            else "Agent"
+        )
         self.logger = logger or logging.getLogger(__name__)
 
     @property
@@ -64,11 +50,12 @@ class AgentStatusReporter:
             return False
 
     def ready(self) -> bool:
-        host = socket.gethostname().split(".", 1)[0] or "unknown"
-        revision = source_revision(self.source_dir)
-        return self._post(
-            f"🟢 {self.agent_name} is online and ready · host `{host}` · revision `{revision}`"
-        )
+        return self._post(f"🟢 {self.agent_name} is online and ready.")
+
+    def ready_async(self) -> None:
+        """Start delivery without delaying the newly bound HTTP listener."""
+        if self.enabled:
+            threading.Thread(target=self.ready, daemon=True).start()
 
     def fatal(self) -> bool:
         return self._post(

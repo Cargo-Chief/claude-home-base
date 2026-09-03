@@ -1,4 +1,3 @@
-from pathlib import Path
 import unittest
 from unittest import mock
 
@@ -41,18 +40,34 @@ class AgentStatusConfigurationTests(unittest.TestCase):
 class AgentStatusReporterTests(unittest.TestCase):
     def reporter(self, client, channel="C012ABC34"):
         return AgentStatusReporter(
-            client, channel, "Ned", Path("/source"), logger=mock.Mock()
+            client, channel, "Ned", logger=mock.Mock()
         )
 
-    @mock.patch("agent_status.socket.gethostname", return_value="ned-host.local")
-    @mock.patch("agent_status.source_revision", return_value="abc1234")
-    def test_ready_message_contains_only_runtime_identity(self, _revision, _hostname):
+    def test_ready_message_contains_only_agent_identity(self):
         client = FakeClient()
         self.assertTrue(self.reporter(client).ready())
         self.assertEqual(client.calls, [{
             "channel": "C012ABC34",
-            "text": "🟢 Ned is online and ready · host `ned-host` · revision `abc1234`",
+            "text": "🟢 Ned is online and ready.",
         }])
+
+    def test_unsafe_display_name_is_not_posted(self):
+        client = FakeClient()
+        reporter = AgentStatusReporter(
+            client, "C012ABC34", "<!channel> customer"
+        )
+        reporter.ready()
+        self.assertEqual(client.calls[0]["text"], "🟢 Agent is online and ready.")
+
+    @mock.patch("agent_status.threading.Thread")
+    def test_ready_async_uses_daemon_thread(self, thread):
+        client = FakeClient()
+        self.reporter(client).ready_async()
+        thread.assert_called_once_with(
+            target=mock.ANY,
+            daemon=True,
+        )
+        thread.return_value.start.assert_called_once_with()
 
     def test_disabled_reporter_makes_no_slack_call(self):
         client = FakeClient()
@@ -79,7 +94,7 @@ class AgentStatusReporterTests(unittest.TestCase):
         logger = mock.Mock()
         reporter = AgentStatusReporter(
             FakeClient(RuntimeError("secret request body")),
-            "C012ABC34", "Ned", Path("/source"), logger=logger,
+            "C012ABC34", "Ned", logger=logger,
         )
         self.assertFalse(reporter.fatal())
         logger.warning.assert_called_once_with(

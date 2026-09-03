@@ -2900,15 +2900,6 @@ def main():
     )
     args = parser.parse_args()
 
-    try:
-        status_channel = configured_status_channel()
-    except ValueError as exc:
-        logger.error("Agent status configuration refused startup: %s", exc)
-        raise SystemExit(1) from exc
-    status_reporter = AgentStatusReporter(
-        slack_client, status_channel, BOT_DISPLAY_NAME, SOURCE_DIR, logger=logger
-    )
-
     # CLI modes — send and exit
     if args.send:
         if args.with_votes:
@@ -3026,6 +3017,13 @@ def main():
         return
 
     if args.request_reboot_status:
+        try:
+            status_channel = configured_status_channel()
+        except ValueError as exc:
+            raise SystemExit(f"agent status configuration is invalid: {exc}") from exc
+        status_reporter = AgentStatusReporter(
+            slack_client, status_channel, BOT_DISPLAY_NAME, logger=logger
+        )
         if not status_reporter.enabled:
             raise SystemExit("agent status channel is not configured")
         if not status_reporter.reboot_needed():
@@ -3039,6 +3037,15 @@ def main():
     if args.find_channel:
         print(find_channel(args.find_channel))
         return
+
+    try:
+        status_channel = configured_status_channel()
+    except ValueError as exc:
+        logger.error("Agent status configuration refused startup: %s", exc)
+        raise SystemExit(1) from exc
+    status_reporter = AgentStatusReporter(
+        slack_client, status_channel, BOT_DISPLAY_NAME, logger=logger
+    )
 
     # Server mode.  An empty allowlist is a startup error, never "allow all".
     try:
@@ -3079,10 +3086,18 @@ def main():
     # Start idle session cleanup thread
     threading.Thread(target=_cleanup_idle_sessions, daemon=True).start()
 
+    runtime_ready = False
+
+    def announce_ready():
+        nonlocal runtime_ready
+        runtime_ready = True
+        status_reporter.ready_async()
+
     try:
-        serve_http(flask_app, PORT, on_ready=status_reporter.ready)
+        serve_http(flask_app, PORT, on_ready=announce_ready)
     except Exception:
-        status_reporter.fatal()
+        if runtime_ready:
+            status_reporter.fatal()
         raise
 
 
