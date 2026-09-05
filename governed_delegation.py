@@ -530,6 +530,60 @@ def _write_pid(path: Path, process: subprocess.Popen | None) -> None:
     path.chmod(0o600)
 
 
+def governed_delegate_active(pid_path: Path) -> bool:
+    """Return whether the governed launcher holds this thread's delegate lock."""
+    lock_path = pid_path.with_suffix(".lock")
+    try:
+        if lock_path.is_symlink():
+            return False
+        with lock_path.open("a", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
+
+
+def cleanup_stale_delegate_pid(pid_path: Path) -> bool:
+    """Remove an inactive delegate marker while holding its launcher lock."""
+    lock_path = pid_path.with_suffix(".lock")
+    try:
+        if lock_path.is_symlink():
+            return False
+        with lock_path.open("a", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            try:
+                if pid_path.is_symlink() or not pid_path.is_file():
+                    return False
+                pid_path.unlink()
+                return True
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        return False
+
+
+def _acquire_delegate_lock(handle, *, wait_seconds: float = 0.1) -> None:
+    """Tolerate the activity probe's momentary lock without queueing delegates."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            if time.monotonic() >= deadline:
+                raise DelegationError(
+                    "another delegate is already active in this thread"
+                ) from exc
+            time.sleep(0.01)
+
+
 def _append_audit(path: Path, fields: Mapping[str, object]) -> None:
     safe = " | ".join(f"{key}:{value}" for key, value in fields.items())
     with path.open("a", encoding="utf-8") as handle:
@@ -778,10 +832,7 @@ def launch_from_environment(env: Mapping[str, str] | None = None) -> int:
     lock_path = Path(pid_name).with_suffix(".lock")
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with lock_path.open("a", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise DelegationError("another delegate is already active in this thread") from exc
+        _acquire_delegate_lock(handle)
         os.fchmod(handle.fileno(), 0o600)
         return _launch_from_environment_unlocked(values)
 

@@ -1,5 +1,5 @@
 import json
-import subprocess
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -70,7 +70,8 @@ class OpenAIFallbackTest(unittest.TestCase):
     def test_runner_passes_prompt_via_stdin_and_never_raises_stderr(self, popen):
         process = popen.return_value
         process.returncode = 7
-        process.communicate.return_value = ("", "credential-bearing diagnostic")
+        process.stdout = iter([])
+        process.stderr = iter(["credential-bearing diagnostic"])
         observed = []
         result = run_codex_turn(
             ["codex", "exec", "--json", "-"], "authority envelope",
@@ -79,21 +80,132 @@ class OpenAIFallbackTest(unittest.TestCase):
         )
         self.assertEqual("Codex fallback exited with status 7", result.error)
         self.assertNotIn("credential", result.error)
-        process.communicate.assert_called_once_with("authority envelope", timeout=10)
+        process.stdin.write.assert_called_once_with("authority envelope")
+        process.stdin.close.assert_called_once_with()
         self.assertEqual([process, None], observed)
 
     @patch("openai_fallback.subprocess.Popen")
     def test_runner_kills_timed_out_process(self, popen):
         process = popen.return_value
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired(cmd="codex", timeout=10),
-            ("", ""),
-        ]
+        process.returncode = 0
+        process.poll.return_value = None
+        released = threading.Event()
+
+        def blocked_stdout():
+            released.wait(timeout=1)
+            return
+            yield
+
+        process.stdout = blocked_stdout()
+        process.stderr = iter([])
+        process.kill.side_effect = released.set
         result = run_codex_turn(
-            ["codex"], "prompt", cwd="/workspace", env={}, timeout=10,
+            ["codex"], "prompt", cwd="/workspace", env={}, timeout=0.01,
         )
         self.assertEqual("Codex fallback timed out", result.error)
         process.kill.assert_called_once_with()
+
+    @patch("openai_fallback.subprocess.Popen")
+    def test_runner_times_out_when_prompt_delivery_blocks(self, popen):
+        process = popen.return_value
+        process.returncode = 0
+        process.poll.return_value = None
+        released = threading.Event()
+        process.stdin.write.side_effect = lambda _prompt: released.wait(timeout=1)
+
+        def blocked_stdout():
+            released.wait(timeout=1)
+            return
+            yield
+
+        process.stdout = blocked_stdout()
+        process.stderr = iter([])
+        process.kill.side_effect = released.set
+
+        result = run_codex_turn(
+            ["codex"], "prompt", cwd="/workspace", env={}, timeout=0.01,
+        )
+
+        self.assertEqual("Codex fallback timed out", result.error)
+        process.kill.assert_called_once_with()
+
+    @patch("openai_fallback.subprocess.Popen")
+    def test_runner_reaps_child_after_prompt_write_failure(self, popen):
+        process = popen.return_value
+        process.returncode = 1
+        process.stdin.write.side_effect = BrokenPipeError
+        process.stdout = iter([])
+        process.stderr = iter([])
+
+        result = run_codex_turn(
+            ["codex"], "prompt", cwd="/workspace", env={}, timeout=1,
+        )
+
+        self.assertEqual("Codex fallback could not start", result.error)
+        process.wait.assert_called_once_with(timeout=5)
+
+    @patch("openai_fallback.subprocess.Popen")
+    def test_runner_keeps_waiting_while_delegate_is_active(self, popen):
+        process = popen.return_value
+        process.returncode = 0
+        release_stdout = threading.Event()
+
+        def delayed_stdout():
+            release_stdout.wait(timeout=1)
+            yield json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "finished",
+            }})
+
+        process.stdout = delayed_stdout()
+        process.stderr = iter([])
+
+        def wait_for_completion(done_event, **kwargs):
+            self.assertTrue(kwargs["delegate_active"]())
+            self.assertEqual(17, kwargs["max_duration"])
+            release_stdout.set()
+            self.assertTrue(done_event.wait(timeout=1))
+            return True
+
+        result = run_codex_turn(
+            ["codex"], "prompt", cwd="/workspace", env={}, timeout=10,
+            delegate_active=lambda: True,
+            max_duration=17,
+            wait_for_completion=wait_for_completion,
+        )
+        self.assertEqual(["finished"], result.texts)
+
+    @patch("openai_fallback.subprocess.Popen")
+    def test_runner_reports_stream_progress_to_lifecycle_waiter(self, popen):
+        process = popen.return_value
+        process.returncode = 0
+        emit_line = threading.Event()
+        finish_stream = threading.Event()
+
+        def streamed_stdout():
+            emit_line.wait(timeout=1)
+            yield json.dumps({"type": "thread.started", "thread_id": "T1"})
+            finish_stream.wait(timeout=1)
+
+        process.stdout = streamed_stdout()
+        process.stderr = iter([])
+
+        def wait_for_completion(done_event, **kwargs):
+            before = kwargs["activity_at"]()
+            emit_line.set()
+            for _ in range(100):
+                if kwargs["activity_at"]() > before:
+                    break
+                threading.Event().wait(0.01)
+            self.assertGreater(kwargs["activity_at"](), before)
+            finish_stream.set()
+            self.assertTrue(done_event.wait(timeout=1))
+            return True
+
+        result = run_codex_turn(
+            ["codex"], "prompt", cwd="/workspace", env={}, timeout=10,
+            wait_for_completion=wait_for_completion,
+        )
+        self.assertEqual("T1", result.session_id)
 
 
 if __name__ == "__main__":

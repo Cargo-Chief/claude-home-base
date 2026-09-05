@@ -94,15 +94,23 @@ from provider_control import (
     use_openai_provider,
 )
 from reply_routing import ReplyRouteStore
-from session_lifecycle import TurnAdmission, oldest_evictable_session, stop_timed_out_session
+from session_lifecycle import (
+    TurnAdmission,
+    oldest_evictable_session,
+    owner_stream_event_is_activity,
+    stop_timed_out_session,
+    wait_for_turn_completion,
+)
 from governed_delegation import (
     BUDGET_UNIT,
     DelegationError,
+    cleanup_stale_delegate_pid,
     consume_allocation_exhaustion,
     consume_budget_exhaustion,
     budget_status,
     delegation_audit_path,
     delegation_verification_status,
+    governed_delegate_active,
     prepare_owner_delegation_state,
     parse_budget_command,
     update_budget,
@@ -195,6 +203,7 @@ for private_log in (LOG_DIR / "bot.log", AUDIT_LOG):
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 CLAUDE_TIMEOUT = RUNTIME_POLICY.claude_timeout
+MAX_TURN_RUNTIME = 4 * CLAUDE_TIMEOUT
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -607,6 +616,7 @@ class LiveSession:
     session_id: str | None = None
     stdin_lock: threading.Lock = field(default_factory=threading.Lock)
     last_activity: float = field(default_factory=time.time)
+    turn_activity: float = field(default_factory=time.monotonic)
     channel: str = ""
     thread_ts: str = ""
     user_id: str = ""
@@ -781,12 +791,12 @@ def _spawn_claude_process(
         escalation_message_file, escalation_receipt_file,
         workspace.escalation_attempt_file, workspace.parking_claim_file,
         workspace.delegation_request_file, workspace.implementation_claim_file,
-        workspace.delegate_pid_file,
     ):
         try:
             stale_path.unlink()
         except FileNotFoundError:
             pass
+    cleanup_stale_delegate_pid(workspace.delegate_pid_file)
     cmd = build_claude_command(
         policy,
         initial_prompt=battery_context,
@@ -995,12 +1005,12 @@ def _reader_loop(session: LiveSession) -> None:
             except json.JSONDecodeError:
                 continue
 
-            # Any output means the session is working — keep the idle reaper
-            # away even when no new message has arrived for a long time
-            # (e.g. a quiet multi-hour background workflow).
-            session.last_activity = time.time()
-
             msg_type = data.get("type")
+            # Provider and tool-result output proves the owner is working. An
+            # echoed inbound user event does not extend a hung turn's deadline.
+            if owner_stream_event_is_activity(data):
+                session.last_activity = time.time()
+                session.turn_activity = time.monotonic()
             session.delegation_tracker.observe(data)
 
             if msg_type == "system":
@@ -1885,6 +1895,7 @@ def _run_openai_fallback(
     user_id: str,
     prompt: str,
     on_text,
+    max_duration: float = MAX_TURN_RUNTIME,
 ) -> str | None:
     """Run one profile-governed Codex turn and apply the shared harness claims."""
     validate_codex_runtime()
@@ -1907,12 +1918,12 @@ def _run_openai_fallback(
         workspace.parking_claim_file,
         workspace.delegation_request_file,
         workspace.implementation_claim_file,
-        workspace.delegate_pid_file,
     ):
         try:
             stale_path.unlink()
         except FileNotFoundError:
             pass
+    cleanup_stale_delegate_pid(workspace.delegate_pid_file)
     bundle = resolve_thread_bundle(workspace)
     cwd = bundle or workspace.path
     saved_session_id = _get_openai_session(thread_ts)
@@ -1973,6 +1984,8 @@ def _run_openai_fallback(
         env=proc_env,
         timeout=CLAUDE_TIMEOUT,
         on_process=track_process,
+        delegate_active=lambda: governed_delegate_active(workspace.delegate_pid_file),
+        max_duration=max_duration,
     )
     with _live_sessions_lock:
         stopped = thread_ts in _openai_stopped
@@ -2325,6 +2338,7 @@ def process_message_async(event: dict) -> None:
 
     try:
         if use_openai:
+            turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
             with _openai_turn_lock(thread_ts):
                 audit_session_id = _run_openai_fallback(
                     policy=room_policy,
@@ -2333,6 +2347,7 @@ def process_message_async(event: dict) -> None:
                     user_id=user_id,
                     prompt=text,
                     on_text=on_text,
+                    max_duration=max(0.001, turn_deadline - time.monotonic()),
                 )
             session = None
         else:
@@ -2372,12 +2387,24 @@ def process_message_async(event: dict) -> None:
         # If another message is already being processed, we block here.
         if session:
             with session.turn_lock:
+                turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
                 session._on_text = on_text
                 session._turn_done.clear()
+                if session.workspace:
+                    cleanup_stale_delegate_pid(session.workspace.delegate_pid_file)
 
                 _send_to_claude(session, text)
 
-                if not session._turn_done.wait(timeout=CLAUDE_TIMEOUT):
+                if not wait_for_turn_completion(
+                    session._turn_done,
+                    inactivity_timeout=CLAUDE_TIMEOUT,
+                    activity_at=lambda: session.turn_activity,
+                    delegate_active=lambda: bool(
+                        session.workspace
+                        and governed_delegate_active(session.workspace.delegate_pid_file)
+                    ),
+                    max_duration=max(0.001, turn_deadline - time.monotonic()),
+                ):
                     try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                     except Exception: pass
                     while session.pending_reactions:
@@ -2391,7 +2418,8 @@ def process_message_async(event: dict) -> None:
                     slack_client.chat_postMessage(
                         channel=channel, thread_ts=thread_ts,
                         text=(
-                            f"Timed out after {minutes} minutes and stopped. "
+                            f"Turn reached its {minutes}-minute inactivity limit or "
+                            f"{MAX_TURN_RUNTIME // 60}-minute hard limit; stopped. "
                             "Working files and thread continuity were preserved; "
                             "tell me to resume when ready."
                         ),
@@ -2422,6 +2450,7 @@ def process_message_async(event: dict) -> None:
                             user_id=user_id,
                             prompt=fallback_prompt,
                             on_text=on_text,
+                            max_duration=max(0.001, turn_deadline - time.monotonic()),
                         )
 
                 # Check if the process died without producing a response

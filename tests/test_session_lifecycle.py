@@ -1,7 +1,45 @@
 import threading
 import unittest
 
-from session_lifecycle import TurnAdmission, oldest_evictable_session, stop_timed_out_session
+from session_lifecycle import (
+    TurnAdmission,
+    oldest_evictable_session,
+    owner_stream_event_is_activity,
+    stop_timed_out_session,
+    wait_for_turn_completion,
+)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class FakeDoneEvent:
+    def __init__(
+        self, clock, *, complete_on_wait=None, set_on_wait=None, after_wait=None,
+    ):
+        self.clock = clock
+        self.complete_on_wait = complete_on_wait
+        self.set_on_wait = set_on_wait
+        self.after_wait = after_wait
+        self.waits = 0
+
+    def wait(self, timeout):
+        self.clock.now += timeout
+        self.waits += 1
+        if self.after_wait:
+            self.after_wait(self.waits)
+        return self.waits == self.complete_on_wait
+
+    def is_set(self):
+        return (
+            self.waits == self.complete_on_wait
+            or (self.set_on_wait is not None and self.waits >= self.set_on_wait)
+        )
 
 
 class FakeSession:
@@ -88,6 +126,108 @@ class SessionLifecycleTests(unittest.TestCase):
 
         self.assertTrue(stop_timed_out_session(session, interrupt))
         self.assertEqual([(None, [])], observed)
+
+    def test_turn_times_out_after_configured_inactivity(self):
+        clock = FakeClock()
+        done = FakeDoneEvent(clock)
+
+        self.assertFalse(wait_for_turn_completion(
+            done,
+            inactivity_timeout=3,
+            activity_at=lambda: 0,
+            delegate_active=lambda: False,
+            clock=clock,
+            poll_interval=1,
+        ))
+        self.assertEqual(3, done.waits)
+
+    def test_owner_output_resets_turn_inactivity_deadline(self):
+        clock = FakeClock()
+        activity = [0.0]
+
+        def record_activity(wait_number):
+            if wait_number == 2:
+                activity[0] = clock.now
+
+        done = FakeDoneEvent(
+            clock, complete_on_wait=4, after_wait=record_activity,
+        )
+
+        self.assertTrue(wait_for_turn_completion(
+            done,
+            inactivity_timeout=3,
+            activity_at=lambda: activity[0],
+            delegate_active=lambda: False,
+            clock=clock,
+            poll_interval=1,
+        ))
+
+    def test_live_delegate_suspends_owner_inactivity_timeout(self):
+        clock = FakeClock()
+        done = FakeDoneEvent(clock, complete_on_wait=5)
+
+        self.assertTrue(wait_for_turn_completion(
+            done,
+            inactivity_timeout=2,
+            activity_at=lambda: 0,
+            delegate_active=lambda: clock.now < 4,
+            clock=clock,
+            poll_interval=1,
+        ))
+
+    def test_delegate_completion_starts_a_fresh_owner_inactivity_window(self):
+        clock = FakeClock()
+        done = FakeDoneEvent(clock)
+
+        self.assertFalse(wait_for_turn_completion(
+            done,
+            inactivity_timeout=2,
+            activity_at=lambda: 0,
+            delegate_active=lambda: clock.now < 3,
+            clock=clock,
+            poll_interval=1,
+        ))
+        self.assertEqual(5, done.waits)
+
+    def test_hard_limit_stops_continuously_active_turn(self):
+        clock = FakeClock()
+        done = FakeDoneEvent(clock)
+
+        self.assertFalse(wait_for_turn_completion(
+            done,
+            inactivity_timeout=2,
+            activity_at=lambda: clock.now,
+            delegate_active=lambda: True,
+            clock=clock,
+            poll_interval=1,
+            max_duration=5,
+        ))
+        self.assertEqual(5, done.waits)
+
+    def test_completion_at_deadline_wins_boundary_race(self):
+        clock = FakeClock()
+        done = FakeDoneEvent(clock, set_on_wait=3)
+
+        self.assertTrue(wait_for_turn_completion(
+            done,
+            inactivity_timeout=3,
+            activity_at=lambda: 0,
+            delegate_active=lambda: False,
+            clock=clock,
+            poll_interval=1,
+        ))
+
+    def test_inbound_user_text_is_not_owner_activity(self):
+        self.assertFalse(owner_stream_event_is_activity({
+            "type": "user", "message": {"content": "steer"},
+        }))
+
+    def test_tool_result_and_assistant_output_are_owner_activity(self):
+        self.assertTrue(owner_stream_event_is_activity({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "content": "done"}]},
+        }))
+        self.assertTrue(owner_stream_event_is_activity({"type": "assistant"}))
 
 
 if __name__ == "__main__":

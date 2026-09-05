@@ -11,6 +11,7 @@ from unittest.mock import patch
 from codex_delegation import CodexDelegateResult
 
 from governed_delegation import (
+    _acquire_delegate_lock,
     _append_audit,
     BUDGET_UNIT,
     DEFAULT_TOKEN_BUDGET,
@@ -19,10 +20,12 @@ from governed_delegation import (
     ROUTES,
     USAGE_RECEIPT_SCHEMA,
     budget_status,
+    cleanup_stale_delegate_pid,
     consume_allocation_exhaustion,
     consume_budget_exhaustion,
     delegation_audit_path,
     delegation_verification_status,
+    governed_delegate_active,
     initialize_budget,
     prepare_owner_delegation_state,
     launch_from_environment,
@@ -584,6 +587,69 @@ class GovernedDelegationTest(unittest.TestCase):
             with self.assertRaisesRegex(DelegationError, "already active"):
                 launch_from_environment(env)
         self.assertTrue(request.exists())
+
+    def test_delegate_launch_tolerates_transient_activity_probe_lock(self):
+        lock = (self.work / "delegate.pid").with_suffix(".lock")
+        holder = lock.open("a", encoding="utf-8")
+        contender = lock.open("a", encoding="utf-8")
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def release_probe():
+            threading.Event().wait(0.02)
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+        releaser = threading.Thread(target=release_probe)
+        releaser.start()
+        try:
+            _acquire_delegate_lock(contender, wait_seconds=0.2)
+            fcntl.flock(contender, fcntl.LOCK_UN)
+        finally:
+            contender.close()
+            releaser.join(timeout=1)
+        self.assertFalse(releaser.is_alive())
+
+    def test_held_delegate_lock_reports_active(self):
+        pid = self.work / "delegate.pid"
+        lock = pid.with_suffix(".lock")
+        with lock.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(governed_delegate_active(pid))
+
+    def test_free_delegate_lock_reports_inactive(self):
+        self.assertFalse(governed_delegate_active(self.work / "delegate.pid"))
+
+    def test_stale_pid_cleanup_respects_delegate_lock(self):
+        pid = self.work / "delegate.pid"
+        pid.write_text("123\n", encoding="utf-8")
+        lock = pid.with_suffix(".lock")
+        with lock.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(cleanup_stale_delegate_pid(pid))
+        self.assertTrue(pid.exists())
+        self.assertTrue(cleanup_stale_delegate_pid(pid))
+        self.assertFalse(pid.exists())
+
+    def test_stale_pid_cleanup_refuses_symlink(self):
+        target = self.work / "target"
+        target.write_text("123\n", encoding="utf-8")
+        pid = self.work / "delegate.pid"
+        pid.symlink_to(target)
+
+        self.assertFalse(cleanup_stale_delegate_pid(pid))
+        self.assertTrue(pid.is_symlink())
+
+    def test_delegate_helpers_refuse_symlinked_lock(self):
+        target = self.work / "real.lock"
+        target.touch()
+        pid = self.work / "delegate.pid"
+        pid.with_suffix(".lock").symlink_to(target)
+
+        self.assertFalse(governed_delegate_active(pid))
+        self.assertFalse(cleanup_stale_delegate_pid(pid))
+
+    def test_stale_pid_cleanup_ignores_missing_marker(self):
+        self.assertFalse(cleanup_stale_delegate_pid(self.work / "delegate.pid"))
 
     @patch("governed_delegation.run_codex_delegate")
     def test_openai_launch_records_budget_and_content_free_audit(self, run):
