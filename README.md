@@ -19,10 +19,15 @@ harness recognizes Claude's account credit-limit response.
 
 Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
-`CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live sessions, caps turns at 15 minutes, writes
-metadata-only audit records, removes stale temporary files at startup, and refuses file transfer
-or transcript search. Additional Slack threads wait behind the two active turns and start
-automatically when capacity is available; requests are not discarded at the session cap.
+`CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live sessions and stops a turn after at most 15
+minutes without owner output or a live governed delegate. A governed delegate retains its own
+bounded call timeout and generation-token allocation; its held launcher lock keeps the owner alive long
+enough for the launcher to meter the return, and the owner receives a fresh inactivity window when
+the delegate exits. A one-hour hard limit still prevents a continuously noisy or repeatedly
+delegating turn from holding one of the two admission slots forever. Gate A also writes metadata-only audit records, removes stale temporary files
+at startup, and refuses file transfer or transcript search. Additional Slack threads wait behind
+the two active turns and start automatically when capacity is available; requests are not
+discarded at the session cap.
 
 Lifecycle reporting is optional and installation-specific. During setup, create or select the
 Slack channel you want to use, invite the app, and put its stable channel ID in

@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 import json
 import re
 import subprocess
+import threading
+import time
 from typing import Callable, Iterable, Mapping
+
+from session_lifecycle import wait_for_turn_completion
 
 
 CLAUDE_LIMIT_RE = re.compile(
@@ -80,8 +84,43 @@ def run_codex_turn(
     env: Mapping[str, str],
     timeout: int,
     on_process: Callable[[subprocess.Popen | None], None] | None = None,
+    delegate_active: Callable[[], bool] = lambda: False,
+    max_duration: float | None = None,
+    wait_for_completion: Callable = wait_for_turn_completion,
 ) -> CodexTurnResult:
-    """Run one governed Codex turn without exposing stderr or configuration values."""
+    """Run one governed Codex turn with a progress-aware inactivity timeout."""
+    process = None
+    stdout_lines: list[str] = []
+    stdout_done = threading.Event()
+    activity_lock = threading.Lock()
+    last_activity = time.monotonic()
+    input_error = []
+
+    def send_prompt() -> None:
+        try:
+            process.stdin.write(prompt)
+            process.stdin.close()
+        except OSError as exc:
+            input_error.append(exc)
+
+    def record_stdout() -> None:
+        nonlocal last_activity
+        try:
+            for line in process.stdout:
+                stdout_lines.append(line)
+                with activity_lock:
+                    last_activity = time.monotonic()
+        finally:
+            stdout_done.set()
+
+    def discard_stderr() -> None:
+        for _line in process.stderr:
+            pass
+
+    def activity_at() -> float:
+        with activity_lock:
+            return last_activity
+
     try:
         process = subprocess.Popen(
             command,
@@ -94,17 +133,41 @@ def run_codex_turn(
         )
         if on_process:
             on_process(process)
-        stdout, _stderr = process.communicate(prompt, timeout=timeout)
+        stdout_reader = threading.Thread(target=record_stdout, daemon=True)
+        stderr_reader = threading.Thread(target=discard_stderr, daemon=True)
+        input_writer = threading.Thread(target=send_prompt, daemon=True)
+        stdout_reader.start()
+        stderr_reader.start()
+        input_writer.start()
+        completed = wait_for_completion(
+            stdout_done,
+            inactivity_timeout=timeout,
+            activity_at=activity_at,
+            delegate_active=delegate_active,
+            max_duration=max_duration if max_duration is not None else 4 * timeout,
+        )
+        if not completed:
+            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
+        process.wait(timeout=5)
+        input_writer.join(timeout=1)
+        stdout_reader.join(timeout=1)
+        stderr_reader.join(timeout=1)
+        if input_error:
+            return CodexTurnResult(error="Codex fallback could not start")
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
         return CodexTurnResult(error="Codex fallback timed out")
     except OSError:
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
         return CodexTurnResult(error="Codex fallback could not start")
     finally:
         if on_process:
             on_process(None)
-    result = parse_codex_events(stdout.splitlines())
+    result = parse_codex_events(stdout_lines)
     if process.returncode != 0 and not result.error:
         result.error = f"Codex fallback exited with status {process.returncode}"
     return result
