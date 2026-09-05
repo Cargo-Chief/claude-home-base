@@ -668,6 +668,44 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
 
+    def test_harness_prompt_declares_the_unit_the_launcher_accepts(self):
+        # The prompt tells the agent which budget_unit to write into a delegation request,
+        # and load_request refuses any other value. If these two drift apart, every governed
+        # delegation in every thread refuses and no other test notices.
+        from governed_delegation import BUDGET_UNIT
+
+        command = build_claude_command(
+            self.policy,
+            initial_prompt="context",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/work/escalation.txt"),
+            bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
+            parking_claim_file=Path("/workspace/work/parking-claim.txt"),
+            delegation_request_file=Path("/workspace/work/delegation-request.json"),
+            implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
+            delegate_timeout=1_800,
+            identity_prompt="agent identity",
+            model_prompt="room prompt",
+            session_id="session-1",
+        )
+        claude_prompt = command[command.index("--append-system-prompt") + 1]
+        codex_prompt = build_codex_prompt(
+            self.policy,
+            inbound_prompt="authority envelope",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/escalation.txt"),
+            bundle_claim_file=Path("/workspace/bundle.txt"),
+            parking_claim_file=Path("/workspace/parking.txt"),
+            delegation_request_file=Path("/workspace/delegation-request.json"),
+            implementation_claim_file=Path("/workspace/implementation-claim.txt"),
+            delegate_timeout=1_200,
+            identity_prompt="agent identity",
+        )
+        for prompt in (claude_prompt, codex_prompt):
+            self.assertIn("The supported unit is `%s`" % BUDGET_UNIT, prompt)
+
     def test_codex_command_uses_governed_profile_model_and_effort(self):
         command = build_codex_command(self.policy, cwd=Path("/workspace/work/thread"))
         self.assertEqual("codex", command[0])

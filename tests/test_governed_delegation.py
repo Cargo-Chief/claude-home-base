@@ -13,14 +13,19 @@ from codex_delegation import CodexDelegateResult
 from governed_delegation import (
     _acquire_delegate_lock,
     _append_audit,
+    _normalized_charge,
+    _provider_call_limit,
     BUDGET_UNIT,
+    CODEX_GENERATION_FACTOR,
     DEFAULT_TOKEN_BUDGET,
     LEGACY_BUDGET_UNIT,
+    DelegateResult,
     DelegationError,
     ROUTES,
     USAGE_RECEIPT_SCHEMA,
     budget_status,
     cleanup_stale_delegate_pid,
+    codex_generation_factor,
     consume_allocation_exhaustion,
     consume_budget_exhaustion,
     delegate_timeout_from_env,
@@ -723,16 +728,17 @@ class GovernedDelegationTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, launch_from_environment(env))
         self.assertEqual("delegate evidence\n", output.getvalue())
-        self.assertEqual(75, budget_status(budget)["used"])
+        self.assertEqual(54, budget_status(budget)["used"])
         audit = (self.work / "audit.log").read_text()
         self.assertIn("MODEL:gpt-5.6-sol", audit)
-        self.assertIn("BUDGET_UNIT:generation_tokens_v1", audit)
-        self.assertIn("BUDGET_TOKENS:35", audit)
+        self.assertIn("BUDGET_UNIT:generation_tokens_v2", audit)
+        self.assertIn("BUDGET_TOKENS:14", audit)
+        self.assertIn("PROVIDER_TOKENS:35", audit)
         self.assertIn("RAW_TOKENS:3500", audit)
         self.assertNotIn("private brief", audit)
         self.assertNotIn("delegate evidence", audit)
         self.assertTrue(run.call_args.kwargs["read_only"])
-        self.assertEqual(45_000, run.call_args.kwargs["token_limit"])
+        self.assertEqual(112_500, run.call_args.kwargs["token_limit"])
         self.assertEqual(1_200, run.call_args.kwargs["timeout"])
         self.assertIn("app-server", run.call_args.args[0])
         self.assertTrue((self.work / "verification.json").is_file())
@@ -742,7 +748,7 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertEqual({
             "schema_version": USAGE_RECEIPT_SCHEMA,
             "budget_unit": BUDGET_UNIT,
-            "actual_tokens": 35,
+            "actual_tokens": 14,
         }, {
             key: value
             for key, value in json.loads(verify_output.getvalue()).items()
@@ -826,8 +832,8 @@ class GovernedDelegationTest(unittest.TestCase):
         with self.assertRaisesRegex(DelegationError, "stage generation-token allocation"):
             launch_from_environment(env)
 
-        self.assertEqual(45_000, run.call_args.kwargs["token_limit"])
-        self.assertEqual(45_001, budget_status(budget)["used"])
+        self.assertEqual(112_500, run.call_args.kwargs["token_limit"])
+        self.assertEqual(18_001, budget_status(budget)["used"])
         marker = self.work / "verification.json"
         self.assertEqual("allocation_exhausted", json.loads(marker.read_text())["status"])
         self.assertIn("STATUS:allocation_exhausted", (self.work / "audit.log").read_text())
@@ -838,7 +844,7 @@ class GovernedDelegationTest(unittest.TestCase):
     @patch("governed_delegation.run_codex_delegate")
     def test_over_budget_return_is_withheld(self, run):
         run.return_value = CodexDelegateResult(
-            tokens=10, budget_exhausted=True,
+            tokens=25, budget_exhausted=True,
         )
         budget = self.work / "budget.json"
         update_budget(budget, limit=10)
@@ -871,6 +877,160 @@ class GovernedDelegationTest(unittest.TestCase):
         with self.assertRaisesRegex(DelegationError, "reset by a named approver"):
             verify_from_environment(env)
         self.assertTrue(marker.exists())
+
+    def _launch_environment(self, request, budget, *, provider="openai", extra=None):
+        values = {
+            "CARGO_CHIEF_ROOT": str(self.root),
+            "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(request),
+            "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(self.work / "claim.txt"),
+            "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(budget),
+            "CARGO_CHIEF_DELEGATE_PID_FILE": str(self.work / "pid"),
+            "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
+            "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
+            "CARGO_CHIEF_OWNER_PROVIDER": provider,
+            "CARGO_CHIEF_OWNER_MODEL": (
+                "gpt-5.6-sol" if provider == "openai" else "claude-opus-5[1m]"
+            ),
+            "CARGO_CHIEF_OWNER_EFFORT": "high",
+            "CLAUDE_THREAD_TS": "T1", "CLAUDE_CHANNEL_ID": "C1",
+            "CARGO_CHIEF_CURRENT_USER": "U1",
+        }
+        values.update(extra or {})
+        return values
+
+    def _bounded_request(self, planned_tokens=45_000):
+        request = self.work / "delegation-request.json"
+        request.write_text(json.dumps({
+            "tier": "bounded", "prompt": "private brief", "mutation": False,
+            "budget_unit": BUDGET_UNIT, "planned_tokens": planned_tokens,
+        }))
+        return request
+
+    def test_generation_factor_default_and_bounds(self):
+        self.assertEqual(2.5, CODEX_GENERATION_FACTOR)
+        self.assertEqual(2.5, codex_generation_factor({}))
+        self.assertEqual(
+            3.0,
+            codex_generation_factor({"CARGO_CHIEF_CODEX_GENERATION_FACTOR": "3"}),
+        )
+        for value in ("", "not-a-number", "0.9", "4.1", "nan", "inf", "-2"):
+            with self.subTest(value=value):
+                with self.assertRaises(DelegationError):
+                    codex_generation_factor(
+                        {"CARGO_CHIEF_CODEX_GENERATION_FACTOR": value}
+                    )
+
+    def test_call_limit_and_charge_are_provider_normalized(self):
+        self.assertEqual(112_500, _provider_call_limit(45_000, "openai", {}))
+        self.assertEqual(45_000, _provider_call_limit(45_000, "claude", {}))
+        self.assertEqual(40_000, _normalized_charge(100_000, "openai", {}))
+        self.assertEqual(100_000, _normalized_charge(100_000, "claude", {}))
+        self.assertEqual(1, _normalized_charge(1, "openai", {}))
+        self.assertEqual(1, _normalized_charge(2, "openai", {}))
+        self.assertEqual(0, _normalized_charge(0, "openai", {}))
+
+    @patch("governed_delegation.run_codex_delegate")
+    def test_codex_generation_tokens_are_charged_normalized(self, run):
+        run.return_value = CodexDelegateResult(
+            texts=["delegate evidence"], tokens=100_000, raw_tokens=1_125_414,
+        )
+        request = self._bounded_request()
+        budget = self.work / "budget.json"
+        values = self._launch_environment(request, budget)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(0, launch_from_environment(values))
+
+        self.assertEqual(112_500, run.call_args.kwargs["token_limit"])
+        self.assertEqual(40_000, budget_status(budget)["used"])
+        marker = json.loads((self.work / "verification.json").read_text())
+        self.assertEqual(40_000, marker["tokens"])
+        self.assertEqual(100_000, marker["provider_tokens"])
+        self.assertEqual(1_125_414, marker["raw_tokens"])
+        audit = (self.work / "audit.log").read_text()
+        self.assertIn("BUDGET_TOKENS:40000", audit)
+        self.assertIn("PROVIDER_TOKENS:100000", audit)
+
+    @patch("governed_delegation.run_claude_delegate")
+    def test_claude_provider_budget_is_unnormalized(self, run):
+        run.return_value = DelegateResult(
+            text="delegate evidence", tokens=45_000, raw_tokens=1_125_414,
+        )
+        request = self._bounded_request()
+        budget = self.work / "budget.json"
+        values = self._launch_environment(request, budget, provider="claude")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(0, launch_from_environment(values))
+
+        self.assertEqual(45_000, run.call_args.kwargs["token_limit"])
+        self.assertEqual(45_000, budget_status(budget)["used"])
+        marker = json.loads((self.work / "verification.json").read_text())
+        self.assertEqual(45_000, marker["tokens"])
+        self.assertEqual(45_000, marker["provider_tokens"])
+        audit = (self.work / "audit.log").read_text()
+        self.assertIn("BUDGET_TOKENS:45000", audit)
+        self.assertIn("PROVIDER_TOKENS:45000", audit)
+
+    @patch("governed_delegation.run_codex_delegate")
+    def test_invalid_generation_factor_refuses_before_spending(self, run):
+        request = self._bounded_request()
+        budget = self.work / "budget.json"
+        values = self._launch_environment(request, budget, extra={
+            "CARGO_CHIEF_CODEX_GENERATION_FACTOR": "8",
+        })
+
+        with self.assertRaisesRegex(DelegationError, "CODEX_GENERATION_FACTOR"):
+            launch_from_environment(values)
+
+        run.assert_not_called()
+        self.assertEqual(0, budget_status(budget)["used"])
+
+    @patch("governed_delegation.run_codex_delegate")
+    def test_superseded_generation_unit_requires_named_approver_reset(self, run):
+        budget = self.work / "budget.json"
+        budget.write_text(
+            json.dumps({
+                "limit": 250_000, "used": 45_000, "unit": "generation_tokens_v1",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual("generation_tokens_v1", budget_status(budget)["unit"])
+        with self.assertRaisesRegex(DelegationError, "must be reset"):
+            update_budget(budget, add_tokens=1)
+
+        request = self._bounded_request()
+        values = self._launch_environment(request, budget)
+        with self.assertRaisesRegex(DelegationError, "must be reset by a named approver"):
+            launch_from_environment(values)
+        run.assert_not_called()
+
+        reset = update_budget(budget, reset=True)
+        self.assertEqual({"limit": 250_000, "used": 0, "unit": BUDGET_UNIT}, reset)
+
+    @patch("governed_delegation.run_codex_delegate")
+    def test_codex_overshoot_charges_normalized_spend_and_withholds(self, run):
+        run.return_value = CodexDelegateResult(
+            texts=["partial evidence"], tokens=112_500, raw_tokens=1_125_414,
+            budget_exhausted=True,
+        )
+        request = self._bounded_request()
+        budget = self.work / "budget.json"
+        values = self._launch_environment(request, budget)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(DelegationError, "return withheld"):
+                launch_from_environment(values)
+
+        self.assertEqual("", output.getvalue())
+        self.assertEqual(45_000, budget_status(budget)["used"])
+        marker = json.loads((self.work / "verification.json").read_text())
+        self.assertEqual("allocation_exhausted", marker["status"])
+        self.assertEqual(45_000, marker["tokens"])
+        self.assertEqual(112_500, marker["provider_tokens"])
 
 
 if __name__ == "__main__":

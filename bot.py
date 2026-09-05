@@ -2641,8 +2641,9 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
         return True
     if state["unit"] != BUDGET_UNIT:
         message = (
-            f"Delegation budget: {state['used']}/{state['limit']} legacy raw tokens used. "
-            "A named approver must run `delegation budget reset` before further delegation."
+            f"Delegation budget: {state['used']}/{state['limit']} used under the superseded "
+            f"unit `{state['unit']}`. A named approver must run `delegation budget reset` "
+            "before further delegation."
         )
     else:
         message = (

@@ -951,7 +951,7 @@ def _build_harness_prompt(
         "- To delegate, write exactly one JSON object with `tier`, `prompt`, boolean `mutation`, "
         "`budget_unit`, and `planned_tokens` keys to "
         f"{delegation_request_file}. Allowed tiers are implementation, bounded, mechanical, and "
-        "explore. The supported unit is `generation_tokens_v1`; `planned_tokens` is the positive "
+        "explore. The supported unit is `generation_tokens_v2`; `planned_tokens` is the positive "
         "maximum generated-token allocation for this call. When a coordinator supplies those "
         "values, copy both exactly. "
         f"Each delegated call has a wall-clock limit of {delegate_timeout} seconds; size the task "

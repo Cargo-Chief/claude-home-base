@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -22,8 +23,12 @@ from codex_delegation import run_codex_delegate
 
 
 DEFAULT_TOKEN_BUDGET = 250_000
-BUDGET_UNIT = "generation_tokens_v1"
+BUDGET_UNIT = "generation_tokens_v2"
 LEGACY_BUDGET_UNIT = "raw_tokens_legacy"
+SUPERSEDED_BUDGET_UNITS = ("generation_tokens_v1",)
+CODEX_GENERATION_FACTOR = 2.5
+MIN_CODEX_GENERATION_FACTOR = 1.0
+MAX_CODEX_GENERATION_FACTOR = 4.0
 USAGE_RECEIPT_SCHEMA = "cargo-chief/delegation-usage-receipt/v1"
 DEFAULT_DELEGATE_TIMEOUT = 1_800
 MAX_DELEGATE_TIMEOUT = 1_800
@@ -76,6 +81,48 @@ def delegate_timeout_from_env(env: Mapping[str, str] = os.environ) -> int:
             "CARGO_CHIEF_DELEGATE_TIMEOUT must be between 1 and 1800 seconds"
         )
     return timeout
+
+
+def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
+    """Read the Codex-to-Claude generation ratio, failing closed on any bad value."""
+    value = env.get(
+        "CARGO_CHIEF_CODEX_GENERATION_FACTOR", str(CODEX_GENERATION_FACTOR)
+    )
+    try:
+        factor = float(value)
+    except (TypeError, ValueError) as exc:
+        raise DelegationError(
+            "CARGO_CHIEF_CODEX_GENERATION_FACTOR must be a number between 1.0 and 4.0"
+        ) from exc
+    if (
+        not math.isfinite(factor)
+        or factor < MIN_CODEX_GENERATION_FACTOR
+        or factor > MAX_CODEX_GENERATION_FACTOR
+    ):
+        raise DelegationError(
+            "CARGO_CHIEF_CODEX_GENERATION_FACTOR must be between 1.0 and 4.0"
+        )
+    return factor
+
+
+def _provider_call_limit(
+    planned_tokens: int, provider: str, env: Mapping[str, str] = os.environ
+) -> int:
+    """Scale a Claude-equivalent stage allocation up into provider generated tokens."""
+    if provider != "openai":
+        return planned_tokens
+    return math.ceil(planned_tokens * codex_generation_factor(env))
+
+
+def _normalized_charge(
+    tokens: int, provider: str, env: Mapping[str, str] = os.environ
+) -> int:
+    """Normalize provider generated tokens back into the Claude-equivalent budget unit."""
+    if provider != "openai":
+        return tokens
+    if tokens < 1:
+        return 0
+    return max(1, math.ceil(tokens / codex_generation_factor(env)))
 
 
 @dataclass(frozen=True)
@@ -219,6 +266,10 @@ def _validated_budget_state(value: object) -> dict:
         unit = LEGACY_BUDGET_UNIT
     elif keys == {"limit", "used", "unit"} and value.get("unit") == BUDGET_UNIT:
         unit = BUDGET_UNIT
+    elif keys == {"limit", "used", "unit"} and value.get("unit") in SUPERSEDED_BUDGET_UNITS:
+        # A superseded generation unit counted different tokens, so its `used`
+        # value is never reinterpreted under the current unit.
+        unit = value["unit"]
     else:
         raise DelegationError("delegation budget state is invalid")
     limit, used = value.get("limit"), value.get("used")
@@ -737,7 +788,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         raise DelegationError(
             "planned delegation does not fit the remaining generation-token budget"
         )
-    call_token_limit = request.planned_tokens
+    call_token_limit = _provider_call_limit(request.planned_tokens, provider, env)
     prompt = (
         "You are a governed Cargo Chief delegate. Perform only the supplied bounded task. "
         "Do not delegate again, access credentials, touch production, commit, push, or widen scope. "
@@ -775,7 +826,8 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
             timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
-    state = update_budget(budget_file, add_tokens=result.tokens)
+    budget_tokens = _normalized_charge(result.tokens, provider, env)
+    state = update_budget(budget_file, add_tokens=budget_tokens)
     thread_exhausted = state["used"] >= state["limit"]
     allocation_exhausted = result.budget_exhausted and not thread_exhausted
     status = (
@@ -797,7 +849,8 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         "EFFORT": effort,
         "PLAN_GATE": plan_gate,
         "BUDGET_UNIT": BUDGET_UNIT,
-        "BUDGET_TOKENS": result.tokens,
+        "BUDGET_TOKENS": budget_tokens,
+        "PROVIDER_TOKENS": result.tokens,
         "RAW_TOKENS": result.raw_tokens,
         "DURATION": f"{time.monotonic() - started:.1f}s",
         "STATUS": status,
@@ -810,7 +863,8 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
             verification_file.write_text(json.dumps({
                 "status": "allocation_exhausted", "tier": request.tier,
                 "provider": provider, "model": model, "effort": effort,
-                "budget_unit": BUDGET_UNIT, "tokens": result.tokens,
+                "budget_unit": BUDGET_UNIT, "tokens": budget_tokens,
+                "provider_tokens": result.tokens,
                 "raw_tokens": result.raw_tokens,
                 "request_id": request_id,
             }, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -823,7 +877,8 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
             verification_file.write_text(json.dumps({
                 "status": "budget_exhausted", "tier": request.tier,
                 "provider": provider, "model": model, "effort": effort,
-                "budget_unit": BUDGET_UNIT, "tokens": result.tokens,
+                "budget_unit": BUDGET_UNIT, "tokens": budget_tokens,
+                "provider_tokens": result.tokens,
                 "raw_tokens": result.raw_tokens,
                 "request_id": request_id,
             }, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -832,7 +887,8 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     with _verification_marker_lock(verification_file):
         verification_file.write_text(json.dumps({
             "status": "pending", "tier": request.tier, "provider": provider, "model": model,
-            "effort": effort, "budget_unit": BUDGET_UNIT, "tokens": result.tokens,
+            "effort": effort, "budget_unit": BUDGET_UNIT, "tokens": budget_tokens,
+            "provider_tokens": result.tokens,
             "raw_tokens": result.raw_tokens, "mutation": request.mutation,
             "request_id": request_id,
         }, separators=(",", ":")) + "\n", encoding="utf-8")

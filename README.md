@@ -100,10 +100,14 @@ generated reasoning. Audit records contain routing, plan-gate, aggregate usage, 
 outcome metadata only. Delegated prompts, tool inputs, file paths, and response content are never
 retained or logged.
 
-Budget state includes `unit: generation_tokens_v1`. A two-field budget file from the former raw-
-token accounting remains readable for status, but delegation refuses until a named approver runs
+Budget state includes `unit: generation_tokens_v2`, counted in Claude-equivalent generated tokens.
+Codex reports cumulative agentic-turn output including reasoning, so its per-call ceiling is scaled
+up by `CODEX_GENERATION_FACTOR` before dispatch and its reported spend is normalized back down
+before it is charged; `PROVIDER_TOKENS` in the audit keeps the raw provider count visible. A budget
+file from the former raw-token accounting, or from the superseded `generation_tokens_v1` contract,
+remains readable for status, but delegation refuses until a named approver runs
 `delegation budget reset`; the old `used` value is never reinterpreted under the new unit.
-Every request declares `budget_unit: generation_tokens_v1` and a positive `planned_tokens` call
+Every request declares `budget_unit: generation_tokens_v2` and a positive `planned_tokens` call
 ceiling. Coordinator-backed requests copy those values from their dispatch contract. Reaching the
 stage allocation withholds the partial return but leaves the thread available to its owner; only
 exhausting the thread ceiling creates the reset-gated exhaustion state.
