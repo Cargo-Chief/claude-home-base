@@ -873,11 +873,21 @@ def discard_unverifiable_verification(
         status = _delegation_verification_status_unlocked(path)
         if status is None:
             raise DelegationError("no delegation verification marker exists")
+        # Read the unit under the same safety guard the status check applies. A
+        # marker that is a symlink, not a regular file, or oversized is exactly
+        # the kind verification already refuses, so it must stay discardable: an
+        # unguarded read here could return a current-unit value from a file the
+        # verifier will never accept, and refuse the only recovery there is.
         metadata: Mapping[str, object] = {}
         try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                metadata = loaded
+            if (
+                not path.is_symlink()
+                and path.is_file()
+                and path.stat().st_size <= 4096
+            ):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    metadata = loaded
         except (OSError, json.JSONDecodeError, ValueError):
             metadata = {}
         if metadata.get("budget_unit") == BUDGET_UNIT:
@@ -896,16 +906,43 @@ def discard_unverifiable_verification(
             number = _safe_marker_number(metadata.get(key))
             if number is not None:
                 discarded[key] = number
+        # Audit before removing. The marker is the only place provider_tokens
+        # lives, so writing the row afterwards would let a failed append destroy
+        # the record it exists to preserve.
+        _append_audit(audit_path, _discard_audit_fields(
+            discarded, status, user, channel, thread, "verification_discarded",
+        ))
         try:
             path.unlink()
-        except OSError as exc:
-            raise DelegationError(
-                "delegation verification marker could not be cleared"
-            ) from exc
-    # Every other terminal transition writes an audit row, and the marker is the
-    # only place provider_tokens is recorded, so the discard cannot be the one
-    # transition that leaves no trace of the spend it abandons.
-    _append_audit(audit_path, {
+        except OSError as unlink_error:
+            # unlink() on a directory raises IsADirectoryError on Linux and
+            # PermissionError on macOS, so branch on the path's state rather
+            # than on the exception type.
+            removed = False
+            if path.is_dir() and not path.is_symlink():
+                try:
+                    path.rmdir()
+                    removed = True
+                except OSError:
+                    removed = False
+            if not removed:
+                _append_audit(audit_path, _discard_audit_fields(
+                    discarded, status, user, channel, thread,
+                    "verification_discard_failed",
+                ))
+                raise DelegationError(
+                    "delegation verification marker could not be cleared; an "
+                    "operator must remove it"
+                ) from unlink_error
+    return discarded
+
+
+def _discard_audit_fields(
+    discarded: Mapping[str, object], status: str,
+    user: str, channel: str, thread: str, outcome: str,
+) -> dict[str, object]:
+    """Build the content-free audit row for a verification discard."""
+    return {
         "USER": user,
         "CHANNEL": channel,
         "THREAD": thread,
@@ -918,9 +955,8 @@ def discard_unverifiable_verification(
         "PROVIDER_TOKENS": discarded.get("provider_tokens", "unrecorded"),
         "RAW_TOKENS": discarded.get("raw_tokens", "unrecorded"),
         "GENERATION_FACTOR": discarded.get("generation_factor", "unrecorded"),
-        "STATUS": "verification_discarded",
-    })
-    return discarded
+        "STATUS": outcome,
+    }
 
 
 def prepare_owner_delegation_state(budget_path: Path, verification_path: Path) -> bool:

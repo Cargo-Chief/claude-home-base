@@ -940,6 +940,43 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertIn("BUDGET_TOKENS:unrecorded", log)
         self.assertIn("STATUS:verification_discarded", log)
 
+    def test_approver_discard_clears_a_marker_verification_calls_unsafe(self):
+        # An oversized or symlinked marker is refused by verification as unsafe
+        # no matter what it contains, so reading its unit unguarded would let a
+        # current-unit value block the only recovery from a permanent mute.
+        audit = self.work / "audit.log"
+        marker = self.work / "verification.json"
+        marker.write_text(json.dumps({
+            "status": "pending", "budget_unit": BUDGET_UNIT,
+            "padding": "x" * 5_000,
+        }) + "\n", encoding="utf-8")
+        self.assertGreater(marker.stat().st_size, 4096)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(DelegationError, "no safe pending"):
+                verify_from_environment(self._verify_environment(marker))
+
+        discard_unverifiable_verification(
+            marker, audit, user="U1", channel="C1", thread="T1",
+        )
+
+        self.assertFalse(marker.exists())
+        self.assertIn("STATUS:verification_discarded", audit.read_text(encoding="utf-8"))
+
+    def test_approver_discard_clears_a_non_regular_marker_path(self):
+        # A directory at the marker path leaves bot.py muting on an "invalid"
+        # status that no unlink can clear.
+        audit = self.work / "audit.log"
+        marker = self.work / "verification.json"
+        marker.mkdir()
+
+        discard_unverifiable_verification(
+            marker, audit, user="U1", channel="C1", thread="T1",
+        )
+
+        self.assertFalse(marker.exists())
+        self.assertIn("STATUS:verification_discarded", audit.read_text(encoding="utf-8"))
+
     @patch("governed_delegation.run_codex_delegate")
     def test_stage_allocation_exhaustion_preserves_thread_for_owner(self, run):
         # The runner only reports exhaustion once observed tokens reach the

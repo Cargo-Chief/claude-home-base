@@ -78,7 +78,6 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("_send_to_claude", calls)
         self.assertIn("wait_for_turn_completion", calls)
 
-
     def test_audit_calls_match_the_formatter_signature(self):
         # A budget-command audit row was calling format_audit_metadata with
         # action/used/limit/unit and no message_length, so every approver
@@ -103,6 +102,7 @@ class BotTurnStructureTest(unittest.TestCase):
                 offenders.append((node.lineno, sorted(unknown)))
 
         self.assertEqual([], offenders)
+
 
 if __name__ == "__main__":
     unittest.main()
