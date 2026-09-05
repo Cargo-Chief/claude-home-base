@@ -103,16 +103,17 @@ from session_lifecycle import (
 )
 from governed_delegation import (
     BUDGET_UNIT,
-    DEFAULT_TOKEN_BUDGET,
-    LEGACY_BUDGET_UNIT,
     DelegationError,
+    budget_unit_reset_refusal,
     cleanup_stale_delegate_pid,
     consume_allocation_exhaustion,
     consume_budget_exhaustion,
     budget_status,
+    append_delegation_audit,
     delegation_audit_path,
     delegation_verification_status,
     delegate_timeout_from_env,
+    discard_unverifiable_verification,
     governed_delegate_active,
     prepare_owner_delegation_state,
     parse_budget_command,
@@ -2610,11 +2611,12 @@ def _maybe_stop_from_message(event: dict) -> bool:
 
 
 def _maybe_delegation_budget_command(event: dict) -> bool:
-    """Handle exact per-thread budget controls from a named approver."""
+    """Handle exact per-thread delegation controls from a named approver."""
     command = parse_budget_command(event.get("text", ""))
     if not command:
         return False
     action, limit = command
+    discarded: dict = {}
     user_id = event.get("user", "")
     try:
         authority = AuthorityPolicy.from_env()
@@ -2626,7 +2628,16 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
         workspace = prepare_thread_workspace(
             policy.root, channel=channel, thread=thread_ts
         )
-        if action == "status":
+        if action == "verification reset":
+            discarded = discard_unverifiable_verification(
+                workspace.delegate_verification_file,
+                delegation_audit_path(policy.root),
+                user=user_id,
+                channel=channel,
+                thread=thread_ts or "unknown",
+            )
+            state = None
+        elif action == "status":
             state = budget_status(workspace.delegation_budget_file)
         elif action == "reset":
             state = update_budget(workspace.delegation_budget_file, reset=True)
@@ -2641,22 +2652,24 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
             text=f"Delegation budget refused: {exc}",
         )
         return True
-    if state["unit"] != BUDGET_UNIT:
-        # The two stale states cost different things on reset, and an approver
-        # who raised the ceiling must not lose it to a generic "run reset".
-        if state["unit"] == LEGACY_BUDGET_UNIT:
-            consequence = (
-                f"That reset also returns the limit to the {DEFAULT_TOKEN_BUDGET} "
-                "default, because a raw-token limit does not translate."
-            )
-            description = f"legacy raw-token unit `{state['unit']}`"
-        else:
-            consequence = "That reset keeps the current limit."
-            description = f"superseded unit `{state['unit']}`"
+    if state is None:
         message = (
-            f"Delegation budget: {state['used']}/{state['limit']} used under the "
-            f"{description}. A named approver must run `delegation budget reset` "
-            f"before further delegation. {consequence}"
+            "Delegation verification discarded: a "
+            f"`{discarded['status']}` marker recording "
+            f"{discarded.get('tokens', 'an unrecorded number of')} tokens under "
+            f"`{discarded.get('budget_unit', 'no recorded unit')}` for tier "
+            f"`{discarded.get('tier', 'unknown')}`. That spend stays charged and "
+            "the delegation stage must be re-run; the thread is no longer muted."
+        )
+    elif state["unit"] != BUDGET_UNIT:
+        # The stale states cost different things on reset, and an approver who
+        # raised the ceiling must not lose it to a generic "run reset". The
+        # launcher's own refusal is the single source of that difference, so it
+        # is composed here rather than re-branched into a second wording that
+        # can drift from it.
+        message = (
+            f"Delegation budget: {state['used']}/{state['limit']} used, but "
+            f"{budget_unit_reset_refusal(state['unit'])}."
         )
     else:
         message = (
@@ -2668,12 +2681,19 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
         thread_ts=event.get("thread_ts") or event.get("ts"),
         text=message,
     )
-    audit_logger.info(format_audit_metadata(
-        "DELEGATION_BUDGET", user=user_id, channel=event.get("channel", ""),
-        thread=event.get("thread_ts") or event.get("ts") or "unknown",
-        action=action.split()[0], used=state["used"], limit=state["limit"],
-        unit=state["unit"],
-    ))
+    append_delegation_audit(delegation_audit_path(policy.root), {
+        "KIND": "DELEGATION_BUDGET",
+        "USER": user_id,
+        "CHANNEL": event.get("channel", ""),
+        "THREAD": event.get("thread_ts") or event.get("ts") or "unknown",
+        "ACTION": action.replace(" ", "_") if state is None else action.split()[0],
+        "USED": "n/a" if state is None else state["used"],
+        "LIMIT": "n/a" if state is None else state["limit"],
+        "UNIT": (
+            discarded.get("budget_unit", "unrecorded") if state is None
+            else state["unit"]
+        ),
+    })
     return True
 
 

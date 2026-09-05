@@ -89,6 +89,23 @@ def delegate_timeout_from_env(env: Mapping[str, str] = os.environ) -> int:
     return timeout
 
 
+def _generation_factor_fault(detail: str) -> DelegationError:
+    """Describe a bad generation factor as the host-level fault that it is.
+
+    The value is read on every launch on both providers, so one bad export stops
+    delegation for every thread on this host. The principal who happens to hit
+    it first did nothing to cause it and cannot fix it from the thread, so the
+    message has to read as a host configuration fault rather than as a refusal
+    of what they asked for.
+    """
+    return DelegationError(
+        "delegation is stopped by a host configuration fault: "
+        f"CARGO_CHIEF_CODEX_GENERATION_FACTOR {detail}. That variable is read on "
+        "every launch on both providers, so this affects every thread on this "
+        "host until an operator corrects or unsets it"
+    )
+
+
 def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
     """Read the Codex-to-Claude generation ratio, failing closed on any bad value."""
     value = env.get(
@@ -100,17 +117,13 @@ def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
     try:
         factor = float(value)
     except (TypeError, ValueError) as exc:
-        raise DelegationError(
-            f"CARGO_CHIEF_CODEX_GENERATION_FACTOR must be a number {bounds}"
-        ) from exc
+        raise _generation_factor_fault(f"must be a number {bounds}") from exc
     if (
         not math.isfinite(factor)
         or factor < MIN_CODEX_GENERATION_FACTOR
         or factor > MAX_CODEX_GENERATION_FACTOR
     ):
-        raise DelegationError(
-            f"CARGO_CHIEF_CODEX_GENERATION_FACTOR must be {bounds}"
-        )
+        raise _generation_factor_fault(f"must be {bounds}")
     return factor
 
 
@@ -136,12 +149,56 @@ def budget_unit_reset_refusal(unit: str) -> str:
     )
 
 
+def _checked_factor(factor: float) -> float:
+    """Re-establish the bounds the factor used to carry by construction.
+
+    Taking the factor as an argument is what makes the recorded
+    `GENERATION_FACTOR` provably the applied divisor, but it also turned
+    "finite and within [MIN, MAX]" from a guarantee into a calling convention.
+    An unchecked 0.0 reaching the charge raises ZeroDivisionError, which the
+    launcher's DelegationError handler does not catch: it would exit with a
+    traceback after the delegate had already spent tokens and before the budget
+    was updated, so the spend would never be charged.
+    """
+    if (
+        isinstance(factor, bool)
+        or not isinstance(factor, (int, float))
+        or not math.isfinite(factor)
+        or factor < MIN_CODEX_GENERATION_FACTOR
+        or factor > MAX_CODEX_GENERATION_FACTOR
+    ):
+        raise _generation_factor_fault(
+            f"resolved to {factor!r}, which is not a number between "
+            f"{MIN_CODEX_GENERATION_FACTOR} and {MAX_CODEX_GENERATION_FACTOR}"
+        )
+    return float(factor)
+
+
+def verification_reset_refusal(unit: object) -> str:
+    """Name the approver recovery for a marker this launcher cannot verify.
+
+    Verification runs inside the owner's turn, and the owner's substantive
+    reply is withheld while the marker exists, so this refusal must not clear
+    it: consuming a pending marker from a tool call would unmute the very turn
+    whose delegate spend was never verified. The recovery is therefore an
+    approver command in the thread, outside any owner turn.
+    """
+    described = f"the unit `{unit}`" if isinstance(unit, str) and unit else "no budget unit"
+    return (
+        f"pending delegate verification records {described}, not the current "
+        f"`{BUDGET_UNIT}`; its delegate return cannot be verified here, so the "
+        "stage must be re-run after a named approver runs "
+        "`delegation verification reset`"
+    )
+
+
 def _provider_call_limit(planned_tokens: int, provider: str, factor: float) -> int:
     """Scale a Claude-equivalent stage allocation up into provider generated tokens.
 
     The factor is passed in, never re-read here, so the recorded
     `GENERATION_FACTOR` is provably the one that produced the charge.
     """
+    factor = _checked_factor(factor)
     if provider != "openai":
         return planned_tokens
     return math.ceil(planned_tokens * factor)
@@ -149,6 +206,7 @@ def _provider_call_limit(planned_tokens: int, provider: str, factor: float) -> i
 
 def _normalized_charge(tokens: int, provider: str, factor: float) -> int:
     """Normalize provider generated tokens back into the Claude-equivalent budget unit."""
+    factor = _checked_factor(factor)
     if provider != "openai":
         return tokens
     if tokens < 1:
@@ -708,6 +766,16 @@ def _append_audit(path: Path, fields: Mapping[str, object]) -> None:
         handle.write(time.strftime("%Y-%m-%d %H:%M:%S") + " | DELEGATION | " + safe + "\n")
 
 
+def append_delegation_audit(path: Path, fields: Mapping[str, object]) -> None:
+    """Append one content-free delegation audit row.
+
+    The public entry point for callers outside this module. Approver commands
+    record through here rather than through the Claude-session audit formatter,
+    whose fields describe a turn and do not accept a budget action.
+    """
+    _append_audit(path, fields)
+
+
 def delegation_audit_path(root: Path) -> Path:
     """Return the workspace-writable, operator-readable delegation audit log."""
     path = root.resolve() / "work" / "home-base" / "delegation-audit.log"
@@ -770,6 +838,91 @@ def consume_allocation_exhaustion(path: Path) -> bool:
         return True
 
 
+def _safe_marker_identifier(value: object) -> str | None:
+    """Return a marker identifier only when it is shaped like an identifier.
+
+    The audit stays content-free even if the marker was hand-written: anything
+    that is not a short identifier-shaped token is dropped rather than logged.
+    """
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.\[\]:-]{1,64}", value):
+        return value
+    return None
+
+
+def _safe_marker_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def discard_unverifiable_verification(
+    path: Path, audit_path: Path, *, user: str, channel: str, thread: str
+) -> dict:
+    """Clear only a delegation marker that cannot be verified under this unit.
+
+    A marker whose `budget_unit` is missing, superseded, or otherwise not the
+    current unit can never be consumed by verification, and the pending gate is
+    durable by design, so without this the thread stays muted forever. A marker
+    that *is* on the current unit is excluded deliberately: it is verifiable by
+    running the verification stage, so clearing it here would be a bypass of a
+    live gate rather than a recovery from a dead one.
+    """
+    with _verification_marker_lock(path):
+        status = _delegation_verification_status_unlocked(path)
+        if status is None:
+            raise DelegationError("no delegation verification marker exists")
+        metadata: Mapping[str, object] = {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                metadata = loaded
+        except (OSError, json.JSONDecodeError, ValueError):
+            metadata = {}
+        if metadata.get("budget_unit") == BUDGET_UNIT:
+            raise DelegationError(
+                f"this delegation verification is on the current `{BUDGET_UNIT}` "
+                "unit and is verifiable, so it cannot be discarded; the owner "
+                "must run the verification stage, and an exhausted thread budget "
+                "is cleared with `delegation budget reset`"
+            )
+        discarded: dict[str, object] = {"status": status}
+        for key in ("tier", "model", "budget_unit", "request_id"):
+            identifier = _safe_marker_identifier(metadata.get(key))
+            if identifier is not None:
+                discarded[key] = identifier
+        for key in ("tokens", "provider_tokens", "raw_tokens", "generation_factor"):
+            number = _safe_marker_number(metadata.get(key))
+            if number is not None:
+                discarded[key] = number
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise DelegationError(
+                "delegation verification marker could not be cleared"
+            ) from exc
+    # Every other terminal transition writes an audit row, and the marker is the
+    # only place provider_tokens is recorded, so the discard cannot be the one
+    # transition that leaves no trace of the spend it abandons.
+    _append_audit(audit_path, {
+        "USER": user,
+        "CHANNEL": channel,
+        "THREAD": thread,
+        "TIER": discarded.get("tier", "unknown"),
+        "MODEL": discarded.get("model", "unknown"),
+        "MARKER_STATUS": status,
+        "BUDGET_UNIT": discarded.get("budget_unit", "unrecorded"),
+        "REQUEST_ID": discarded.get("request_id", "unrecorded"),
+        "BUDGET_TOKENS": discarded.get("tokens", "unrecorded"),
+        "PROVIDER_TOKENS": discarded.get("provider_tokens", "unrecorded"),
+        "RAW_TOKENS": discarded.get("raw_tokens", "unrecorded"),
+        "GENERATION_FACTOR": discarded.get("generation_factor", "unrecorded"),
+        "STATUS": "verification_discarded",
+    })
+    return discarded
+
+
 def prepare_owner_delegation_state(budget_path: Path, verification_path: Path) -> bool:
     """Initialize budget state and clear only a stale per-call allocation stop.
 
@@ -782,8 +935,10 @@ def prepare_owner_delegation_state(budget_path: Path, verification_path: Path) -
 
 
 def parse_budget_command(text: str) -> tuple[str, int | None] | None:
-    """Parse the two supported exact spellings of a delegation-budget command."""
+    """Parse the exact spellings of the approver-gated delegation commands."""
     normalized = re.sub(r"<@[A-Z0-9]+>", "", text).strip().lower()
+    if re.fullmatch(r"(?:delegation|delegate) verification reset", normalized):
+        return "verification reset", None
     match = re.fullmatch(
         r"(?:delegation|delegate) budget (status|reset|set\s+([1-9][0-9]{0,17}))",
         normalized,
@@ -997,23 +1152,17 @@ def verify_from_environment(env: Mapping[str, str] | None = None) -> int:
             )
         if metadata.get("status") != "pending":
             raise DelegationError("thread delegation budget must be reset by a named approver")
-        if metadata.get("budget_unit") in SUPERSEDED_BUDGET_UNITS:
-            # A pending marker is a durable gate that survives owner restarts, so
-            # one written under a superseded unit would otherwise mute the thread
-            # forever with no approver command to clear it. Consume it and say
-            # what has to happen instead; no receipt is emitted for spend that
-            # cannot be verified under the current unit.
-            marker.unlink()
-            raise DelegationError(
-                "pending delegate verification predates the current budget unit "
-                f"`{BUDGET_UNIT}`; its delegate return cannot be verified and the "
-                "stage must be re-run"
-            )
+        if metadata.get("budget_unit") != BUDGET_UNIT:
+            # Refuse without consuming. This runs inside the owner's turn, and
+            # bot.py withholds that turn's assistant text while the marker
+            # exists, so unlinking here would release delegate text whose spend
+            # was never verified. Clearing a marker that can never be verified
+            # is an approver command instead: `delegation verification reset`.
+            raise DelegationError(verification_reset_refusal(metadata.get("budget_unit")))
         tokens = metadata.get("tokens")
         request_id = metadata.get("request_id")
         if (
-            metadata.get("budget_unit") != BUDGET_UNIT
-            or isinstance(tokens, bool)
+            isinstance(tokens, bool)
             or not isinstance(tokens, int)
             or tokens < 1
             or not isinstance(request_id, str)

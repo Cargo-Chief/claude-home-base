@@ -124,6 +124,14 @@ process-local and unreviewed while the constant is reviewed. Every launch record
 `GENERATION_FACTOR` in the audit and in its verification marker, so a raised constant is visible;
 what the bound protects is the review, not the visibility.
 
+The variable is read on every launch, on **both** providers, before any one-shot file is consumed.
+An invalid value is therefore a host-level configuration fault, not a per-thread one: it stops all
+delegation for every thread on the host, including Claude threads, until an operator corrects or
+unsets it. The refusal says so, because the principal who first hits it neither caused it nor can
+fix it from the thread. Validating it only on the openai path would instead leave a bad export
+sitting silently until a provider switch surfaced it, and would destroy the one-shot request and
+implementation claim over a value the environment already got wrong.
+
 To check whether the factor still matches reality, compare `PROVIDER_TOKENS` for a Codex delegate
 against `PROVIDER_TOKENS` for a **Claude** delegate on the **same** stage of comparable work; the
 audit log carries both. Use `PROVIDER_TOKENS`, not `RAW_TOKENS`: only `PROVIDER_TOKENS` is
@@ -142,10 +150,21 @@ and an `actual_tokens` figure: the amount charged against that unit. For a Codex
 the normalized Claude-equivalent charge, not the number of tokens the provider generated. The raw
 `provider_tokens` count stays in the launcher's local verification marker and is deliberately kept
 out of the receipt. Coordinators consume that receipt instead of estimating usage or reading the
-private audit log. A pending verification normally survives an owner restart, but one written under
-a superseded budget unit is consumed on the next verify with a distinct refusal — its spend cannot
-be verified under the current unit, so the stage is re-run rather than leaving the thread muted with
-no approver command to clear it.
+private audit log.
+
+A pending verification survives an owner restart by design, and the owner's substantive reply is
+withheld while it exists. Verification itself therefore never clears a marker it cannot verify:
+that check runs inside the owner's turn, so consuming the marker there would unmute the very turn
+whose delegate spend was never verified. A marker whose `budget_unit` is missing, superseded, or
+otherwise not the current unit can never be verified, so without a separate recovery it would mute
+the thread permanently. `delegation verification reset` is that recovery: a named approver runs it
+in the thread, and it discards exactly one marker that cannot be verified under the current unit,
+after appending a content-free audit row recording the marker's status, tier, model, request id and
+token counts — the marker is the only place `provider_tokens` is kept. It refuses a marker that
+*is* on the current unit, because that one is verifiable by running the verification stage and
+discarding it would bypass a live gate rather than recover from a dead one. The discarded spend
+stays charged against the thread budget and the delegation stage has to be re-run. An exhausted
+thread budget is a different state with a different command: `delegation budget reset`.
 
 The receipt is a correlation and integrity contract between cooperating processes under one Unix
 principal, not a cryptographic attestation against that principal. A security boundary against a
