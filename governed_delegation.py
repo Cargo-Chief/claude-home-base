@@ -28,7 +28,10 @@ LEGACY_BUDGET_UNIT = "raw_tokens_legacy"
 SUPERSEDED_BUDGET_UNITS = ("generation_tokens_v1",)
 CODEX_GENERATION_FACTOR = 2.5
 MIN_CODEX_GENERATION_FACTOR = 1.0
-MAX_CODEX_GENERATION_FACTOR = 4.0
+# The maximum equals the default so an override can only narrow the grant: a
+# higher factor would raise the per-call ceiling and shrink the charge at once,
+# widening an approver-gated thread budget without an anomalous audit line.
+MAX_CODEX_GENERATION_FACTOR = CODEX_GENERATION_FACTOR
 USAGE_RECEIPT_SCHEMA = "cargo-chief/delegation-usage-receipt/v1"
 DEFAULT_DELEGATE_TIMEOUT = 1_800
 MAX_DELEGATE_TIMEOUT = 1_800
@@ -88,11 +91,14 @@ def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
     value = env.get(
         "CARGO_CHIEF_CODEX_GENERATION_FACTOR", str(CODEX_GENERATION_FACTOR)
     )
+    bounds = (
+        f"between {MIN_CODEX_GENERATION_FACTOR} and {MAX_CODEX_GENERATION_FACTOR}"
+    )
     try:
         factor = float(value)
     except (TypeError, ValueError) as exc:
         raise DelegationError(
-            "CARGO_CHIEF_CODEX_GENERATION_FACTOR must be a number between 1.0 and 4.0"
+            f"CARGO_CHIEF_CODEX_GENERATION_FACTOR must be a number {bounds}"
         ) from exc
     if (
         not math.isfinite(factor)
@@ -100,7 +106,7 @@ def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
         or factor > MAX_CODEX_GENERATION_FACTOR
     ):
         raise DelegationError(
-            "CARGO_CHIEF_CODEX_GENERATION_FACTOR must be between 1.0 and 4.0"
+            f"CARGO_CHIEF_CODEX_GENERATION_FACTOR must be {bounds}"
         )
     return factor
 
@@ -122,7 +128,9 @@ def _normalized_charge(
         return tokens
     if tokens < 1:
         return 0
-    return max(1, math.ceil(tokens / codex_generation_factor(env)))
+    # Every permitted factor is finite and >= 1.0, so ceil(tokens / factor) is
+    # already at least 1 once the tokens < 1 case above has been handled.
+    return math.ceil(tokens / codex_generation_factor(env))
 
 
 @dataclass(frozen=True)
@@ -190,6 +198,14 @@ def load_request(path: Path) -> DelegationRequest:
         raise DelegationError("explore delegation must remain read-only")
     budget_unit = value.get("budget_unit")
     planned_tokens = value.get("planned_tokens")
+    if budget_unit in SUPERSEDED_BUDGET_UNITS:
+        # The coordinator ships from another repo, so a deploy window can leave
+        # it declaring a superseded unit; name the skew instead of failing closed
+        # with a generic contract error. The stale unit is still refused.
+        raise DelegationError(
+            f"delegation request declares the superseded budget unit `{budget_unit}` "
+            f"but this launcher requires `{BUDGET_UNIT}`; refresh the agent-kit skills"
+        )
     if (
         budget_unit != BUDGET_UNIT
         or isinstance(planned_tokens, bool)
@@ -397,16 +413,22 @@ def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, 
                 raise
             state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
         migrating_legacy_unit = state["unit"] != BUDGET_UNIT
+        # A superseded generation unit counted the same kind of token, so its
+        # approver-set limit is still meaningful; a raw-token limit is not.
+        migrating_raw_token_limit = state["unit"] == LEGACY_BUDGET_UNIT
         current_limit = state["limit"]
         current_used = state["used"]
         if migrating_legacy_unit and not reset:
             raise DelegationError(
-                "legacy raw-token delegation budget must be reset by a named approver"
+                f"delegation budget under the superseded unit `{state['unit']}` "
+                "must be reset by a named approver"
             )
         state = {
+            # A unit migration always discards `used`, whose value cannot be
+            # reinterpreted, but preserves an approver-set generation-token limit.
             "limit": (
                 limit if limit is not None
-                else DEFAULT_TOKEN_BUDGET if migrating_legacy_unit
+                else DEFAULT_TOKEN_BUDGET if migrating_raw_token_limit
                 else current_limit
             ),
             "used": 0 if reset else current_used + add_tokens,
@@ -779,7 +801,8 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     before = budget_status(budget_file)
     if before["unit"] != BUDGET_UNIT:
         raise DelegationError(
-            "legacy raw-token delegation budget must be reset by a named approver"
+            f"delegation budget under the superseded unit `{before['unit']}` "
+            "must be reset by a named approver"
         )
     if before["used"] >= before["limit"]:
         raise DelegationError("thread delegation budget is exhausted")
@@ -788,6 +811,9 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         raise DelegationError(
             "planned delegation does not fit the remaining generation-token budget"
         )
+    # Record the factor that produced this launch's charge so two launches under
+    # different factors are never mistaken for one accumulated currency.
+    generation_factor = codex_generation_factor(env) if provider == "openai" else 1.0
     call_token_limit = _provider_call_limit(request.planned_tokens, provider, env)
     prompt = (
         "You are a governed Cargo Chief delegate. Perform only the supplied bounded task. "
@@ -849,6 +875,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         "EFFORT": effort,
         "PLAN_GATE": plan_gate,
         "BUDGET_UNIT": BUDGET_UNIT,
+        "GENERATION_FACTOR": generation_factor,
         "BUDGET_TOKENS": budget_tokens,
         "PROVIDER_TOKENS": result.tokens,
         "RAW_TOKENS": result.raw_tokens,
@@ -864,6 +891,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
                 "status": "allocation_exhausted", "tier": request.tier,
                 "provider": provider, "model": model, "effort": effort,
                 "budget_unit": BUDGET_UNIT, "tokens": budget_tokens,
+                "generation_factor": generation_factor,
                 "provider_tokens": result.tokens,
                 "raw_tokens": result.raw_tokens,
                 "request_id": request_id,
@@ -878,6 +906,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
                 "status": "budget_exhausted", "tier": request.tier,
                 "provider": provider, "model": model, "effort": effort,
                 "budget_unit": BUDGET_UNIT, "tokens": budget_tokens,
+                "generation_factor": generation_factor,
                 "provider_tokens": result.tokens,
                 "raw_tokens": result.raw_tokens,
                 "request_id": request_id,
@@ -888,6 +917,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         verification_file.write_text(json.dumps({
             "status": "pending", "tier": request.tier, "provider": provider, "model": model,
             "effort": effort, "budget_unit": BUDGET_UNIT, "tokens": budget_tokens,
+            "generation_factor": generation_factor,
             "provider_tokens": result.tokens,
             "raw_tokens": result.raw_tokens, "mutation": request.mutation,
             "request_id": request_id,

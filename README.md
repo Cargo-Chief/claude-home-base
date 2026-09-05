@@ -103,17 +103,38 @@ retained or logged.
 Budget state includes `unit: generation_tokens_v2`, counted in Claude-equivalent generated tokens.
 Codex reports cumulative agentic-turn output including reasoning, so its per-call ceiling is scaled
 up by `CODEX_GENERATION_FACTOR` before dispatch and its reported spend is normalized back down
-before it is charged; `PROVIDER_TOKENS` in the audit keeps the raw provider count visible. A budget
-file from the former raw-token accounting, or from the superseded `generation_tokens_v1` contract,
-remains readable for status, but delegation refuses until a named approver runs
-`delegation budget reset`; the old `used` value is never reinterpreted under the new unit.
+before it is charged; `PROVIDER_TOKENS` in the audit keeps the raw provider count visible, and
+`GENERATION_FACTOR` records the factor that produced each charge. A budget file from the former
+raw-token accounting, or from the superseded `generation_tokens_v1` contract, remains readable for
+status, but delegation refuses until a named approver runs
+`delegation budget reset`; the old `used` value is never reinterpreted under the new unit. Migrating
+from a superseded *generation-token* unit preserves an approver-set `limit`, which still means the
+same thing; migrating from the raw-token file resets the limit to the 250,000 default, because a
+raw-token limit does not translate.
+
+`CARGO_CHIEF_CODEX_GENERATION_FACTOR` overrides that factor for one launcher process, bounded
+between `MIN_CODEX_GENERATION_FACTOR` and `MAX_CODEX_GENERATION_FACTOR`. The maximum equals the
+default, so an override can only *narrow* the grant: a lower factor shrinks the per-call ceiling and
+charges more per generated token. Raising the effective ceiling requires changing
+`CODEX_GENERATION_FACTOR` in code, through the PR gate, because a higher factor would widen an
+approver-gated thread budget without any anomalous audit line.
+
+To check whether the factor still matches reality, compare `PROVIDER_TOKENS` for a Codex delegate
+against `PROVIDER_TOKENS` for a **Claude** delegate on the **same** stage of comparable work; the
+audit log carries both. Do not compare `PROVIDER_TOKENS` to `BUDGET_TOKENS` within a single audit
+row: `BUDGET_TOKENS` is by construction `ceil(PROVIDER_TOKENS / factor)`, so that ratio is always
+the configured factor and proves nothing about the true Codex-to-Claude ratio.
+
 Every request declares `budget_unit: generation_tokens_v2` and a positive `planned_tokens` call
 ceiling. Coordinator-backed requests copy those values from their dispatch contract. Reaching the
 stage allocation withholds the partial return but leaves the thread available to its owner; only
 exhausting the thread ceiling creates the reset-gated exhaustion state.
 Successful owner verification emits a content-free, versioned usage receipt with the budget unit
-and actual generated-token count. Coordinators consume that receipt instead of estimating usage or
-reading the private audit log.
+and an `actual_tokens` figure: the amount charged against that unit. For a Codex delegate that is
+the normalized Claude-equivalent charge, not the number of tokens the provider generated. The raw
+`provider_tokens` count stays in the launcher's local verification marker and is deliberately kept
+out of the receipt. Coordinators consume that receipt instead of estimating usage or reading the
+private audit log.
 
 The receipt is a correlation and integrity contract between cooperating processes under one Unix
 principal, not a cryptographic attestation against that principal. A security boundary against a
