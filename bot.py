@@ -98,10 +98,12 @@ from session_lifecycle import TurnAdmission, oldest_evictable_session, stop_time
 from governed_delegation import (
     BUDGET_UNIT,
     DelegationError,
+    consume_allocation_exhaustion,
     consume_budget_exhaustion,
     budget_status,
     delegation_audit_path,
     delegation_verification_status,
+    prepare_owner_delegation_state,
     parse_budget_command,
     update_budget,
 )
@@ -769,6 +771,10 @@ def _spawn_claude_process(
     workspace = prepare_thread_workspace(
         policy.root, channel=channel, thread=thread_ts, session_id=session_id
     )
+    prepare_owner_delegation_state(
+        workspace.delegation_budget_file,
+        workspace.delegate_verification_file,
+    )
     escalation_message_file = workspace.escalation_message_file
     escalation_receipt_file = workspace.escalation_receipt_file
     for stale_path in (
@@ -1151,7 +1157,7 @@ def _reader_loop(session: LiveSession) -> None:
                         session._on_text(
                             "Delegate result withheld: independent owner verification is missing."
                         )
-                elif verification_status != "budget_exhausted":
+                elif verification_status not in {"allocation_exhausted", "budget_exhausted"}:
                     for text in session.pre_tool_text:
                         if session._on_text:
                             session._on_text(text)
@@ -1170,6 +1176,20 @@ def _reader_loop(session: LiveSession) -> None:
                             "Delegate result withheld: thread delegation budget exhausted; "
                             "further delegation requires a named approver to reset or raise "
                             f"the budget. {recovery}"
+                        )
+                elif verification_status == "allocation_exhausted" and session.workspace:
+                    consumed = consume_allocation_exhaustion(
+                        session.workspace.delegate_verification_file
+                    )
+                    if session._on_text:
+                        recovery = (
+                            "Owner-only replies and the remaining thread budget are available."
+                            if consumed else
+                            "The allocation notice could not be cleared; retry an owner-only reply."
+                        )
+                        session._on_text(
+                            "Delegate result withheld: stage generation-token allocation "
+                            f"exhausted. {recovery}"
                         )
                 session.private_escalation_pending = False
                 session.first_tool_seen = False
@@ -1876,6 +1896,10 @@ def _run_openai_fallback(
         thread=thread_ts,
         session_id=_get_openai_session(thread_ts),
     )
+    prepare_owner_delegation_state(
+        workspace.delegation_budget_file,
+        workspace.delegate_verification_file,
+    )
     for stale_path in (
         workspace.escalation_message_file,
         workspace.escalation_receipt_file,
@@ -2028,7 +2052,7 @@ def _run_openai_fallback(
             thread_ts, fallback_error_kind(result.error),
         )
         on_text("OpenAI fallback could not complete this turn.")
-    elif verification_status == "budget_exhausted":
+    elif verification_status in {"allocation_exhausted", "budget_exhausted"}:
         pass
     elif verification_missing:
         audit_logger.warning(
@@ -2051,6 +2075,17 @@ def _run_openai_fallback(
         on_text(
             "Delegate result withheld: thread delegation budget exhausted; further delegation "
             f"requires a named approver to reset or raise the budget. {recovery}"
+        )
+    elif verification_status == "allocation_exhausted":
+        consumed = consume_allocation_exhaustion(workspace.delegate_verification_file)
+        recovery = (
+            "Owner-only replies and the remaining thread budget are available."
+            if consumed else
+            "The allocation notice could not be cleared; retry an owner-only reply."
+        )
+        on_text(
+            "Delegate result withheld: stage generation-token allocation exhausted. "
+            + recovery
         )
 
     audit_logger.info(

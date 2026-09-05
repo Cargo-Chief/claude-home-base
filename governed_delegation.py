@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import sys
 import threading
 import time
 from typing import Callable, Mapping
+import uuid
 
 from codex_delegation import run_codex_delegate
 
@@ -22,6 +24,7 @@ from codex_delegation import run_codex_delegate
 DEFAULT_TOKEN_BUDGET = 250_000
 BUDGET_UNIT = "generation_tokens_v1"
 LEGACY_BUDGET_UNIT = "raw_tokens_legacy"
+USAGE_RECEIPT_SCHEMA = "cargo-chief/delegation-usage-receipt/v1"
 MAX_REQUEST_BYTES = 64 * 1024
 IMPLEMENTATION_SECTIONS = (
     ("## Blocking Product Questions",),
@@ -62,8 +65,8 @@ class DelegationRequest:
     tier: str
     prompt: str
     mutation: bool
-    budget_unit: str | None = None
-    planned_tokens: int | None = None
+    budget_unit: str
+    planned_tokens: int
 
 
 @dataclass
@@ -74,6 +77,19 @@ class DelegateResult:
     tool_uses: int = 0
     error: str | None = None
     budget_exhausted: bool = False
+
+
+def delegation_request_id(request: DelegationRequest) -> str:
+    """Return a content-free correlation id for the exact governed request."""
+    payload = {
+        "tier": request.tier,
+        "prompt": request.prompt,
+        "mutation": request.mutation,
+        "budget_unit": request.budget_unit,
+        "planned_tokens": request.planned_tokens,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _read_one_shot(path: Path, *, max_bytes: int = MAX_REQUEST_BYTES) -> str:
@@ -96,9 +112,8 @@ def load_request(path: Path) -> DelegationRequest:
         value = json.loads(_read_one_shot(path))
     except json.JSONDecodeError as exc:
         raise DelegationError("delegation request is invalid JSON") from exc
-    core_keys = {"tier", "prompt", "mutation"}
-    budget_keys = core_keys | {"budget_unit", "planned_tokens"}
-    if not isinstance(value, dict) or set(value) not in {frozenset(core_keys), frozenset(budget_keys)}:
+    budget_keys = {"tier", "prompt", "mutation", "budget_unit", "planned_tokens"}
+    if not isinstance(value, dict) or set(value) != budget_keys:
         raise DelegationError("delegation request contains unsupported keys")
     tier = value.get("tier")
     prompt = value.get("prompt")
@@ -110,7 +125,7 @@ def load_request(path: Path) -> DelegationRequest:
         raise DelegationError("explore delegation must remain read-only")
     budget_unit = value.get("budget_unit")
     planned_tokens = value.get("planned_tokens")
-    if set(value) == budget_keys and (
+    if (
         budget_unit != BUDGET_UNIT
         or isinstance(planned_tokens, bool)
         or not isinstance(planned_tokens, int)
@@ -197,7 +212,42 @@ def _validated_budget_state(value: object) -> dict:
     return {"limit": limit, "used": used, "unit": unit}
 
 
+def initialize_budget(path: Path) -> None:
+    """Atomically create new-unit state without reading or rewriting existing state."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.writing")
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            json.dump(
+                {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT},
+                handle, separators=(",", ":"),
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+    except OSError as exc:
+        raise DelegationError("delegation budget state could not be initialized") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def budget_status(path: Path) -> dict:
+    if path.is_symlink():
+        raise DelegationError("delegation budget state is invalid")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -221,6 +271,8 @@ def budget_status(path: Path) -> dict:
 def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, reset: bool = False) -> dict:
     if add_tokens < 0 or (limit is not None and limit < 1):
         raise DelegationError("delegation budget update is invalid")
+    if path.is_symlink():
+        raise DelegationError("delegation budget state is invalid")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -230,18 +282,30 @@ def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, 
             try:
                 state = json.loads(raw)
             except json.JSONDecodeError as exc:
-                raise DelegationError("delegation budget state is invalid") from exc
+                if not reset:
+                    raise DelegationError("delegation budget state is invalid") from exc
+                state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
         else:
             state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
-        state = _validated_budget_state(state)
+        try:
+            state = _validated_budget_state(state)
+        except DelegationError:
+            if not reset:
+                raise
+            state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
+        migrating_legacy_unit = state["unit"] != BUDGET_UNIT
         current_limit = state["limit"]
         current_used = state["used"]
-        if state["unit"] != BUDGET_UNIT and not reset:
+        if migrating_legacy_unit and not reset:
             raise DelegationError(
                 "legacy raw-token delegation budget must be reset by a named approver"
             )
         state = {
-            "limit": limit if limit is not None else current_limit,
+            "limit": (
+                limit if limit is not None
+                else DEFAULT_TOKEN_BUDGET if migrating_legacy_unit
+                else current_limit
+            ),
             "used": 0 if reset else current_used + add_tokens,
             "unit": BUDGET_UNIT,
         }
@@ -354,13 +418,22 @@ def run_claude_delegate(
                         )
             elif event.get("type") == "result":
                 usage = event.get("usage") or {}
-                if not seen_messages and isinstance(usage, dict):
-                    generated = _generation_tokens(usage)
-                    raw = _total_tokens(usage)
-                    if generated is None or raw < generated:
-                        return DelegateResult(error="Claude delegate returned invalid usage")
-                    tokens = generated
-                    raw_tokens = raw
+                if not isinstance(usage, dict):
+                    return DelegateResult(
+                        tokens=tokens, raw_tokens=raw_tokens,
+                        error="Claude delegate returned invalid usage",
+                    )
+                generated = _generation_tokens(usage)
+                raw = _total_tokens(usage)
+                if generated is None or raw < generated:
+                    return DelegateResult(
+                        tokens=tokens, raw_tokens=raw_tokens,
+                        error="Claude delegate returned invalid usage",
+                    )
+                # Claude Code's result usage is authoritative for the complete turn.
+                # Assistant usage remains useful for interrupting between turns.
+                tokens = generated
+                raw_tokens = raw
                 text = event.get("result")
                 if not isinstance(text, str):
                     return DelegateResult(
@@ -380,7 +453,15 @@ def run_claude_delegate(
                 tokens=tokens, raw_tokens=raw_tokens, error="Claude delegate failed",
             )
         if tokens < 1:
-            return DelegateResult(error="Claude delegate returned no usage")
+            return DelegateResult(
+                raw_tokens=raw_tokens,
+                error="Claude delegate returned no usage",
+            )
+        if tokens >= token_limit:
+            return DelegateResult(
+                tokens=tokens, raw_tokens=raw_tokens,
+                tool_uses=tool_uses, budget_exhausted=True,
+            )
         return DelegateResult(
             text=result_text, tokens=tokens, raw_tokens=raw_tokens, tool_uses=tool_uses,
         )
@@ -454,7 +535,7 @@ def _delegation_verification_status_unlocked(path: Path) -> str | None:
     if not isinstance(metadata, dict):
         return "invalid"
     status = metadata.get("status")
-    return status if status in {"pending", "budget_exhausted"} else "invalid"
+    return status if status in {"pending", "allocation_exhausted", "budget_exhausted"} else "invalid"
 
 
 def delegation_verification_status(path: Path) -> str | None:
@@ -473,6 +554,29 @@ def consume_budget_exhaustion(path: Path) -> bool:
         except OSError:
             return False
         return True
+
+
+def consume_allocation_exhaustion(path: Path) -> bool:
+    """Consume one valid stage-allocation stop without changing the thread budget."""
+    with _verification_marker_lock(path):
+        if _delegation_verification_status_unlocked(path) != "allocation_exhausted":
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+
+
+def prepare_owner_delegation_state(budget_path: Path, verification_path: Path) -> bool:
+    """Initialize budget state and clear only a stale per-call allocation stop.
+
+    A stopped or evicted owner may never observe the result event that normally
+    consumes this marker. Pending verification and thread-budget exhaustion are
+    durable gates and must survive owner restarts.
+    """
+    initialize_budget(budget_path)
+    return consume_allocation_exhaustion(verification_path)
 
 
 def parse_budget_command(text: str) -> tuple[str, int | None] | None:
@@ -502,6 +606,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         raise DelegationError("governed delegation environment is incomplete")
     root = Path(env["CARGO_CHIEF_ROOT"]).resolve()
     request = load_request(Path(env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"]))
+    request_id = delegation_request_id(request)
     claim_file = Path(env["CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE"])
     plan_gate = "not-required"
     if request.mutation:
@@ -523,10 +628,11 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     if before["used"] >= before["limit"]:
         raise DelegationError("thread delegation budget is exhausted")
     remaining_tokens = before["limit"] - before["used"]
-    if request.planned_tokens is not None and request.planned_tokens > remaining_tokens:
+    if request.planned_tokens > remaining_tokens:
         raise DelegationError(
             "planned delegation does not fit the remaining generation-token budget"
         )
+    call_token_limit = request.planned_tokens
     prompt = (
         "You are a governed Cargo Chief delegate. Perform only the supplied bounded task. "
         "Do not delegate again, access credentials, touch production, commit, push, or widen scope. "
@@ -543,7 +649,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         ]
         result_raw = run_codex_delegate(
             command, prompt, cwd=os.getcwd(), env=env, model=model, effort=effort,
-            read_only=not request.mutation, token_limit=remaining_tokens, timeout=timeout,
+            read_only=not request.mutation, token_limit=call_token_limit, timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
         result = DelegateResult(
@@ -561,13 +667,19 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         if not request.mutation:
             command.extend(["--allowedTools", "Read,Grep,Glob"])
         result = run_claude_delegate(
-            command, prompt, cwd=os.getcwd(), env=env, token_limit=remaining_tokens,
+            command, prompt, cwd=os.getcwd(), env=env, token_limit=call_token_limit,
             timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
     state = update_budget(budget_file, add_tokens=result.tokens)
-    exhausted = result.budget_exhausted or state["used"] >= state["limit"]
-    status = "failed" if result.error else "budget_exhausted" if exhausted else "completed"
+    thread_exhausted = state["used"] >= state["limit"]
+    allocation_exhausted = result.budget_exhausted and not thread_exhausted
+    status = (
+        "failed" if result.error else
+        "allocation_exhausted" if allocation_exhausted else
+        "budget_exhausted" if thread_exhausted else
+        "completed"
+    )
     _append_audit(Path(env["CARGO_CHIEF_AUDIT_LOG"]), {
         "USER": env["CARGO_CHIEF_CURRENT_USER"],
         "CHANNEL": env["CLAUDE_CHANNEL_ID"],
@@ -589,13 +701,27 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     if result.error:
         raise DelegationError(result.error)
     verification_file = Path(env["CARGO_CHIEF_DELEGATE_VERIFICATION_FILE"])
-    if exhausted:
+    if allocation_exhausted:
+        with _verification_marker_lock(verification_file):
+            verification_file.write_text(json.dumps({
+                "status": "allocation_exhausted", "tier": request.tier,
+                "provider": provider, "model": model, "effort": effort,
+                "budget_unit": BUDGET_UNIT, "tokens": result.tokens,
+                "raw_tokens": result.raw_tokens,
+                "request_id": request_id,
+            }, separators=(",", ":")) + "\n", encoding="utf-8")
+            verification_file.chmod(0o600)
+        raise DelegationError(
+            "delegation stage generation-token allocation exhausted; delegate return withheld"
+        )
+    if thread_exhausted:
         with _verification_marker_lock(verification_file):
             verification_file.write_text(json.dumps({
                 "status": "budget_exhausted", "tier": request.tier,
                 "provider": provider, "model": model, "effort": effort,
                 "budget_unit": BUDGET_UNIT, "tokens": result.tokens,
                 "raw_tokens": result.raw_tokens,
+                "request_id": request_id,
             }, separators=(",", ":")) + "\n", encoding="utf-8")
             verification_file.chmod(0o600)
         raise DelegationError("thread delegation budget exhausted; delegate return withheld")
@@ -604,6 +730,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
             "status": "pending", "tier": request.tier, "provider": provider, "model": model,
             "effort": effort, "budget_unit": BUDGET_UNIT, "tokens": result.tokens,
             "raw_tokens": result.raw_tokens, "mutation": request.mutation,
+            "request_id": request_id,
         }, separators=(",", ":")) + "\n", encoding="utf-8")
         verification_file.chmod(0o600)
     print(result.text)
@@ -645,8 +772,24 @@ def verify_from_environment(env: Mapping[str, str] | None = None) -> int:
                 raise DelegationError("pending delegate verification is invalid")
         except (FileNotFoundError, json.JSONDecodeError) as exc:
             raise DelegationError("no safe pending delegate verification exists") from exc
+        if metadata.get("status") == "allocation_exhausted":
+            raise DelegationError(
+                "delegation stage generation-token allocation was exhausted; "
+                "no thread-budget reset is required"
+            )
         if metadata.get("status") != "pending":
             raise DelegationError("thread delegation budget must be reset by a named approver")
+        tokens = metadata.get("tokens")
+        request_id = metadata.get("request_id")
+        if (
+            metadata.get("budget_unit") != BUDGET_UNIT
+            or isinstance(tokens, bool)
+            or not isinstance(tokens, int)
+            or tokens < 1
+            or not isinstance(request_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", request_id) is None
+        ):
+            raise DelegationError("pending delegate verification usage is invalid")
         marker.unlink()
     _append_audit(Path(values["CARGO_CHIEF_AUDIT_LOG"]), {
         "USER": values["CARGO_CHIEF_CURRENT_USER"],
@@ -657,7 +800,12 @@ def verify_from_environment(env: Mapping[str, str] | None = None) -> int:
         "OWNER_VERIFY_TOOLS": 1,
         "STATUS": "verified",
     })
-    print("VERIFICATION_RECORDED")
+    print(json.dumps({
+        "schema_version": USAGE_RECEIPT_SCHEMA,
+        "budget_unit": metadata["budget_unit"],
+        "actual_tokens": tokens,
+        "request_id": request_id,
+    }, separators=(",", ":")))
     return 0
 
 
