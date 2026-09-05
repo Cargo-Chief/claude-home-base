@@ -864,6 +864,7 @@ def build_claude_command(
     parking_claim_file: Path,
     delegation_request_file: Path,
     implementation_claim_file: Path,
+    delegate_timeout: int,
     identity_prompt: str = "",
     model_prompt: str = "",
     session_id: str | None = None,
@@ -878,6 +879,7 @@ def build_claude_command(
         parking_claim_file=parking_claim_file,
         delegation_request_file=delegation_request_file,
         implementation_claim_file=implementation_claim_file,
+        delegate_timeout=delegate_timeout,
         delegation=(
             "Delegate only through the governed launcher described below. Do not invoke Agent, Task, "
             "Explore, Plan, general-purpose, or any other provider-native subagent. Verify every "
@@ -913,6 +915,7 @@ def _build_harness_prompt(
     parking_claim_file: Path,
     delegation_request_file: Path,
     implementation_claim_file: Path,
+    delegate_timeout: int,
     delegation: str,
 ) -> str:
     return (
@@ -951,6 +954,8 @@ def _build_harness_prompt(
         "explore. The supported unit is `generation_tokens_v1`; `planned_tokens` is the positive "
         "maximum generated-token allocation for this call. When a coordinator supplies those "
         "values, copy both exactly. "
+        f"Each delegated call has a wall-clock limit of {delegate_timeout} seconds; size the task "
+        "so it can return evidence within that limit. "
         "Every mutation=true request requires first writing the absolute path of the implementation-ready "
         f"docs-worktree plan to {implementation_claim_file}. Then run exactly:\n"
         f"  {shlex.quote(str(transport_python))} "
@@ -981,6 +986,7 @@ def build_codex_prompt(
     parking_claim_file: Path,
     delegation_request_file: Path,
     implementation_claim_file: Path,
+    delegate_timeout: int,
     identity_prompt: str = "",
 ) -> str:
     """Compose the same autonomous and harness governance for a Codex fallback turn."""
@@ -994,6 +1000,7 @@ def build_codex_prompt(
         parking_claim_file=parking_claim_file,
         delegation_request_file=delegation_request_file,
         implementation_claim_file=implementation_claim_file,
+        delegate_timeout=delegate_timeout,
         delegation=(
             "Delegate only through the governed launcher described below; raw Codex collaboration "
             "is disabled. Keep decisions, production-touching work, credentials, and final "

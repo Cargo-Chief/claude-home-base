@@ -25,6 +25,8 @@ DEFAULT_TOKEN_BUDGET = 250_000
 BUDGET_UNIT = "generation_tokens_v1"
 LEGACY_BUDGET_UNIT = "raw_tokens_legacy"
 USAGE_RECEIPT_SCHEMA = "cargo-chief/delegation-usage-receipt/v1"
+DEFAULT_DELEGATE_TIMEOUT = 1_800
+MAX_DELEGATE_TIMEOUT = 1_800
 MAX_REQUEST_BYTES = 64 * 1024
 IMPLEMENTATION_SECTIONS = (
     ("## Blocking Product Questions",),
@@ -58,6 +60,22 @@ ROUTES = {
 
 class DelegationError(RuntimeError):
     pass
+
+
+def delegate_timeout_from_env(env: Mapping[str, str] = os.environ) -> int:
+    """Read a bounded wall-clock limit that is independent of the owner timeout."""
+    value = env.get("CARGO_CHIEF_DELEGATE_TIMEOUT", str(DEFAULT_DELEGATE_TIMEOUT))
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as exc:
+        raise DelegationError(
+            "CARGO_CHIEF_DELEGATE_TIMEOUT must be an integer between 1 and 1800 seconds"
+        ) from exc
+    if not 1 <= timeout <= MAX_DELEGATE_TIMEOUT:
+        raise DelegationError(
+            "CARGO_CHIEF_DELEGATE_TIMEOUT must be between 1 and 1800 seconds"
+        )
+    return timeout
 
 
 @dataclass(frozen=True)
@@ -690,6 +708,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     )
     if any(not env.get(key) for key in required):
         raise DelegationError("governed delegation environment is incomplete")
+    timeout = delegate_timeout_from_env(env)
     root = Path(env["CARGO_CHIEF_ROOT"]).resolve()
     request = load_request(Path(env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"]))
     request_id = delegation_request_id(request)
@@ -726,7 +745,6 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
            "This is read-only: do not edit or create files. ")
         + "Return concise evidence for independent owner verification.\n\n" + request.prompt
     )
-    timeout = int(env.get("CARGO_CHIEF_DELEGATE_TIMEOUT", "1800"))
     pid_file = Path(env["CARGO_CHIEF_DELEGATE_PID_FILE"])
     started = time.monotonic()
     if provider == "openai":
