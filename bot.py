@@ -110,6 +110,7 @@ from governed_delegation import (
     budget_status,
     delegation_audit_path,
     delegation_verification_status,
+    delegate_timeout_from_env,
     governed_delegate_active,
     prepare_owner_delegation_state,
     parse_budget_command,
@@ -203,7 +204,11 @@ for private_log in (LOG_DIR / "bot.log", AUDIT_LOG):
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 CLAUDE_TIMEOUT = RUNTIME_POLICY.claude_timeout
-MAX_TURN_RUNTIME = 4 * CLAUDE_TIMEOUT
+DELEGATE_TIMEOUT = delegate_timeout_from_env(os.environ)
+MAX_TURN_RUNTIME = max(
+    4 * CLAUDE_TIMEOUT,
+    DELEGATE_TIMEOUT + CLAUDE_TIMEOUT,
+)
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -807,6 +812,7 @@ def _spawn_claude_process(
         parking_claim_file=workspace.parking_claim_file,
         delegation_request_file=workspace.delegation_request_file,
         implementation_claim_file=workspace.implementation_claim_file,
+        delegate_timeout=DELEGATE_TIMEOUT,
         identity_prompt=_identity_prompt(),
         model_prompt=model_prompt,
         session_id=session_id,
@@ -841,7 +847,7 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_OWNER_MODEL"] = policy.model
     proc_env["CARGO_CHIEF_OWNER_EFFORT"] = policy.effort
     proc_env["CARGO_CHIEF_CURRENT_USER"] = user_id
-    proc_env["CARGO_CHIEF_DELEGATE_TIMEOUT"] = str(CLAUDE_TIMEOUT)
+    proc_env["CARGO_CHIEF_DELEGATE_TIMEOUT"] = str(DELEGATE_TIMEOUT)
     bundle = resolve_thread_bundle(workspace)
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
@@ -1940,6 +1946,7 @@ def _run_openai_fallback(
         parking_claim_file=workspace.parking_claim_file,
         delegation_request_file=workspace.delegation_request_file,
         implementation_claim_file=workspace.implementation_claim_file,
+        delegate_timeout=DELEGATE_TIMEOUT,
         identity_prompt=_identity_prompt(),
     )
     proc_env = {**os.environ}
@@ -1964,7 +1971,7 @@ def _run_openai_fallback(
         "CARGO_CHIEF_OWNER_MODEL": policy.fallback_model,
         "CARGO_CHIEF_OWNER_EFFORT": policy.fallback_effort,
         "CARGO_CHIEF_CURRENT_USER": user_id,
-        "CARGO_CHIEF_DELEGATE_TIMEOUT": str(CLAUDE_TIMEOUT),
+        "CARGO_CHIEF_DELEGATE_TIMEOUT": str(DELEGATE_TIMEOUT),
     })
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)

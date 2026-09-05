@@ -632,6 +632,7 @@ class PreflightTest(unittest.TestCase):
             parking_claim_file=Path("/workspace/work/parking-claim.txt"),
             delegation_request_file=Path("/workspace/work/delegation-request.json"),
             implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
+            delegate_timeout=1_800,
             identity_prompt="agent identity",
             model_prompt="room prompt",
             session_id="session-1",
@@ -660,6 +661,7 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("/workspace/work/bundle-claim.txt", appended)
         self.assertIn("/workspace/work/delegation-request.json", appended)
         self.assertIn("/workspace/work/implementation-claim.txt", appended)
+        self.assertIn("wall-clock limit of 1800 seconds", appended)
         self.assertNotIn("--channel D1", appended)
         self.assertIn("Do not invoke Agent, Task, Explore, Plan", appended)
         self.assertIn("agent identity", appended)
@@ -695,11 +697,13 @@ class PreflightTest(unittest.TestCase):
             parking_claim_file=Path("/workspace/parking.txt"),
             delegation_request_file=Path("/workspace/delegation-request.json"),
             implementation_claim_file=Path("/workspace/implementation-claim.txt"),
+            delegate_timeout=1_200,
             identity_prompt="agent identity",
         )
         self.assertTrue(prompt.startswith("autonomous\n\nCargo Chief harness"))
         self.assertIn("raw Codex collaboration is disabled", prompt)
         self.assertIn("governed_delegation.py", prompt)
+        self.assertIn("wall-clock limit of 1200 seconds", prompt)
         self.assertIn("agent identity", prompt)
         self.assertTrue(prompt.endswith("authority envelope"))
 

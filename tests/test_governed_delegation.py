@@ -23,6 +23,7 @@ from governed_delegation import (
     cleanup_stale_delegate_pid,
     consume_allocation_exhaustion,
     consume_budget_exhaustion,
+    delegate_timeout_from_env,
     delegation_audit_path,
     delegation_verification_status,
     governed_delegate_active,
@@ -405,6 +406,45 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertEqual(("claude-haiku-4-5-20251001", "medium"), ROUTES["explore"]["claude"])
         self.assertEqual(("gpt-5.6-luna", "medium"), ROUTES["explore"]["openai"])
 
+    def test_delegate_timeout_is_independent_and_bounded(self):
+        self.assertEqual(1_800, delegate_timeout_from_env({}))
+        self.assertEqual(
+            1_200,
+            delegate_timeout_from_env({"CARGO_CHIEF_DELEGATE_TIMEOUT": "1200"}),
+        )
+        for value in ("not-a-number", "0", "-1", "1801"):
+            with self.subTest(value=value):
+                with self.assertRaises(DelegationError):
+                    delegate_timeout_from_env({"CARGO_CHIEF_DELEGATE_TIMEOUT": value})
+
+    def test_invalid_delegate_timeout_does_not_consume_request(self):
+        request = self.work / "delegation-request.json"
+        request.write_text(json.dumps({
+            "tier": "bounded", "prompt": "private brief", "mutation": False,
+            "budget_unit": BUDGET_UNIT, "planned_tokens": 45_000,
+        }))
+        env = {
+            "CARGO_CHIEF_ROOT": str(self.root),
+            "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(request),
+            "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(self.work / "claim.txt"),
+            "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(self.work / "budget.json"),
+            "CARGO_CHIEF_DELEGATE_PID_FILE": str(self.work / "pid"),
+            "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
+            "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
+            "CARGO_CHIEF_OWNER_PROVIDER": "openai",
+            "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
+            "CARGO_CHIEF_OWNER_EFFORT": "high",
+            "CARGO_CHIEF_DELEGATE_TIMEOUT": "invalid",
+            "CLAUDE_THREAD_TS": "T1",
+            "CLAUDE_CHANNEL_ID": "C1",
+            "CARGO_CHIEF_CURRENT_USER": "U1",
+        }
+
+        with self.assertRaisesRegex(DelegationError, "must be an integer"):
+            launch_from_environment(env)
+
+        self.assertTrue(request.is_file())
+
     @patch("governed_delegation.subprocess.Popen")
     def test_claude_prompt_uses_stdin_and_usage_is_metered(self, popen):
         process = _StreamProcess([
@@ -674,6 +714,7 @@ class GovernedDelegationTest(unittest.TestCase):
             "CARGO_CHIEF_OWNER_PROVIDER": "openai",
             "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
             "CARGO_CHIEF_OWNER_EFFORT": "high",
+            "CARGO_CHIEF_DELEGATE_TIMEOUT": "1200",
             "CLAUDE_THREAD_TS": "T1",
             "CLAUDE_CHANNEL_ID": "C1",
             "CARGO_CHIEF_CURRENT_USER": "U1",
@@ -692,6 +733,7 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertNotIn("delegate evidence", audit)
         self.assertTrue(run.call_args.kwargs["read_only"])
         self.assertEqual(45_000, run.call_args.kwargs["token_limit"])
+        self.assertEqual(1_200, run.call_args.kwargs["timeout"])
         self.assertIn("app-server", run.call_args.args[0])
         self.assertTrue((self.work / "verification.json").is_file())
         verify_output = io.StringIO()
