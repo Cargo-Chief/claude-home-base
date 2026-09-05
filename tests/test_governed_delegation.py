@@ -807,11 +807,61 @@ class GovernedDelegationTest(unittest.TestCase):
             verify_from_environment(env)
         self.assertTrue(marker.exists())
 
+    def _verify_environment(self, marker):
+        return {
+            "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(marker),
+            "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
+            "CARGO_CHIEF_CURRENT_USER": "U1",
+            "CLAUDE_CHANNEL_ID": "C1",
+            "CLAUDE_THREAD_TS": "T1",
+        }
+
+    def test_pending_marker_under_a_superseded_unit_is_consumed_once(self):
+        # A pending marker survives owner restarts by design, so one written
+        # under a superseded unit would mute the thread forever if it could
+        # never be consumed.
+        marker = self.work / "verification.json"
+        marker.write_text(json.dumps({
+            "status": "pending", "budget_unit": SUPERSEDED_BUDGET_UNITS[0],
+            "tokens": 40_000, "request_id": "a" * 64,
+        }) + "\n", encoding="utf-8")
+        env = self._verify_environment(marker)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaises(DelegationError) as raised:
+                verify_from_environment(env)
+
+        message = str(raised.exception)
+        self.assertIn("predates the current budget unit", message)
+        self.assertIn("must be re-run", message)
+        # No receipt is emitted for spend that cannot be verified.
+        self.assertEqual("", output.getvalue())
+        self.assertFalse(marker.exists())
+
+        with self.assertRaisesRegex(DelegationError, "no safe pending delegate verification"):
+            verify_from_environment(env)
+
+    def test_pending_marker_under_an_unrecognized_unit_still_fails_closed(self):
+        marker = self.work / "verification.json"
+        for unit in ("generation_tokens_v99", LEGACY_BUDGET_UNIT, 7, None):
+            with self.subTest(unit=unit):
+                marker.write_text(json.dumps({
+                    "status": "pending", "budget_unit": unit,
+                    "tokens": 40_000, "request_id": "a" * 64,
+                }) + "\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(DelegationError, "usage is invalid"):
+                    verify_from_environment(self._verify_environment(marker))
+
+                self.assertTrue(marker.exists())
+
     @patch("governed_delegation.run_codex_delegate")
     def test_stage_allocation_exhaustion_preserves_thread_for_owner(self, run):
         # The runner only reports exhaustion once observed tokens reach the
-        # scaled call limit, so the mock must overshoot 112_500, not 45_000.
-        provider_tokens = 113_000
+        # scaled call limit, so the mock must overshoot that limit, not 45_000.
+        expected_limit = math.ceil(45_000 * CODEX_GENERATION_FACTOR)
+        provider_tokens = expected_limit + 500
         expected_charge = math.ceil(provider_tokens / CODEX_GENERATION_FACTOR)
         run.return_value = CodexDelegateResult(
             tokens=provider_tokens, raw_tokens=1_125_414, budget_exhausted=True,
@@ -840,8 +890,8 @@ class GovernedDelegationTest(unittest.TestCase):
         with self.assertRaisesRegex(DelegationError, "stage generation-token allocation"):
             launch_from_environment(env)
 
-        self.assertEqual(112_500, run.call_args.kwargs["token_limit"])
-        self.assertLessEqual(112_500, provider_tokens)
+        self.assertEqual(expected_limit, run.call_args.kwargs["token_limit"])
+        self.assertLessEqual(expected_limit, provider_tokens)
         self.assertEqual(expected_charge, budget_status(budget)["used"])
         self.assertLess(expected_charge, DEFAULT_TOKEN_BUDGET)
         marker = self.work / "verification.json"
@@ -917,13 +967,27 @@ class GovernedDelegationTest(unittest.TestCase):
         return request
 
     def test_generation_factor_default_and_bounds(self):
-        self.assertEqual(2.5, CODEX_GENERATION_FACTOR)
-        self.assertEqual(2.5, codex_generation_factor({}))
+        # The constant is re-measured and raised through the PR gate, so every
+        # numeric expectation is derived from it; only the non-numeric and
+        # non-finite rejections are deliberate literals.
+        self.assertEqual(CODEX_GENERATION_FACTOR, codex_generation_factor({}))
+        narrowed = (MIN_CODEX_GENERATION_FACTOR + MAX_CODEX_GENERATION_FACTOR) / 2
         self.assertEqual(
-            1.5,
-            codex_generation_factor({"CARGO_CHIEF_CODEX_GENERATION_FACTOR": "1.5"}),
+            narrowed,
+            codex_generation_factor(
+                {"CARGO_CHIEF_CODEX_GENERATION_FACTOR": str(narrowed)}
+            ),
         )
-        for value in ("", "not-a-number", "0.9", "2.6", "3", "4", "nan", "inf", "-2"):
+        rejected = (
+            "",
+            "not-a-number",
+            "nan",
+            "inf",
+            str(MIN_CODEX_GENERATION_FACTOR - 0.1),
+            str(MAX_CODEX_GENERATION_FACTOR + 0.1),
+            str(-MAX_CODEX_GENERATION_FACTOR),
+        )
+        for value in rejected:
             with self.subTest(value=value):
                 with self.assertRaises(DelegationError):
                     codex_generation_factor(
@@ -935,30 +999,57 @@ class GovernedDelegationTest(unittest.TestCase):
         # the effective per-call ceiling or shrink the charge below the default.
         self.assertEqual(MIN_CODEX_GENERATION_FACTOR, 1.0)
         self.assertEqual(MAX_CODEX_GENERATION_FACTOR, CODEX_GENERATION_FACTOR)
-        narrowed = {"CARGO_CHIEF_CODEX_GENERATION_FACTOR": "1.0"}
-        self.assertEqual(45_000, _provider_call_limit(45_000, "openai", narrowed))
-        self.assertEqual(100_000, _normalized_charge(100_000, "openai", narrowed))
+        floor = codex_generation_factor({
+            "CARGO_CHIEF_CODEX_GENERATION_FACTOR": str(MIN_CODEX_GENERATION_FACTOR),
+        })
+        self.assertEqual(
+            math.ceil(45_000 * MIN_CODEX_GENERATION_FACTOR),
+            _provider_call_limit(45_000, "openai", floor),
+        )
+        self.assertEqual(
+            math.ceil(100_000 / MIN_CODEX_GENERATION_FACTOR),
+            _normalized_charge(100_000, "openai", floor),
+        )
+        self.assertLessEqual(
+            _provider_call_limit(45_000, "openai", floor),
+            _provider_call_limit(45_000, "openai", CODEX_GENERATION_FACTOR),
+        )
         with self.assertRaises(DelegationError) as raised:
-            codex_generation_factor({"CARGO_CHIEF_CODEX_GENERATION_FACTOR": "4.0"})
+            codex_generation_factor({
+                "CARGO_CHIEF_CODEX_GENERATION_FACTOR": str(
+                    MAX_CODEX_GENERATION_FACTOR + 0.1
+                ),
+            })
         message = str(raised.exception)
         self.assertIn(str(MIN_CODEX_GENERATION_FACTOR), message)
         self.assertIn(str(MAX_CODEX_GENERATION_FACTOR), message)
-        # The old hardcoded upper bound must not survive in the text.
-        self.assertNotIn("4.0", message)
 
     def test_call_limit_and_charge_are_provider_normalized(self):
-        self.assertEqual(112_500, _provider_call_limit(45_000, "openai", {}))
-        self.assertEqual(45_000, _provider_call_limit(45_000, "claude", {}))
-        self.assertEqual(40_000, _normalized_charge(100_000, "openai", {}))
-        self.assertEqual(100_000, _normalized_charge(100_000, "claude", {}))
-        self.assertEqual(1, _normalized_charge(1, "openai", {}))
-        self.assertEqual(1, _normalized_charge(2, "openai", {}))
-        self.assertEqual(0, _normalized_charge(0, "openai", {}))
+        factor = codex_generation_factor({})
+        self.assertEqual(
+            math.ceil(45_000 * factor), _provider_call_limit(45_000, "openai", factor)
+        )
+        self.assertEqual(45_000, _provider_call_limit(45_000, "claude", factor))
+        self.assertEqual(
+            math.ceil(100_000 / factor), _normalized_charge(100_000, "openai", factor)
+        )
+        self.assertEqual(100_000, _normalized_charge(100_000, "claude", factor))
+        # Nonzero generated spend is never rounded down to a free call, and only
+        # zero spend is free.
+        for tokens in (1, 2):
+            with self.subTest(tokens=tokens):
+                self.assertGreaterEqual(
+                    _normalized_charge(tokens, "openai", factor), 1
+                )
+        self.assertEqual(0, _normalized_charge(0, "openai", factor))
 
     @patch("governed_delegation.run_codex_delegate")
     def test_codex_generation_tokens_are_charged_normalized(self, run):
+        provider_tokens = 100_000
+        expected_limit = math.ceil(45_000 * CODEX_GENERATION_FACTOR)
+        expected_charge = math.ceil(provider_tokens / CODEX_GENERATION_FACTOR)
         run.return_value = CodexDelegateResult(
-            texts=["delegate evidence"], tokens=100_000, raw_tokens=1_125_414,
+            texts=["delegate evidence"], tokens=provider_tokens, raw_tokens=1_125_414,
         )
         request = self._bounded_request()
         budget = self.work / "budget.json"
@@ -968,22 +1059,26 @@ class GovernedDelegationTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, launch_from_environment(values))
 
-        self.assertEqual(112_500, run.call_args.kwargs["token_limit"])
-        self.assertEqual(40_000, budget_status(budget)["used"])
+        self.assertEqual(expected_limit, run.call_args.kwargs["token_limit"])
+        self.assertEqual(expected_charge, budget_status(budget)["used"])
         marker = json.loads((self.work / "verification.json").read_text())
-        self.assertEqual(40_000, marker["tokens"])
-        self.assertEqual(100_000, marker["provider_tokens"])
+        self.assertEqual(expected_charge, marker["tokens"])
+        self.assertEqual(provider_tokens, marker["provider_tokens"])
         self.assertEqual(1_125_414, marker["raw_tokens"])
         self.assertEqual(CODEX_GENERATION_FACTOR, marker["generation_factor"])
         audit = (self.work / "audit.log").read_text()
-        self.assertIn("BUDGET_TOKENS:40000", audit)
-        self.assertIn("PROVIDER_TOKENS:100000", audit)
+        self.assertIn(f"BUDGET_TOKENS:{expected_charge}", audit)
+        self.assertIn(f"PROVIDER_TOKENS:{provider_tokens}", audit)
         self.assertIn(f"GENERATION_FACTOR:{CODEX_GENERATION_FACTOR}", audit)
 
     @patch("governed_delegation.run_claude_delegate")
     def test_claude_provider_budget_is_unnormalized(self, run):
+        # A real Claude delegate that reached the 45,000 call limit would report
+        # budget_exhausted, so the mocked count stays below it: this test asserts
+        # a successful launch, which is only reachable under the limit.
+        provider_tokens = 30_000
         run.return_value = DelegateResult(
-            text="delegate evidence", tokens=45_000, raw_tokens=1_125_414,
+            text="delegate evidence", tokens=provider_tokens, raw_tokens=1_125_414,
         )
         request = self._bounded_request()
         budget = self.work / "budget.json"
@@ -994,14 +1089,14 @@ class GovernedDelegationTest(unittest.TestCase):
             self.assertEqual(0, launch_from_environment(values))
 
         self.assertEqual(45_000, run.call_args.kwargs["token_limit"])
-        self.assertEqual(45_000, budget_status(budget)["used"])
+        self.assertEqual(provider_tokens, budget_status(budget)["used"])
         marker = json.loads((self.work / "verification.json").read_text())
-        self.assertEqual(45_000, marker["tokens"])
-        self.assertEqual(45_000, marker["provider_tokens"])
+        self.assertEqual(provider_tokens, marker["tokens"])
+        self.assertEqual(provider_tokens, marker["provider_tokens"])
         self.assertEqual(1.0, marker["generation_factor"])
         audit = (self.work / "audit.log").read_text()
-        self.assertIn("BUDGET_TOKENS:45000", audit)
-        self.assertIn("PROVIDER_TOKENS:45000", audit)
+        self.assertIn(f"BUDGET_TOKENS:{provider_tokens}", audit)
+        self.assertIn(f"PROVIDER_TOKENS:{provider_tokens}", audit)
         self.assertIn("GENERATION_FACTOR:1.0", audit)
 
     @patch("governed_delegation.run_codex_delegate")
@@ -1017,6 +1112,39 @@ class GovernedDelegationTest(unittest.TestCase):
 
         run.assert_not_called()
         self.assertEqual(0, budget_status(budget)["used"])
+
+    @patch("governed_delegation.run_codex_delegate")
+    @patch("governed_delegation.run_claude_delegate")
+    def test_invalid_generation_factor_does_not_consume_the_one_shot_files(
+        self, claude, codex
+    ):
+        # A purely environmental misconfiguration must not destroy the one-shot
+        # request or implementation claim, and validating it only on the openai
+        # path would make that depend on which provider the thread is on.
+        for provider in ("openai", "claude"):
+            with self.subTest(provider=provider):
+                request = self._bounded_request()
+                claim = self.work / "claim.txt"
+                claim.write_text("/nonexistent/plan.md\n", encoding="utf-8")
+                budget = self.work / "budget.json"
+                values = self._launch_environment(
+                    request, budget, provider=provider, extra={
+                        "CARGO_CHIEF_CODEX_GENERATION_FACTOR": str(
+                            MAX_CODEX_GENERATION_FACTOR + 0.1
+                        ),
+                    },
+                )
+
+                with self.assertRaisesRegex(
+                    DelegationError, "CODEX_GENERATION_FACTOR"
+                ):
+                    launch_from_environment(values)
+
+                self.assertTrue(request.is_file())
+                self.assertTrue(claim.is_file())
+                self.assertEqual(0, budget_status(budget)["used"])
+        claude.assert_not_called()
+        codex.assert_not_called()
 
     @patch("governed_delegation.run_codex_delegate")
     def test_superseded_generation_unit_requires_named_approver_reset(self, run):
@@ -1042,6 +1170,9 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertIn("generation_tokens_v1", str(launched.exception))
         self.assertNotIn("raw-token", str(launched.exception))
         self.assertIn("must be reset by a named approver", str(launched.exception))
+        # This reset preserves an approver-set limit, so it must not carry the
+        # raw-token warning about returning the limit to the default.
+        self.assertIn("keeps the current limit", str(launched.exception))
         run.assert_not_called()
 
         reset = update_budget(budget, reset=True)
@@ -1057,8 +1188,13 @@ class GovernedDelegationTest(unittest.TestCase):
         with self.assertRaises(DelegationError) as raised:
             update_budget(budget, add_tokens=1)
 
-        self.assertIn(LEGACY_BUDGET_UNIT, str(raised.exception))
-        self.assertIn("must be reset by a named approver", str(raised.exception))
+        message = str(raised.exception)
+        self.assertIn(LEGACY_BUDGET_UNIT, message)
+        self.assertIn("must be reset by a named approver", message)
+        # An approver who ran `delegation budget set` must be told that this
+        # reset, unlike the superseded-generation-unit reset, drops the ceiling.
+        self.assertIn(str(DEFAULT_TOKEN_BUDGET), message)
+        self.assertIn("default", message)
 
     def test_unit_migration_preserves_an_approver_set_limit(self):
         budget = self.work / "budget.json"
@@ -1095,8 +1231,10 @@ class GovernedDelegationTest(unittest.TestCase):
 
     @patch("governed_delegation.run_codex_delegate")
     def test_codex_overshoot_charges_normalized_spend_and_withholds(self, run):
+        provider_tokens = math.ceil(45_000 * CODEX_GENERATION_FACTOR)
+        expected_charge = math.ceil(provider_tokens / CODEX_GENERATION_FACTOR)
         run.return_value = CodexDelegateResult(
-            texts=["partial evidence"], tokens=112_500, raw_tokens=1_125_414,
+            texts=["partial evidence"], tokens=provider_tokens, raw_tokens=1_125_414,
             budget_exhausted=True,
         )
         request = self._bounded_request()
@@ -1109,11 +1247,11 @@ class GovernedDelegationTest(unittest.TestCase):
                 launch_from_environment(values)
 
         self.assertEqual("", output.getvalue())
-        self.assertEqual(45_000, budget_status(budget)["used"])
+        self.assertEqual(expected_charge, budget_status(budget)["used"])
         marker = json.loads((self.work / "verification.json").read_text())
         self.assertEqual("allocation_exhausted", marker["status"])
-        self.assertEqual(45_000, marker["tokens"])
-        self.assertEqual(112_500, marker["provider_tokens"])
+        self.assertEqual(expected_charge, marker["tokens"])
+        self.assertEqual(provider_tokens, marker["provider_tokens"])
 
 
 if __name__ == "__main__":

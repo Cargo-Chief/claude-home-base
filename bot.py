@@ -103,6 +103,8 @@ from session_lifecycle import (
 )
 from governed_delegation import (
     BUDGET_UNIT,
+    DEFAULT_TOKEN_BUDGET,
+    LEGACY_BUDGET_UNIT,
     DelegationError,
     cleanup_stale_delegate_pid,
     consume_allocation_exhaustion,
@@ -2640,10 +2642,21 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
         )
         return True
     if state["unit"] != BUDGET_UNIT:
+        # The two stale states cost different things on reset, and an approver
+        # who raised the ceiling must not lose it to a generic "run reset".
+        if state["unit"] == LEGACY_BUDGET_UNIT:
+            consequence = (
+                f"That reset also returns the limit to the {DEFAULT_TOKEN_BUDGET} "
+                "default, because a raw-token limit does not translate."
+            )
+            description = f"legacy raw-token unit `{state['unit']}`"
+        else:
+            consequence = "That reset keeps the current limit."
+            description = f"superseded unit `{state['unit']}`"
         message = (
-            f"Delegation budget: {state['used']}/{state['limit']} used under the superseded "
-            f"unit `{state['unit']}`. A named approver must run `delegation budget reset` "
-            "before further delegation."
+            f"Delegation budget: {state['used']}/{state['limit']} used under the "
+            f"{description}. A named approver must run `delegation budget reset` "
+            f"before further delegation. {consequence}"
         )
     else:
         message = (

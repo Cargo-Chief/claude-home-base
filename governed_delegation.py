@@ -29,8 +29,11 @@ SUPERSEDED_BUDGET_UNITS = ("generation_tokens_v1",)
 CODEX_GENERATION_FACTOR = 2.5
 MIN_CODEX_GENERATION_FACTOR = 1.0
 # The maximum equals the default so an override can only narrow the grant: a
-# higher factor would raise the per-call ceiling and shrink the charge at once,
-# widening an approver-gated thread budget without an anomalous audit line.
+# higher factor raises the per-call ceiling and shrinks the charge at once, and
+# an environment override is process-local and unreviewed. Widening an
+# approver-gated thread budget has to go through the PR gate that reviews this
+# constant. Every launch records GENERATION_FACTOR, so a raised constant is
+# visible in the audit; what the bound protects is the review, not visibility.
 MAX_CODEX_GENERATION_FACTOR = CODEX_GENERATION_FACTOR
 USAGE_RECEIPT_SCHEMA = "cargo-chief/delegation-usage-receipt/v1"
 DEFAULT_DELEGATE_TIMEOUT = 1_800
@@ -111,18 +114,40 @@ def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
     return factor
 
 
-def _provider_call_limit(
-    planned_tokens: int, provider: str, env: Mapping[str, str] = os.environ
-) -> int:
-    """Scale a Claude-equivalent stage allocation up into provider generated tokens."""
+def budget_unit_reset_refusal(unit: str) -> str:
+    """Name the reset a stale budget file needs, and what that reset costs.
+
+    A superseded generation unit and the legacy raw-token unit both refuse until
+    a named approver resets, but they do not cost the same: only the raw-token
+    reset discards an approver-set limit, and an approver must not lose a raised
+    ceiling to a message that read as routine.
+    """
+    if unit == LEGACY_BUDGET_UNIT:
+        return (
+            f"delegation budget under the legacy raw-token unit `{unit}` must be "
+            "reset by a named approver; the reset discards `used` and also returns "
+            f"the limit to the {DEFAULT_TOKEN_BUDGET} default, because a raw-token "
+            "limit does not translate"
+        )
+
+    return (
+        f"delegation budget under the superseded unit `{unit}` must be reset by a "
+        "named approver; the reset discards `used` and keeps the current limit"
+    )
+
+
+def _provider_call_limit(planned_tokens: int, provider: str, factor: float) -> int:
+    """Scale a Claude-equivalent stage allocation up into provider generated tokens.
+
+    The factor is passed in, never re-read here, so the recorded
+    `GENERATION_FACTOR` is provably the one that produced the charge.
+    """
     if provider != "openai":
         return planned_tokens
-    return math.ceil(planned_tokens * codex_generation_factor(env))
+    return math.ceil(planned_tokens * factor)
 
 
-def _normalized_charge(
-    tokens: int, provider: str, env: Mapping[str, str] = os.environ
-) -> int:
+def _normalized_charge(tokens: int, provider: str, factor: float) -> int:
     """Normalize provider generated tokens back into the Claude-equivalent budget unit."""
     if provider != "openai":
         return tokens
@@ -130,7 +155,7 @@ def _normalized_charge(
         return 0
     # Every permitted factor is finite and >= 1.0, so ceil(tokens / factor) is
     # already at least 1 once the tokens < 1 case above has been handled.
-    return math.ceil(tokens / codex_generation_factor(env))
+    return math.ceil(tokens / factor)
 
 
 @dataclass(frozen=True)
@@ -412,17 +437,17 @@ def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, 
             if not reset:
                 raise
             state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
-        migrating_legacy_unit = state["unit"] != BUDGET_UNIT
+        # Only "the stored unit is not the current unit" — true for a superseded
+        # generation unit as well as for the raw-token file, which is why it must
+        # not be conflated with the raw-token-specific limit rule below.
+        migrating_unit = state["unit"] != BUDGET_UNIT
         # A superseded generation unit counted the same kind of token, so its
         # approver-set limit is still meaningful; a raw-token limit is not.
         migrating_raw_token_limit = state["unit"] == LEGACY_BUDGET_UNIT
         current_limit = state["limit"]
         current_used = state["used"]
-        if migrating_legacy_unit and not reset:
-            raise DelegationError(
-                f"delegation budget under the superseded unit `{state['unit']}` "
-                "must be reset by a named approver"
-            )
+        if migrating_unit and not reset:
+            raise DelegationError(budget_unit_reset_refusal(state["unit"]))
         state = {
             # A unit migration always discards `used`, whose value cannot be
             # reinterpreted, but preserves an approver-set generation-token limit.
@@ -782,6 +807,11 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     if any(not env.get(key) for key in required):
         raise DelegationError("governed delegation environment is incomplete")
     timeout = delegate_timeout_from_env(env)
+    # Validated before anything one-shot is consumed, and independently of the
+    # thread's provider: a malformed override is an environment misconfiguration,
+    # and refusing it only on an openai thread would destroy the request file and
+    # the implementation claim over a value the environment already got wrong.
+    configured_factor = codex_generation_factor(env)
     root = Path(env["CARGO_CHIEF_ROOT"]).resolve()
     request = load_request(Path(env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"]))
     request_id = delegation_request_id(request)
@@ -800,10 +830,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     budget_file = Path(env["CARGO_CHIEF_DELEGATION_BUDGET_FILE"])
     before = budget_status(budget_file)
     if before["unit"] != BUDGET_UNIT:
-        raise DelegationError(
-            f"delegation budget under the superseded unit `{before['unit']}` "
-            "must be reset by a named approver"
-        )
+        raise DelegationError(budget_unit_reset_refusal(before["unit"]))
     if before["used"] >= before["limit"]:
         raise DelegationError("thread delegation budget is exhausted")
     remaining_tokens = before["limit"] - before["used"]
@@ -811,10 +838,14 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         raise DelegationError(
             "planned delegation does not fit the remaining generation-token budget"
         )
-    # Record the factor that produced this launch's charge so two launches under
-    # different factors are never mistaken for one accumulated currency.
-    generation_factor = codex_generation_factor(env) if provider == "openai" else 1.0
-    call_token_limit = _provider_call_limit(request.planned_tokens, provider, env)
+    # One validated factor is threaded into both the ceiling and the charge, so
+    # the recorded GENERATION_FACTOR is the applied divisor rather than a
+    # parallel recomputation, and two launches under different factors are never
+    # mistaken for one accumulated currency.
+    generation_factor = configured_factor if provider == "openai" else 1.0
+    call_token_limit = _provider_call_limit(
+        request.planned_tokens, provider, generation_factor
+    )
     prompt = (
         "You are a governed Cargo Chief delegate. Perform only the supplied bounded task. "
         "Do not delegate again, access credentials, touch production, commit, push, or widen scope. "
@@ -852,7 +883,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
             timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
-    budget_tokens = _normalized_charge(result.tokens, provider, env)
+    budget_tokens = _normalized_charge(result.tokens, provider, generation_factor)
     state = update_budget(budget_file, add_tokens=budget_tokens)
     thread_exhausted = state["used"] >= state["limit"]
     allocation_exhausted = result.budget_exhausted and not thread_exhausted
@@ -966,6 +997,18 @@ def verify_from_environment(env: Mapping[str, str] | None = None) -> int:
             )
         if metadata.get("status") != "pending":
             raise DelegationError("thread delegation budget must be reset by a named approver")
+        if metadata.get("budget_unit") in SUPERSEDED_BUDGET_UNITS:
+            # A pending marker is a durable gate that survives owner restarts, so
+            # one written under a superseded unit would otherwise mute the thread
+            # forever with no approver command to clear it. Consume it and say
+            # what has to happen instead; no receipt is emitted for spend that
+            # cannot be verified under the current unit.
+            marker.unlink()
+            raise DelegationError(
+                "pending delegate verification predates the current budget unit "
+                f"`{BUDGET_UNIT}`; its delegate return cannot be verified and the "
+                "stage must be re-run"
+            )
         tokens = metadata.get("tokens")
         request_id = metadata.get("request_id")
         if (
