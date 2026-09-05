@@ -38,7 +38,8 @@ class _Process:
         self.returncode = -9
 
 
-def _events(total, *, status="completed", text="evidence"):
+def _events(total, *, output=None, status="completed", text="evidence"):
+    output = total if output is None else output
     return [
         {"jsonrpc": "2.0", "id": 1, "result": {}},
         {"jsonrpc": "2.0", "id": 2,
@@ -47,7 +48,9 @@ def _events(total, *, status="completed", text="evidence"):
         {"jsonrpc": "2.0", "method": "item/completed",
          "params": {"item": {"type": "agentMessage", "text": text}}},
         {"jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
-         "params": {"tokenUsage": {"total": {"totalTokens": total}}}},
+         "params": {"tokenUsage": {"total": {
+             "totalTokens": total, "outputTokens": output,
+         }}}},
         {"jsonrpc": "2.0", "method": "turn/completed",
          "params": {"turn": {"status": status}}},
     ]
@@ -56,7 +59,7 @@ def _events(total, *, status="completed", text="evidence"):
 class CodexDelegationTest(unittest.TestCase):
     @patch("codex_delegation.subprocess.Popen")
     def test_completed_turn_returns_text_and_incremental_usage(self, popen):
-        process = _Process(_events(40))
+        process = _Process(_events(400, output=40))
         popen.return_value = process
         seen = []
 
@@ -68,6 +71,7 @@ class CodexDelegationTest(unittest.TestCase):
 
         self.assertEqual(["evidence"], result.texts)
         self.assertEqual(40, result.tokens)
+        self.assertEqual(400, result.raw_tokens)
         self.assertFalse(result.budget_exhausted)
         sent = [json.loads(line) for line in process.stdin.value.splitlines()]
         thread_start = next(item for item in sent if item.get("method") == "thread/start")
@@ -79,7 +83,7 @@ class CodexDelegationTest(unittest.TestCase):
 
     @patch("codex_delegation.subprocess.Popen")
     def test_crossing_limit_interrupts_and_withholds_text(self, popen):
-        process = _Process(_events(51, status="interrupted", text="must not surface"))
+        process = _Process(_events(510, output=51, status="interrupted", text="must not surface"))
         popen.return_value = process
 
         result = run_codex_delegate(
@@ -91,15 +95,18 @@ class CodexDelegationTest(unittest.TestCase):
         self.assertTrue(result.budget_exhausted)
         self.assertEqual([], result.texts)
         self.assertEqual(51, result.tokens)
+        self.assertEqual(510, result.raw_tokens)
         sent = [json.loads(line) for line in process.stdin.value.splitlines()]
         self.assertTrue(any(item.get("method") == "turn/interrupt" for item in sent))
 
     @patch("codex_delegation.subprocess.Popen")
     def test_non_monotonic_usage_fails_closed(self, popen):
-        events = _events(40)[:-1]
+        events = _events(400, output=40)[:-1]
         events.append({
             "jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
-            "params": {"tokenUsage": {"total": {"totalTokens": 39}}},
+            "params": {"tokenUsage": {"total": {
+                "totalTokens": 399, "outputTokens": 39,
+            }}},
         })
         popen.return_value = _Process(events)
 
@@ -112,6 +119,21 @@ class CodexDelegationTest(unittest.TestCase):
         self.assertEqual("Codex delegate usage was invalid", result.error)
         self.assertEqual([], result.texts)
         self.assertEqual(40, result.tokens)
+        self.assertEqual(400, result.raw_tokens)
+
+    @patch("codex_delegation.subprocess.Popen")
+    def test_large_cached_context_does_not_exhaust_generation_budget(self, popen):
+        popen.return_value = _Process(_events(1_125_414, output=31_203))
+
+        result = run_codex_delegate(
+            ["codex", "app-server", "--stdio"], "work", cwd="/work", env={},
+            model="gpt-5.6-sol", effort="medium", read_only=True,
+            token_limit=250_000, timeout=10, on_process=lambda _value: None,
+        )
+
+        self.assertEqual(31_203, result.tokens)
+        self.assertEqual(1_125_414, result.raw_tokens)
+        self.assertFalse(result.budget_exhausted)
 
 
 if __name__ == "__main__":

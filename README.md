@@ -88,10 +88,16 @@ Delegation is pinned by the harness rather than inherited from a machine default
 calls and Codex multi-agent are disabled; both providers use the same one-shot governed launcher.
 Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,
 mechanical, and explore tiers route to the approved provider-equivalent model and effort. Every
-thread has a persistent 250,000 delegated-token ceiling; only a named approver can inspect, reset,
-or change it, and bare `stop` terminates an active delegate. Audit records contain routing,
-plan-gate, aggregate usage, duration, and outcome metadata only. Delegated prompts, tool inputs,
-file paths, and response content are never retained or logged.
+thread has a persistent 250,000 generated/reasoning-token ceiling; only a named approver can inspect,
+reset, or change it, and bare `stop` terminates an active delegate. Input and prompt-cache usage is
+recorded separately as raw audit metadata, so it remains visible without being charged as newly
+generated reasoning. Audit records contain routing, plan-gate, aggregate usage, duration, and
+outcome metadata only. Delegated prompts, tool inputs, file paths, and response content are never
+retained or logged.
+
+Budget state includes `unit: generation_tokens_v1`. A two-field budget file from the former raw-
+token accounting remains readable for status, but delegation refuses until a named approver runs
+`delegation budget reset`; the old `used` value is never reinterpreted under the new unit.
 
 Every request declares `mutation` explicitly. A mutating request at any capable tier requires the
 implementation plan claim. A non-mutating request runs with read-only provider tools; Explore can

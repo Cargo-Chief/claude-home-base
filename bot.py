@@ -96,6 +96,8 @@ from provider_control import (
 from reply_routing import ReplyRouteStore
 from session_lifecycle import TurnAdmission, oldest_evictable_session, stop_timed_out_session
 from governed_delegation import (
+    BUDGET_UNIT,
+    DelegationError,
     consume_budget_exhaustion,
     budget_status,
     delegation_audit_path,
@@ -2559,22 +2561,33 @@ def _maybe_delegation_budget_command(event: dict) -> bool:
             state = update_budget(
                 workspace.delegation_budget_file, limit=limit
             )
-    except (SafetyError, ValueError, OSError) as exc:
+    except (DelegationError, SafetyError, ValueError, OSError) as exc:
         slack_client.chat_postMessage(
             channel=event.get("channel"),
             thread_ts=event.get("thread_ts") or event.get("ts"),
             text=f"Delegation budget refused: {exc}",
         )
         return True
+    if state["unit"] != BUDGET_UNIT:
+        message = (
+            f"Delegation budget: {state['used']}/{state['limit']} legacy raw tokens used. "
+            "A named approver must run `delegation budget reset` before further delegation."
+        )
+    else:
+        message = (
+            f"Delegation budget: {state['used']}/{state['limit']} "
+            "generation tokens used"
+        )
     slack_client.chat_postMessage(
         channel=event.get("channel"),
         thread_ts=event.get("thread_ts") or event.get("ts"),
-        text=f"Delegation budget: {state['used']}/{state['limit']} tokens used",
+        text=message,
     )
     audit_logger.info(format_audit_metadata(
         "DELEGATION_BUDGET", user=user_id, channel=event.get("channel", ""),
         thread=event.get("thread_ts") or event.get("ts") or "unknown",
         action=action.split()[0], used=state["used"], limit=state["limit"],
+        unit=state["unit"],
     ))
     return True
 

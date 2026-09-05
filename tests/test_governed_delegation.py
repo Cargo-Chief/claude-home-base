@@ -11,7 +11,9 @@ from codex_delegation import CodexDelegateResult
 
 from governed_delegation import (
     _append_audit,
+    BUDGET_UNIT,
     DEFAULT_TOKEN_BUDGET,
+    LEGACY_BUDGET_UNIT,
     DelegationError,
     ROUTES,
     budget_status,
@@ -198,24 +200,60 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertEqual("bounded", load_request(request).tier)
         self.assertFalse(request.exists())
 
+        request.write_text(json.dumps({
+            "tier": "bounded", "prompt": "compact stage", "mutation": False,
+            "budget_unit": BUDGET_UNIT, "planned_tokens": 45_000,
+        }))
+        parsed = load_request(request)
+        self.assertEqual(BUDGET_UNIT, parsed.budget_unit)
+        self.assertEqual(45_000, parsed.planned_tokens)
+        self.assertFalse(request.exists())
+
         request.write_text(json.dumps({"tier": "explore", "prompt": "x", "mutation": True}))
         with self.assertRaisesRegex(DelegationError, "must remain read-only"):
             load_request(request)
         self.assertFalse(request.exists())
 
         request.write_text(json.dumps({"tier": "bounded", "prompt": "x", "mutation": False, "extra": True}))
-        with self.assertRaisesRegex(DelegationError, "only tier, prompt, and mutation"):
+        with self.assertRaisesRegex(DelegationError, "unsupported keys"):
+            load_request(request)
+        self.assertFalse(request.exists())
+
+        request.write_text(json.dumps({
+            "tier": "bounded", "prompt": "x", "mutation": False,
+            "budget_unit": "raw_tokens", "planned_tokens": 45_000,
+        }))
+        with self.assertRaisesRegex(DelegationError, "budget contract is invalid"):
             load_request(request)
         self.assertFalse(request.exists())
 
     def test_budget_persists_reset_and_limit(self):
         path = self.work / "budget.json"
         self.assertEqual(
-            {"limit": DEFAULT_TOKEN_BUDGET, "used": 0}, budget_status(path)
+            {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT},
+            budget_status(path),
         )
+        self.assertEqual(BUDGET_UNIT, json.loads(path.read_text())["unit"])
         self.assertEqual(12, update_budget(path, add_tokens=12)["used"])
         self.assertEqual(99, update_budget(path, limit=99)["limit"])
-        self.assertEqual(0, update_budget(path, reset=True)["used"])
+        reset = update_budget(path, reset=True)
+        self.assertEqual(0, reset["used"])
+        self.assertEqual(BUDGET_UNIT, reset["unit"])
+
+    def test_legacy_raw_budget_requires_named_approver_reset(self):
+        path = self.work / "budget.json"
+        path.write_text('{"limit":250000,"used":1125414}\n', encoding="utf-8")
+        state = budget_status(path)
+        self.assertEqual(LEGACY_BUDGET_UNIT, state["unit"])
+        with self.assertRaisesRegex(DelegationError, "must be reset"):
+            update_budget(path, add_tokens=1)
+        with self.assertRaisesRegex(DelegationError, "must be reset"):
+            update_budget(path, limit=300_000)
+        reset = update_budget(path, reset=True)
+        self.assertEqual(
+            {"limit": 250_000, "used": 0, "unit": BUDGET_UNIT}, reset
+        )
+        self.assertEqual(reset, json.loads(path.read_text(encoding="utf-8")))
 
     def test_exact_provider_routes(self):
         self.assertEqual(("claude-opus-5[1m]", "medium"), ROUTES["implementation"]["claude"])
@@ -230,7 +268,9 @@ class GovernedDelegationTest(unittest.TestCase):
         process = _StreamProcess([
             json.dumps({
                 "type": "assistant",
-                "message": {"id": "m1", "usage": {"input_tokens": 8, "output_tokens": 2},
+                "message": {"id": "m1", "usage": {
+                    "input_tokens": 8, "cache_read_input_tokens": 1_000, "output_tokens": 2,
+                },
                             "content": [{"type": "text", "text": "evidence"}]},
             }) + "\n",
             json.dumps({"type": "result", "result": "evidence"}) + "\n",
@@ -243,7 +283,8 @@ class GovernedDelegationTest(unittest.TestCase):
             on_process=lambda value: seen.append(value),
         )
         self.assertEqual("evidence", result.text)
-        self.assertEqual(10, result.tokens)
+        self.assertEqual(2, result.tokens)
+        self.assertEqual(1_010, result.raw_tokens)
         self.assertEqual("private prompt", process.stdin.value)
         self.assertNotIn("private prompt", popen.call_args.args[0])
         self.assertEqual([process, None], seen)
@@ -253,7 +294,7 @@ class GovernedDelegationTest(unittest.TestCase):
         process = _StreamProcess([
             json.dumps({
                 "type": "assistant",
-                "message": {"id": "m1", "usage": {"input_tokens": 8, "output_tokens": 3},
+                "message": {"id": "m1", "usage": {"input_tokens": 8, "output_tokens": 11},
                             "content": [{"type": "tool_use", "name": "Write"}]},
             }) + "\n",
             json.dumps({"type": "result", "result": "must not surface"}) + "\n",
@@ -267,6 +308,7 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertTrue(result.budget_exhausted)
         self.assertEqual("", result.text)
         self.assertEqual(11, result.tokens)
+        self.assertEqual(19, result.raw_tokens)
         self.assertEqual(-9, process.returncode)
 
     @patch("governed_delegation.subprocess.Popen")
@@ -293,7 +335,35 @@ class GovernedDelegationTest(unittest.TestCase):
             on_process=lambda _value: None,
         )
         self.assertEqual("done", result.text)
-        self.assertEqual(16, result.tokens)
+        self.assertEqual(3, result.tokens)
+        self.assertEqual(16, result.raw_tokens)
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_cache_reads_do_not_exhaust_generation_budget(self, popen):
+        process = _StreamProcess([
+            json.dumps({
+                "type": "assistant",
+                "message": {"id": "m1", "usage": {
+                    "input_tokens": 22,
+                    "cache_creation_input_tokens": 119_658,
+                    "cache_read_input_tokens": 974_531,
+                    "output_tokens": 31_203,
+                }, "content": []},
+            }) + "\n",
+            json.dumps({"type": "result", "result": "review evidence"}) + "\n",
+        ])
+        popen.return_value = process
+
+        result = run_claude_delegate(
+            ["claude", "-p", "--output-format", "stream-json"], "work",
+            cwd=str(self.work), env={}, token_limit=250_000, timeout=10,
+            on_process=lambda _value: None,
+        )
+
+        self.assertEqual("review evidence", result.text)
+        self.assertEqual(31_203, result.tokens)
+        self.assertEqual(1_125_414, result.raw_tokens)
+        self.assertFalse(result.budget_exhausted)
 
     def test_refuses_concurrent_delegate_before_consuming_request(self):
         request = self.work / "delegation-request.json"
@@ -310,7 +380,9 @@ class GovernedDelegationTest(unittest.TestCase):
 
     @patch("governed_delegation.run_codex_delegate")
     def test_openai_launch_records_budget_and_content_free_audit(self, run):
-        run.return_value = CodexDelegateResult(texts=["delegate evidence"], tokens=35)
+        run.return_value = CodexDelegateResult(
+            texts=["delegate evidence"], tokens=35, raw_tokens=3_500,
+        )
         request = self.work / "delegation-request.json"
         request.write_text(json.dumps({"tier": "bounded", "prompt": "private brief", "mutation": False}))
         budget = self.work / "budget.json"
@@ -337,7 +409,9 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertEqual(75, budget_status(budget)["used"])
         audit = (self.work / "audit.log").read_text()
         self.assertIn("MODEL:gpt-5.6-sol", audit)
-        self.assertIn("TOKENS:35", audit)
+        self.assertIn("BUDGET_UNIT:generation_tokens_v1", audit)
+        self.assertIn("BUDGET_TOKENS:35", audit)
+        self.assertIn("RAW_TOKENS:3500", audit)
         self.assertNotIn("private brief", audit)
         self.assertNotIn("delegate evidence", audit)
         self.assertTrue(run.call_args.kwargs["read_only"])
