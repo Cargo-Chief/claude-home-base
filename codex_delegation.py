@@ -15,6 +15,7 @@ from typing import Callable, Mapping
 class CodexDelegateResult:
     texts: list[str] = field(default_factory=list)
     tokens: int = 0
+    raw_tokens: int = 0
     error: str | None = None
     budget_exhausted: bool = False
 
@@ -46,6 +47,7 @@ def run_codex_delegate(
     turn_id = None
     texts: list[str] = []
     tokens = 0
+    raw_tokens = 0
     exhausted = False
     completed = False
     deadline = time.monotonic() + timeout
@@ -117,16 +119,25 @@ def run_codex_delegate(
                     texts.append(item["text"].strip())
             elif method == "thread/tokenUsage/updated":
                 try:
-                    observed = event["params"]["tokenUsage"]["total"]["totalTokens"]
+                    total = event["params"]["tokenUsage"]["total"]
+                    observed = total["outputTokens"]
+                    observed_raw = total["totalTokens"]
                 except (KeyError, TypeError):
                     return CodexDelegateResult(
-                        tokens=tokens, error="Codex delegate usage was invalid",
+                        tokens=tokens, raw_tokens=raw_tokens,
+                        error="Codex delegate usage was invalid",
                     )
-                if not isinstance(observed, int) or observed < tokens:
+                if (
+                    isinstance(observed, bool) or not isinstance(observed, int)
+                    or isinstance(observed_raw, bool) or not isinstance(observed_raw, int)
+                    or observed < tokens or observed_raw < raw_tokens or observed_raw < observed
+                ):
                     return CodexDelegateResult(
-                        tokens=tokens, error="Codex delegate usage was invalid",
+                        tokens=tokens, raw_tokens=raw_tokens,
+                        error="Codex delegate usage was invalid",
                     )
                 tokens = observed
+                raw_tokens = observed_raw
                 if tokens >= token_limit and not exhausted:
                     exhausted = True
                     texts.clear()
@@ -139,7 +150,8 @@ def run_codex_delegate(
                 status = ((event.get("params") or {}).get("turn") or {}).get("status")
                 if status not in {"completed", "interrupted" if exhausted else "completed"}:
                     return CodexDelegateResult(
-                        tokens=tokens, error="Codex delegate turn failed",
+                        tokens=tokens, raw_tokens=raw_tokens,
+                        error="Codex delegate turn failed",
                     )
                 completed = True
             elif event_id is not None and method:
@@ -148,18 +160,32 @@ def run_codex_delegate(
                     "error": {"code": -32601, "message": "unsupported governed request"},
                 })
         if not completed and not exhausted:
-            return CodexDelegateResult(error="Codex delegate ended without completion")
+            return CodexDelegateResult(
+                tokens=tokens, raw_tokens=raw_tokens,
+                error="Codex delegate ended without completion",
+            )
         if tokens < 1:
-            return CodexDelegateResult(error="Codex delegate returned no usage")
+            return CodexDelegateResult(
+                raw_tokens=raw_tokens, error="Codex delegate returned no usage",
+            )
         if exhausted:
-            return CodexDelegateResult(tokens=tokens, budget_exhausted=True)
-        return CodexDelegateResult(texts=[text for text in texts if text], tokens=tokens)
+            return CodexDelegateResult(
+                tokens=tokens, raw_tokens=raw_tokens, budget_exhausted=True,
+            )
+        return CodexDelegateResult(
+            texts=[text for text in texts if text], tokens=tokens, raw_tokens=raw_tokens,
+        )
     except TimeoutError:
         if process:
             process.kill()
-        return CodexDelegateResult(tokens=tokens, error="Codex delegate timed out")
+        return CodexDelegateResult(
+            tokens=tokens, raw_tokens=raw_tokens, error="Codex delegate timed out",
+        )
     except OSError:
-        return CodexDelegateResult(tokens=tokens, error="Codex delegate could not start")
+        return CodexDelegateResult(
+            tokens=tokens, raw_tokens=raw_tokens,
+            error="Codex delegate could not start",
+        )
     finally:
         if process:
             if process.poll() is None:

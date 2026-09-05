@@ -88,10 +88,28 @@ Delegation is pinned by the harness rather than inherited from a machine default
 calls and Codex multi-agent are disabled; both providers use the same one-shot governed launcher.
 Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,
 mechanical, and explore tiers route to the approved provider-equivalent model and effort. Every
-thread has a persistent 250,000 delegated-token ceiling; only a named approver can inspect, reset,
-or change it, and bare `stop` terminates an active delegate. Audit records contain routing,
-plan-gate, aggregate usage, duration, and outcome metadata only. Delegated prompts, tool inputs,
-file paths, and response content are never retained or logged.
+thread has a persistent 250,000 generated/reasoning-token ceiling; only a named approver can inspect,
+reset, or change it, and bare `stop` terminates an active delegate. Input and prompt-cache usage is
+recorded separately as raw audit metadata, so it remains visible without being charged as newly
+generated reasoning. Audit records contain routing, plan-gate, aggregate usage, duration, and
+outcome metadata only. Delegated prompts, tool inputs, file paths, and response content are never
+retained or logged.
+
+Budget state includes `unit: generation_tokens_v1`. A two-field budget file from the former raw-
+token accounting remains readable for status, but delegation refuses until a named approver runs
+`delegation budget reset`; the old `used` value is never reinterpreted under the new unit.
+Every request declares `budget_unit: generation_tokens_v1` and a positive `planned_tokens` call
+ceiling. Coordinator-backed requests copy those values from their dispatch contract. Reaching the
+stage allocation withholds the partial return but leaves the thread available to its owner; only
+exhausting the thread ceiling creates the reset-gated exhaustion state.
+Successful owner verification emits a content-free, versioned usage receipt with the budget unit
+and actual generated-token count. Coordinators consume that receipt instead of estimating usage or
+reading the private audit log.
+
+The receipt is a correlation and integrity contract between cooperating processes under one Unix
+principal, not a cryptographic attestation against that principal. A security boundary against a
+hostile or prompt-injected owner would require OS-level privilege separation for the launcher and
+its metering state; the current same-principal harness does not claim that property.
 
 Every request declares `mutation` explicitly. A mutating request at any capable tier requires the
 implementation plan claim. A non-mutating request runs with read-only provider tools; Explore can
