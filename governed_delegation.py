@@ -29,8 +29,11 @@ SUPERSEDED_BUDGET_UNITS = ("generation_tokens_v1",)
 CODEX_GENERATION_FACTOR = 2.5
 MIN_CODEX_GENERATION_FACTOR = 1.0
 # The maximum equals the default so an override can only narrow the grant: a
-# higher factor would raise the per-call ceiling and shrink the charge at once,
-# widening an approver-gated thread budget without an anomalous audit line.
+# higher factor raises the per-call ceiling and shrinks the charge at once, and
+# an environment override is process-local and unreviewed. Widening an
+# approver-gated thread budget has to go through the PR gate that reviews this
+# constant. Every launch records GENERATION_FACTOR, so a raised constant is
+# visible in the audit; what the bound protects is the review, not visibility.
 MAX_CODEX_GENERATION_FACTOR = CODEX_GENERATION_FACTOR
 USAGE_RECEIPT_SCHEMA = "cargo-chief/delegation-usage-receipt/v1"
 DEFAULT_DELEGATE_TIMEOUT = 1_800
@@ -86,6 +89,23 @@ def delegate_timeout_from_env(env: Mapping[str, str] = os.environ) -> int:
     return timeout
 
 
+def _generation_factor_fault(detail: str) -> DelegationError:
+    """Describe a bad generation factor as the host-level fault that it is.
+
+    The value is read on every launch on both providers, so one bad export stops
+    delegation for every thread on this host. The principal who happens to hit
+    it first did nothing to cause it and cannot fix it from the thread, so the
+    message has to read as a host configuration fault rather than as a refusal
+    of what they asked for.
+    """
+    return DelegationError(
+        "delegation is stopped by a host configuration fault: "
+        f"CARGO_CHIEF_CODEX_GENERATION_FACTOR {detail}. That variable is read on "
+        "every launch on both providers, so this affects every thread on this "
+        "host until an operator corrects or unsets it"
+    )
+
+
 def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
     """Read the Codex-to-Claude generation ratio, failing closed on any bad value."""
     value = env.get(
@@ -97,40 +117,103 @@ def codex_generation_factor(env: Mapping[str, str] = os.environ) -> float:
     try:
         factor = float(value)
     except (TypeError, ValueError) as exc:
-        raise DelegationError(
-            f"CARGO_CHIEF_CODEX_GENERATION_FACTOR must be a number {bounds}"
-        ) from exc
+        raise _generation_factor_fault(f"must be a number {bounds}") from exc
     if (
         not math.isfinite(factor)
         or factor < MIN_CODEX_GENERATION_FACTOR
         or factor > MAX_CODEX_GENERATION_FACTOR
     ):
-        raise DelegationError(
-            f"CARGO_CHIEF_CODEX_GENERATION_FACTOR must be {bounds}"
-        )
+        raise _generation_factor_fault(f"must be {bounds}")
     return factor
 
 
-def _provider_call_limit(
-    planned_tokens: int, provider: str, env: Mapping[str, str] = os.environ
-) -> int:
-    """Scale a Claude-equivalent stage allocation up into provider generated tokens."""
+def budget_unit_reset_refusal(unit: str) -> str:
+    """Name the reset a stale budget file needs, and what that reset costs.
+
+    A superseded generation unit and the legacy raw-token unit both refuse until
+    a named approver resets, but they do not cost the same: only the raw-token
+    reset discards an approver-set limit, and an approver must not lose a raised
+    ceiling to a message that read as routine.
+    """
+    if unit == LEGACY_BUDGET_UNIT:
+        return (
+            f"delegation budget under the legacy raw-token unit `{unit}` must be "
+            "reset by a named approver; the reset discards `used` and also returns "
+            f"the limit to the {DEFAULT_TOKEN_BUDGET} default, because a raw-token "
+            "limit does not translate"
+        )
+
+    return (
+        f"delegation budget under the superseded unit `{unit}` must be reset by a "
+        "named approver; the reset discards `used` and keeps the current limit"
+    )
+
+
+def _checked_factor(factor: float) -> float:
+    """Re-establish the bounds the factor used to carry by construction.
+
+    Taking the factor as an argument is what makes the recorded
+    `GENERATION_FACTOR` provably the applied divisor, but it also turned
+    "finite and within [MIN, MAX]" from a guarantee into a calling convention.
+    An unchecked 0.0 reaching the charge raises ZeroDivisionError, which the
+    launcher's DelegationError handler does not catch: it would exit with a
+    traceback after the delegate had already spent tokens and before the budget
+    was updated, so the spend would never be charged.
+    """
+    if (
+        isinstance(factor, bool)
+        or not isinstance(factor, (int, float))
+        or not math.isfinite(factor)
+        or factor < MIN_CODEX_GENERATION_FACTOR
+        or factor > MAX_CODEX_GENERATION_FACTOR
+    ):
+        raise _generation_factor_fault(
+            f"resolved to {factor!r}, which is not a number between "
+            f"{MIN_CODEX_GENERATION_FACTOR} and {MAX_CODEX_GENERATION_FACTOR}"
+        )
+    return float(factor)
+
+
+def verification_reset_refusal(unit: object) -> str:
+    """Name the approver recovery for a marker this launcher cannot verify.
+
+    Verification runs inside the owner's turn, and the owner's substantive
+    reply is withheld while the marker exists, so this refusal must not clear
+    it: consuming a pending marker from a tool call would unmute the very turn
+    whose delegate spend was never verified. The recovery is therefore an
+    approver command in the thread, outside any owner turn.
+    """
+    described = f"the unit `{unit}`" if isinstance(unit, str) and unit else "no budget unit"
+    return (
+        f"pending delegate verification records {described}, not the current "
+        f"`{BUDGET_UNIT}`; its delegate return cannot be verified here, so the "
+        "stage must be re-run after a named approver runs "
+        "`delegation verification reset`"
+    )
+
+
+def _provider_call_limit(planned_tokens: int, provider: str, factor: float) -> int:
+    """Scale a Claude-equivalent stage allocation up into provider generated tokens.
+
+    The factor is passed in, never re-read here, so the recorded
+    `GENERATION_FACTOR` is provably the one that produced the charge.
+    """
+    factor = _checked_factor(factor)
     if provider != "openai":
         return planned_tokens
-    return math.ceil(planned_tokens * codex_generation_factor(env))
+    return math.ceil(planned_tokens * factor)
 
 
-def _normalized_charge(
-    tokens: int, provider: str, env: Mapping[str, str] = os.environ
-) -> int:
+def _normalized_charge(tokens: int, provider: str, factor: float) -> int:
     """Normalize provider generated tokens back into the Claude-equivalent budget unit."""
+    factor = _checked_factor(factor)
     if provider != "openai":
         return tokens
     if tokens < 1:
         return 0
     # Every permitted factor is finite and >= 1.0, so ceil(tokens / factor) is
     # already at least 1 once the tokens < 1 case above has been handled.
-    return math.ceil(tokens / codex_generation_factor(env))
+    return math.ceil(tokens / factor)
 
 
 @dataclass(frozen=True)
@@ -412,17 +495,17 @@ def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, 
             if not reset:
                 raise
             state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
-        migrating_legacy_unit = state["unit"] != BUDGET_UNIT
+        # Only "the stored unit is not the current unit" — true for a superseded
+        # generation unit as well as for the raw-token file, which is why it must
+        # not be conflated with the raw-token-specific limit rule below.
+        migrating_unit = state["unit"] != BUDGET_UNIT
         # A superseded generation unit counted the same kind of token, so its
         # approver-set limit is still meaningful; a raw-token limit is not.
         migrating_raw_token_limit = state["unit"] == LEGACY_BUDGET_UNIT
         current_limit = state["limit"]
         current_used = state["used"]
-        if migrating_legacy_unit and not reset:
-            raise DelegationError(
-                f"delegation budget under the superseded unit `{state['unit']}` "
-                "must be reset by a named approver"
-            )
+        if migrating_unit and not reset:
+            raise DelegationError(budget_unit_reset_refusal(state["unit"]))
         state = {
             # A unit migration always discards `used`, whose value cannot be
             # reinterpreted, but preserves an approver-set generation-token limit.
@@ -683,6 +766,16 @@ def _append_audit(path: Path, fields: Mapping[str, object]) -> None:
         handle.write(time.strftime("%Y-%m-%d %H:%M:%S") + " | DELEGATION | " + safe + "\n")
 
 
+def append_delegation_audit(path: Path, fields: Mapping[str, object]) -> None:
+    """Append one content-free delegation audit row.
+
+    The public entry point for callers outside this module. Approver commands
+    record through here rather than through the Claude-session audit formatter,
+    whose fields describe a turn and do not accept a budget action.
+    """
+    _append_audit(path, fields)
+
+
 def delegation_audit_path(root: Path) -> Path:
     """Return the workspace-writable, operator-readable delegation audit log."""
     path = root.resolve() / "work" / "home-base" / "delegation-audit.log"
@@ -745,6 +838,127 @@ def consume_allocation_exhaustion(path: Path) -> bool:
         return True
 
 
+def _safe_marker_identifier(value: object) -> str | None:
+    """Return a marker identifier only when it is shaped like an identifier.
+
+    The audit stays content-free even if the marker was hand-written: anything
+    that is not a short identifier-shaped token is dropped rather than logged.
+    """
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.\[\]:-]{1,64}", value):
+        return value
+    return None
+
+
+def _safe_marker_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def discard_unverifiable_verification(
+    path: Path, audit_path: Path, *, user: str, channel: str, thread: str
+) -> dict:
+    """Clear only a delegation marker that cannot be verified under this unit.
+
+    A marker whose `budget_unit` is missing, superseded, or otherwise not the
+    current unit can never be consumed by verification, and the pending gate is
+    durable by design, so without this the thread stays muted forever. A marker
+    that *is* on the current unit is excluded deliberately: it is verifiable by
+    running the verification stage, so clearing it here would be a bypass of a
+    live gate rather than a recovery from a dead one.
+    """
+    with _verification_marker_lock(path):
+        status = _delegation_verification_status_unlocked(path)
+        if status is None:
+            raise DelegationError("no delegation verification marker exists")
+        # Read the unit under the same safety guard the status check applies. A
+        # marker that is a symlink, not a regular file, or oversized is exactly
+        # the kind verification already refuses, so it must stay discardable: an
+        # unguarded read here could return a current-unit value from a file the
+        # verifier will never accept, and refuse the only recovery there is.
+        metadata: Mapping[str, object] = {}
+        try:
+            if (
+                not path.is_symlink()
+                and path.is_file()
+                and path.stat().st_size <= 4096
+            ):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    metadata = loaded
+        except (OSError, json.JSONDecodeError, ValueError):
+            metadata = {}
+        if metadata.get("budget_unit") == BUDGET_UNIT:
+            raise DelegationError(
+                f"this delegation verification is on the current `{BUDGET_UNIT}` "
+                "unit and is verifiable, so it cannot be discarded; the owner "
+                "must run the verification stage, and an exhausted thread budget "
+                "is cleared with `delegation budget reset`"
+            )
+        discarded: dict[str, object] = {"status": status}
+        for key in ("tier", "model", "budget_unit", "request_id"):
+            identifier = _safe_marker_identifier(metadata.get(key))
+            if identifier is not None:
+                discarded[key] = identifier
+        for key in ("tokens", "provider_tokens", "raw_tokens", "generation_factor"):
+            number = _safe_marker_number(metadata.get(key))
+            if number is not None:
+                discarded[key] = number
+        # Audit before removing. The marker is the only place provider_tokens
+        # lives, so writing the row afterwards would let a failed append destroy
+        # the record it exists to preserve.
+        _append_audit(audit_path, _discard_audit_fields(
+            discarded, status, user, channel, thread, "verification_discarded",
+        ))
+        try:
+            path.unlink()
+        except OSError as unlink_error:
+            # unlink() on a directory raises IsADirectoryError on Linux and
+            # PermissionError on macOS, so branch on the path's state rather
+            # than on the exception type.
+            removed = False
+            if path.is_dir() and not path.is_symlink():
+                try:
+                    path.rmdir()
+                    removed = True
+                except OSError:
+                    removed = False
+            if not removed:
+                _append_audit(audit_path, _discard_audit_fields(
+                    discarded, status, user, channel, thread,
+                    "verification_discard_failed",
+                ))
+                raise DelegationError(
+                    "delegation verification marker could not be cleared; an "
+                    "operator must remove it"
+                ) from unlink_error
+    return discarded
+
+
+def _discard_audit_fields(
+    discarded: Mapping[str, object], status: str,
+    user: str, channel: str, thread: str, outcome: str,
+) -> dict[str, object]:
+    """Build the content-free audit row for a verification discard."""
+    return {
+        "USER": user,
+        "CHANNEL": channel,
+        "THREAD": thread,
+        "TIER": discarded.get("tier", "unknown"),
+        "MODEL": discarded.get("model", "unknown"),
+        "MARKER_STATUS": status,
+        "BUDGET_UNIT": discarded.get("budget_unit", "unrecorded"),
+        "REQUEST_ID": discarded.get("request_id", "unrecorded"),
+        "BUDGET_TOKENS": discarded.get("tokens", "unrecorded"),
+        "PROVIDER_TOKENS": discarded.get("provider_tokens", "unrecorded"),
+        "RAW_TOKENS": discarded.get("raw_tokens", "unrecorded"),
+        "GENERATION_FACTOR": discarded.get("generation_factor", "unrecorded"),
+        "STATUS": outcome,
+    }
+
+
 def prepare_owner_delegation_state(budget_path: Path, verification_path: Path) -> bool:
     """Initialize budget state and clear only a stale per-call allocation stop.
 
@@ -757,8 +971,10 @@ def prepare_owner_delegation_state(budget_path: Path, verification_path: Path) -
 
 
 def parse_budget_command(text: str) -> tuple[str, int | None] | None:
-    """Parse the two supported exact spellings of a delegation-budget command."""
+    """Parse the exact spellings of the approver-gated delegation commands."""
     normalized = re.sub(r"<@[A-Z0-9]+>", "", text).strip().lower()
+    if re.fullmatch(r"(?:delegation|delegate) verification reset", normalized):
+        return "verification reset", None
     match = re.fullmatch(
         r"(?:delegation|delegate) budget (status|reset|set\s+([1-9][0-9]{0,17}))",
         normalized,
@@ -782,6 +998,11 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     if any(not env.get(key) for key in required):
         raise DelegationError("governed delegation environment is incomplete")
     timeout = delegate_timeout_from_env(env)
+    # Validated before anything one-shot is consumed, and independently of the
+    # thread's provider: a malformed override is an environment misconfiguration,
+    # and refusing it only on an openai thread would destroy the request file and
+    # the implementation claim over a value the environment already got wrong.
+    configured_factor = codex_generation_factor(env)
     root = Path(env["CARGO_CHIEF_ROOT"]).resolve()
     request = load_request(Path(env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"]))
     request_id = delegation_request_id(request)
@@ -800,10 +1021,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     budget_file = Path(env["CARGO_CHIEF_DELEGATION_BUDGET_FILE"])
     before = budget_status(budget_file)
     if before["unit"] != BUDGET_UNIT:
-        raise DelegationError(
-            f"delegation budget under the superseded unit `{before['unit']}` "
-            "must be reset by a named approver"
-        )
+        raise DelegationError(budget_unit_reset_refusal(before["unit"]))
     if before["used"] >= before["limit"]:
         raise DelegationError("thread delegation budget is exhausted")
     remaining_tokens = before["limit"] - before["used"]
@@ -811,10 +1029,14 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         raise DelegationError(
             "planned delegation does not fit the remaining generation-token budget"
         )
-    # Record the factor that produced this launch's charge so two launches under
-    # different factors are never mistaken for one accumulated currency.
-    generation_factor = codex_generation_factor(env) if provider == "openai" else 1.0
-    call_token_limit = _provider_call_limit(request.planned_tokens, provider, env)
+    # One validated factor is threaded into both the ceiling and the charge, so
+    # the recorded GENERATION_FACTOR is the applied divisor rather than a
+    # parallel recomputation, and two launches under different factors are never
+    # mistaken for one accumulated currency.
+    generation_factor = configured_factor if provider == "openai" else 1.0
+    call_token_limit = _provider_call_limit(
+        request.planned_tokens, provider, generation_factor
+    )
     prompt = (
         "You are a governed Cargo Chief delegate. Perform only the supplied bounded task. "
         "Do not delegate again, access credentials, touch production, commit, push, or widen scope. "
@@ -852,7 +1074,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
             timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
-    budget_tokens = _normalized_charge(result.tokens, provider, env)
+    budget_tokens = _normalized_charge(result.tokens, provider, generation_factor)
     state = update_budget(budget_file, add_tokens=budget_tokens)
     thread_exhausted = state["used"] >= state["limit"]
     allocation_exhausted = result.budget_exhausted and not thread_exhausted
@@ -966,11 +1188,17 @@ def verify_from_environment(env: Mapping[str, str] | None = None) -> int:
             )
         if metadata.get("status") != "pending":
             raise DelegationError("thread delegation budget must be reset by a named approver")
+        if metadata.get("budget_unit") != BUDGET_UNIT:
+            # Refuse without consuming. This runs inside the owner's turn, and
+            # bot.py withholds that turn's assistant text while the marker
+            # exists, so unlinking here would release delegate text whose spend
+            # was never verified. Clearing a marker that can never be verified
+            # is an approver command instead: `delegation verification reset`.
+            raise DelegationError(verification_reset_refusal(metadata.get("budget_unit")))
         tokens = metadata.get("tokens")
         request_id = metadata.get("request_id")
         if (
-            metadata.get("budget_unit") != BUDGET_UNIT
-            or isinstance(tokens, bool)
+            isinstance(tokens, bool)
             or not isinstance(tokens, int)
             or tokens < 1
             or not isinstance(request_id, str)

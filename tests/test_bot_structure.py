@@ -1,6 +1,12 @@
 import ast
+import inspect
 from pathlib import Path
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).parents[1]))
+
+from cargo_chief_safety import format_audit_metadata
 
 
 class BotTurnStructureTest(unittest.TestCase):
@@ -71,6 +77,31 @@ class BotTurnStructureTest(unittest.TestCase):
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertIn("_send_to_claude", calls)
         self.assertIn("wait_for_turn_completion", calls)
+
+    def test_audit_calls_match_the_formatter_signature(self):
+        # A budget-command audit row was calling format_audit_metadata with
+        # action/used/limit/unit and no message_length, so every approver
+        # command raised TypeError after posting its Slack confirmation --
+        # outside the handler's except, and with no test covering the call.
+        # Delegation rows belong on append_delegation_audit instead.
+        accepted = set(inspect.signature(format_audit_metadata).parameters)
+        tree = ast.parse(
+            (Path(__file__).parents[1] / "bot.py").read_text(encoding="utf-8")
+        )
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name != "format_audit_metadata":
+                continue
+            supplied = {kw.arg for kw in node.keywords if kw.arg is not None}
+            unknown = supplied - accepted
+            if unknown or "message_length" not in supplied:
+                offenders.append((node.lineno, sorted(unknown)))
+
+        self.assertEqual([], offenders)
 
 
 if __name__ == "__main__":

@@ -103,26 +103,42 @@ retained or logged.
 Budget state includes `unit: generation_tokens_v2`, counted in Claude-equivalent generated tokens.
 Codex reports cumulative agentic-turn output including reasoning, so its per-call ceiling is scaled
 up by `CODEX_GENERATION_FACTOR` before dispatch and its reported spend is normalized back down
-before it is charged; `PROVIDER_TOKENS` in the audit keeps the raw provider count visible, and
-`GENERATION_FACTOR` records the factor that produced each charge. A budget file from the former
+before it is charged. The audit carries three token fields, and they are not interchangeable:
+`BUDGET_TOKENS` is the Claude-equivalent amount charged, `PROVIDER_TOKENS` is the provider's
+*generated-output* count for that call before normalization, and `RAW_TOKENS` is the provider's
+total including input and prompt-cache reads. `GENERATION_FACTOR` records the validated factor that
+was applied to produce that charge. A budget file from the former
 raw-token accounting, or from the superseded `generation_tokens_v1` contract, remains readable for
 status, but delegation refuses until a named approver runs
-`delegation budget reset`; the old `used` value is never reinterpreted under the new unit. Migrating
-from a superseded *generation-token* unit preserves an approver-set `limit`, which still means the
-same thing; migrating from the raw-token file resets the limit to the 250,000 default, because a
-raw-token limit does not translate.
+`delegation budget reset`; the old `used` value is never reinterpreted under the new unit. The two
+refusals differ, and say so: migrating from a superseded *generation-token* unit preserves an
+approver-set `limit`, which still means the same thing; migrating from the raw-token file also
+returns the limit to the 250,000 default, because a raw-token limit does not translate.
 
 `CARGO_CHIEF_CODEX_GENERATION_FACTOR` overrides that factor for one launcher process, bounded
 between `MIN_CODEX_GENERATION_FACTOR` and `MAX_CODEX_GENERATION_FACTOR`. The maximum equals the
 default, so an override can only *narrow* the grant: a lower factor shrinks the per-call ceiling and
 charges more per generated token. Raising the effective ceiling requires changing
-`CODEX_GENERATION_FACTOR` in code, through the PR gate, because a higher factor would widen an
-approver-gated thread budget without any anomalous audit line.
+`CODEX_GENERATION_FACTOR` in code, through the PR gate, because an environment override is
+process-local and unreviewed while the constant is reviewed. Every launch records
+`GENERATION_FACTOR` in the audit and in its verification marker, so a raised constant is visible;
+what the bound protects is the review, not the visibility.
+
+The variable is read on every launch, on **both** providers, before any one-shot file is consumed.
+An invalid value is therefore a host-level configuration fault, not a per-thread one: it stops all
+delegation for every thread on the host, including Claude threads, until an operator corrects or
+unsets it. The refusal says so, because the principal who first hits it neither caused it nor can
+fix it from the thread. Validating it only on the openai path would instead leave a bad export
+sitting silently until a provider switch surfaced it, and would destroy the one-shot request and
+implementation claim over a value the environment already got wrong.
 
 To check whether the factor still matches reality, compare `PROVIDER_TOKENS` for a Codex delegate
 against `PROVIDER_TOKENS` for a **Claude** delegate on the **same** stage of comparable work; the
-audit log carries both. Do not compare `PROVIDER_TOKENS` to `BUDGET_TOKENS` within a single audit
-row: `BUDGET_TOKENS` is by construction `ceil(PROVIDER_TOKENS / factor)`, so that ratio is always
+audit log carries both. Use `PROVIDER_TOKENS`, not `RAW_TOKENS`: only `PROVIDER_TOKENS` is
+generated output, and `RAW_TOKENS` includes input and prompt-cache reads, whose ratio between
+providers says nothing about generation. Do not compare `PROVIDER_TOKENS` to
+`BUDGET_TOKENS` within a single audit row: `BUDGET_TOKENS` is by construction
+`ceil(PROVIDER_TOKENS / factor)`, so that ratio is always
 the configured factor and proves nothing about the true Codex-to-Claude ratio.
 
 Every request declares `budget_unit: generation_tokens_v2` and a positive `planned_tokens` call
@@ -135,6 +151,20 @@ the normalized Claude-equivalent charge, not the number of tokens the provider g
 `provider_tokens` count stays in the launcher's local verification marker and is deliberately kept
 out of the receipt. Coordinators consume that receipt instead of estimating usage or reading the
 private audit log.
+
+A pending verification survives an owner restart by design, and the owner's substantive reply is
+withheld while it exists. Verification itself therefore never clears a marker it cannot verify:
+that check runs inside the owner's turn, so consuming the marker there would unmute the very turn
+whose delegate spend was never verified. A marker whose `budget_unit` is missing, superseded, or
+otherwise not the current unit can never be verified, so without a separate recovery it would mute
+the thread permanently. `delegation verification reset` is that recovery: a named approver runs it
+in the thread, and it discards exactly one marker that cannot be verified under the current unit,
+after appending a content-free audit row recording the marker's status, tier, model, request id and
+token counts — the marker is the only place `provider_tokens` is kept. It refuses a marker that
+*is* on the current unit, because that one is verifiable by running the verification stage and
+discarding it would bypass a live gate rather than recover from a dead one. The discarded spend
+stays charged against the thread budget and the delegation stage has to be re-run. An exhausted
+thread budget is a different state with a different command: `delegation budget reset`.
 
 The receipt is a correlation and integrity contract between cooperating processes under one Unix
 principal, not a cryptographic attestation against that principal. A security boundary against a
