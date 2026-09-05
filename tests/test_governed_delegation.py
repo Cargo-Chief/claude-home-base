@@ -267,6 +267,27 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertEqual(0, reset["used"])
         self.assertEqual(BUDGET_UNIT, reset["unit"])
 
+    def test_budget_update_failure_preserves_the_last_complete_state(self):
+        path = self.work / "budget.json"
+        update_budget(path, add_tokens=12)
+
+        with patch("governed_delegation.os.replace", side_effect=OSError("stopped")):
+            with self.assertRaisesRegex(DelegationError, "could not be persisted"):
+                update_budget(path, add_tokens=5)
+
+        self.assertEqual(12, budget_status(path)["used"])
+        self.assertEqual([], list(self.work.glob(".budget.json.*.writing")))
+
+    def test_empty_existing_budget_fails_closed_until_named_reset(self):
+        path = self.work / "budget.json"
+        path.touch()
+
+        with self.assertRaisesRegex(DelegationError, "state is invalid"):
+            budget_status(path)
+
+        self.assertEqual(0, update_budget(path, reset=True)["used"])
+        self.assertEqual(BUDGET_UNIT, budget_status(path)["unit"])
+
     def test_budget_initialization_creates_only_missing_state(self):
         path = self.work / "budget.json"
         initialize_budget(path)
@@ -311,6 +332,27 @@ class GovernedDelegationTest(unittest.TestCase):
 
         self.assertEqual([], errors)
         self.assertEqual(BUDGET_UNIT, json.loads(path.read_text())["unit"])
+        self.assertEqual([], list(self.work.glob(".budget.json.*.writing")))
+
+    def test_concurrent_budget_updates_share_the_stable_sidecar_lock(self):
+        path = self.work / "budget.json"
+        initialize_budget(path)
+        errors = []
+
+        def add_one():
+            try:
+                update_budget(path, add_tokens=1)
+            except Exception as exc:  # pragma: no cover - collected for the assertion
+                errors.append(exc)
+
+        workers = [threading.Thread(target=add_one) for _ in range(20)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        self.assertEqual([], errors)
+        self.assertEqual(20, budget_status(path)["used"])
         self.assertEqual([], list(self.work.glob(".budget.json.*.writing")))
 
     def test_legacy_raw_budget_requires_named_approver_reset(self):
@@ -601,6 +643,36 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertRegex(json.loads(verify_output.getvalue())["request_id"], r"^[0-9a-f]{64}$")
         self.assertFalse((self.work / "verification.json").exists())
         self.assertIn("OWNER_VERIFY_TOOLS:1", (self.work / "audit.log").read_text())
+
+    @patch("governed_delegation.run_codex_delegate")
+    def test_launch_refuses_allocation_that_exceeds_remaining_budget(self, run):
+        request = self.work / "delegation-request.json"
+        request.write_text(json.dumps({
+            "tier": "bounded", "prompt": "work", "mutation": False,
+            "budget_unit": BUDGET_UNIT, "planned_tokens": 45_000,
+        }))
+        budget = self.work / "budget.json"
+        update_budget(budget, limit=50_000, add_tokens=10_000)
+        env = {
+            "CARGO_CHIEF_ROOT": str(self.root),
+            "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(request),
+            "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(self.work / "claim.txt"),
+            "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(budget),
+            "CARGO_CHIEF_DELEGATE_PID_FILE": str(self.work / "pid"),
+            "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
+            "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
+            "CARGO_CHIEF_OWNER_PROVIDER": "openai",
+            "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
+            "CARGO_CHIEF_OWNER_EFFORT": "high",
+            "CLAUDE_THREAD_TS": "T1", "CLAUDE_CHANNEL_ID": "C1",
+            "CARGO_CHIEF_CURRENT_USER": "U1",
+        }
+
+        with self.assertRaisesRegex(DelegationError, "does not fit"):
+            launch_from_environment(env)
+
+        run.assert_not_called()
+        self.assertFalse(request.exists())
 
     def test_verification_refuses_a_pending_marker_without_typed_usage(self):
         marker = self.work / "verification.json"

@@ -212,9 +212,19 @@ def _validated_budget_state(value: object) -> dict:
     return {"limit": limit, "used": used, "unit": unit}
 
 
-def initialize_budget(path: Path) -> None:
-    """Atomically create new-unit state without reading or rewriting existing state."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+@contextmanager
+def _budget_state_lock(path: Path):
+    """Serialize state transitions on a stable inode while budget files are replaced."""
+    lock = path.with_suffix(path.suffix + ".lock")
+    lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock.open("a", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def _publish_budget_state(path: Path, state: Mapping[str, object], *, replace: bool) -> None:
+    """Publish a complete state file without exposing a truncated intermediate value."""
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.writing")
     descriptor = None
     try:
@@ -224,18 +234,23 @@ def initialize_budget(path: Path) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = None
             json.dump(
-                {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT},
-                handle, separators=(",", ":"),
+                state, handle, separators=(",", ":"),
             )
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if replace:
+            os.replace(temporary, path)
+        else:
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                pass
+        directory = os.open(path.parent, os.O_RDONLY)
         try:
-            os.link(temporary, path, follow_symlinks=False)
-        except FileExistsError:
-            pass
-    except OSError as exc:
-        raise DelegationError("delegation budget state could not be initialized") from exc
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -245,39 +260,56 @@ def initialize_budget(path: Path) -> None:
             pass
 
 
-def budget_status(path: Path) -> dict:
-    if path.is_symlink():
-        raise DelegationError("delegation budget state is invalid")
+def initialize_budget(path: Path) -> None:
+    """Atomically create new-unit state without reading or rewriting existing state."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.seek(0)
-        raw = handle.read()
-        if raw:
+    try:
+        with _budget_state_lock(path):
+            if path.exists() or path.is_symlink():
+                return
+            _publish_budget_state(
+                path,
+                {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT},
+                replace=False,
+            )
+    except OSError as exc:
+        raise DelegationError("delegation budget state could not be initialized") from exc
+
+
+def budget_status(path: Path) -> dict:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _budget_state_lock(path):
+        if path.is_symlink():
+            raise DelegationError("delegation budget state is invalid")
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
             try:
-                value = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise DelegationError("delegation budget state is invalid") from exc
-            return _validated_budget_state(value)
-        state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
-        handle.seek(0)
-        json.dump(state, handle, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fchmod(handle.fileno(), 0o600)
-        return state
+                _publish_budget_state(path, state, replace=False)
+            except OSError as exc:
+                raise DelegationError("delegation budget state could not be initialized") from exc
+            return state
+        if not raw:
+            raise DelegationError("delegation budget state is invalid")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise DelegationError("delegation budget state is invalid") from exc
+        return _validated_budget_state(value)
 
 
 def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, reset: bool = False) -> dict:
     if add_tokens < 0 or (limit is not None and limit < 1):
         raise DelegationError("delegation budget update is invalid")
-    if path.is_symlink():
-        raise DelegationError("delegation budget state is invalid")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.seek(0)
-        raw = handle.read()
+    with _budget_state_lock(path):
+        if path.is_symlink():
+            raise DelegationError("delegation budget state is invalid")
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw = None
         if raw:
             try:
                 state = json.loads(raw)
@@ -285,8 +317,10 @@ def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, 
                 if not reset:
                     raise DelegationError("delegation budget state is invalid") from exc
                 state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
-        else:
+        elif raw is None or reset:
             state = {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}
+        else:
+            raise DelegationError("delegation budget state is invalid")
         try:
             state = _validated_budget_state(state)
         except DelegationError:
@@ -309,12 +343,10 @@ def update_budget(path: Path, *, add_tokens: int = 0, limit: int | None = None, 
             "used": 0 if reset else current_used + add_tokens,
             "unit": BUDGET_UNIT,
         }
-        handle.seek(0)
-        handle.truncate()
-        json.dump(state, handle, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fchmod(handle.fileno(), 0o600)
+        try:
+            _publish_budget_state(path, state, replace=True)
+        except OSError as exc:
+            raise DelegationError("delegation budget state could not be persisted") from exc
         return state
 
 

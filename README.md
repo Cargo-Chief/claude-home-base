@@ -99,12 +99,17 @@ Budget state includes `unit: generation_tokens_v1`. A two-field budget file from
 token accounting remains readable for status, but delegation refuses until a named approver runs
 `delegation budget reset`; the old `used` value is never reinterpreted under the new unit.
 Every request declares `budget_unit: generation_tokens_v1` and a positive `planned_tokens` call
-ceiling. Coordinator-backed requests copy those values from their dispatch contract. Exceeding the
+ceiling. Coordinator-backed requests copy those values from their dispatch contract. Reaching the
 stage allocation withholds the partial return but leaves the thread available to its owner; only
 exhausting the thread ceiling creates the reset-gated exhaustion state.
 Successful owner verification emits a content-free, versioned usage receipt with the budget unit
 and actual generated-token count. Coordinators consume that receipt instead of estimating usage or
 reading the private audit log.
+
+The receipt is a correlation and integrity contract between cooperating processes under one Unix
+principal, not a cryptographic attestation against that principal. A security boundary against a
+hostile or prompt-injected owner would require OS-level privilege separation for the launcher and
+its metering state; the current same-principal harness does not claim that property.
 
 Every request declares `mutation` explicitly. A mutating request at any capable tier requires the
 implementation plan claim. A non-mutating request runs with read-only provider tools; Explore can
