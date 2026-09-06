@@ -93,7 +93,7 @@ Delegation is pinned by the harness rather than inherited from a machine default
 calls and Codex multi-agent are disabled; both providers use the same one-shot governed launcher.
 Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,
 mechanical, and explore tiers route to the approved provider-equivalent model and effort. Every
-thread has a persistent 400,000 generated/reasoning-token ceiling; only a named approver can inspect,
+thread has a persistent 500,000 generated/reasoning-token ceiling; only a named approver can inspect,
 reset, or change it, and bare `stop` terminates an active delegate. That default applies to *new*
 budget files only: an existing thread keeps whatever limit its budget file already carries, so
 raising the constant does not widen a live thread — a named approver raises that one with
@@ -116,7 +116,7 @@ status, but delegation refuses until a named approver runs
 `delegation budget reset`; the old `used` value is never reinterpreted under the new unit. The two
 refusals differ, and say so: migrating from a superseded *generation-token* unit preserves an
 approver-set `limit`, which still means the same thing; migrating from the raw-token file also
-returns the limit to the 400,000 default, because a raw-token limit does not translate.
+returns the limit to the 500,000 default, because a raw-token limit does not translate.
 
 `CARGO_CHIEF_CODEX_GENERATION_FACTOR` overrides that factor for one launcher process, bounded
 between `MIN_CODEX_GENERATION_FACTOR` and `MAX_CODEX_GENERATION_FACTOR`. The maximum equals the
@@ -302,7 +302,7 @@ file is mode `0600` and never contains prompts or delegate returns.
 - **Per-room models** — `model-config.json` picks which model and reasoning effort answers in each channel or DM, plus an optional per-model system prompt; read fresh on every spawn (no restart), editable from the file explorer's `/models` page. Name a `default_model` there and the page's default row becomes a dropdown too, so you can move every unconfigured room to a different model in one pick
 - **Prompt cadence** — a per-model prompt is in the Claude system prompt at spawn and can be re-sent every Nth message so a standing instruction does not decay
 - **Credit-limit fallback** — a recognized Claude account limit moves the Slack thread to its explicit, profile-governed OpenAI model while preserving the authority envelope and durable session id
-- **Governed delegation** — one provider-neutral launcher enforces implementation-plan readiness, exact model/effort routing, a persistent 400k thread budget, metadata-only audit, and the shared stop path. Usage is enforced at provider call boundaries: once a Claude stream event or Codex app-server notification reaches the remaining allowance, the launcher interrupts before another model call, charges the full observed usage, and withholds that turn's return. The withholding notice is consumed after delivery so later owner-only replies remain available, while the numeric budget continues to refuse further delegates. One already-running provider call can cross the exact token boundary because usage arrives only after that call completes
+- **Governed delegation** — one provider-neutral launcher enforces implementation-plan readiness, exact model/effort routing, a persistent 500k thread budget, metadata-only audit, and the shared stop path. Usage is enforced at provider call boundaries: once a Claude stream event or Codex app-server notification reaches the remaining allowance, the launcher interrupts before another model call, charges the full observed usage, and withholds that turn's return. The withholding notice is consumed after delivery so later owner-only replies remain available, while the numeric budget continues to refuse further delegates. One already-running provider call can cross the exact token boundary because usage arrives only after that call completes
 - **Interactive buttons** — button clicks and menu picks route back into the thread's Claude session as messages, so your AI can offer approve/hold/snooze choices and act on the answer (requires Interactivity enabled in your Slack app config; Request URL = the same `/slack/events` endpoint)
 - **In-thread stop** — type a bare `stop` in a thread where the bot is mid-run to interrupt it (like Esc in the terminal); the session survives with full context, so your next message steers it in the new direction
 - **Mid-turn steering** — message a thread while the bot is mid-run and it sees your message at the next tool-call boundary, inside the same turn (like typing without Esc in the terminal); no more waiting for the whole task to finish before you can course-correct
