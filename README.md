@@ -93,8 +93,11 @@ Delegation is pinned by the harness rather than inherited from a machine default
 calls and Codex multi-agent are disabled; both providers use the same one-shot governed launcher.
 Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,
 mechanical, and explore tiers route to the approved provider-equivalent model and effort. Every
-thread has a persistent 250,000 generated/reasoning-token ceiling; only a named approver can inspect,
-reset, or change it, and bare `stop` terminates an active delegate. Input and prompt-cache usage is
+thread has a persistent 400,000 generated/reasoning-token ceiling; only a named approver can inspect,
+reset, or change it, and bare `stop` terminates an active delegate. That default applies to *new*
+budget files only: an existing thread keeps whatever limit its budget file already carries, so
+raising the constant does not widen a live thread — a named approver raises that one with
+`delegation budget set`. Input and prompt-cache usage is
 recorded separately as raw audit metadata, so it remains visible without being charged as newly
 generated reasoning. Audit records contain routing, plan-gate, aggregate usage, duration, and
 outcome metadata only. Delegated prompts, tool inputs, file paths, and response content are never
@@ -113,7 +116,7 @@ status, but delegation refuses until a named approver runs
 `delegation budget reset`; the old `used` value is never reinterpreted under the new unit. The two
 refusals differ, and say so: migrating from a superseded *generation-token* unit preserves an
 approver-set `limit`, which still means the same thing; migrating from the raw-token file also
-returns the limit to the 250,000 default, because a raw-token limit does not translate.
+returns the limit to the 400,000 default, because a raw-token limit does not translate.
 
 `CARGO_CHIEF_CODEX_GENERATION_FACTOR` overrides that factor for one launcher process, bounded
 between `MIN_CODEX_GENERATION_FACTOR` and `MAX_CODEX_GENERATION_FACTOR`. The maximum equals the

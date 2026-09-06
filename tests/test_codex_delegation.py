@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_delegation import run_codex_delegate
+from governed_delegation import DEFAULT_TOKEN_BUDGET
 
 
 class _Input:
@@ -128,7 +129,8 @@ class CodexDelegationTest(unittest.TestCase):
         result = run_codex_delegate(
             ["codex", "app-server", "--stdio"], "work", cwd="/work", env={},
             model="gpt-5.6-sol", effort="medium", read_only=True,
-            token_limit=250_000, timeout=10, on_process=lambda _value: None,
+            token_limit=DEFAULT_TOKEN_BUDGET, timeout=10,
+            on_process=lambda _value: None,
         )
 
         self.assertEqual(31_203, result.tokens)
