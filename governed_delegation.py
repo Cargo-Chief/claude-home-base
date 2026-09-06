@@ -23,17 +23,25 @@ from codex_delegation import run_codex_delegate
 
 
 # Sized against the maximal compact roster rather than chosen as a backstop:
-# both top-tier proof tasks at 45,000, the security and adversarial specialists
-# at 20,000 each, both conditional generated tasks at 20,000 each, the verifier
-# at 30,000 and the omission pass at 25,000 — 225,000 — plus the 50,000 owner
-# reserve, so 275,000. The former 250,000 was picked before any stage had been
-# metered and sat below that, which is what made it brittle; 400,000 leaves real
-# headroom above a correctly-sized roster instead of landing exactly on it.
+# six finders at 45,000 each — 270,000 — plus the verifier at 30,000 and the
+# omission pass at 65,000, so 365,000 for the roster itself, plus the 50,000
+# owner reserve, which is 415,000. Omission carries the largest single stage
+# budget because it is structurally the largest stage: it re-reads the whole
+# pinned diff, re-executes every generated proof task, and then reads
+# verified.json, which is a finder's entire workload and then some — it was the
+# one stage to exhaust at 45,000.
+#
+# Unlike the previous sizing, these are measured figures rather than estimates.
+# On a live compact run against Claude, where the provider factor is 1.0, five
+# finders completed between 34,045 and 40,024 against their 45,000 allocation
+# while the verifier completed at 30,000; only omission exhausted. So 500,000
+# leaves real headroom above a roster whose stages have actually been metered,
+# instead of landing exactly on it.
 # Raising this widens NEW budget files only. initialize_budget writes it when no
 # budget file exists, and update_budget preserves an existing approver-set
 # `limit`, including across a superseded-unit reset, so a live thread keeps the
 # limit it already has until an approver runs `delegation budget set`.
-DEFAULT_TOKEN_BUDGET = 400_000
+DEFAULT_TOKEN_BUDGET = 500_000
 BUDGET_UNIT = "generation_tokens_v2"
 LEGACY_BUDGET_UNIT = "raw_tokens_legacy"
 SUPERSEDED_BUDGET_UNITS = ("generation_tokens_v1",)

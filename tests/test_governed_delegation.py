@@ -1124,7 +1124,7 @@ class GovernedDelegationTest(unittest.TestCase):
         # deliberate, reviewed two-line change here rather than an invisible
         # one-line diff that widens every new approver-gated thread budget.
         # Update this assertion together with the constant.
-        self.assertEqual(400_000, DEFAULT_TOKEN_BUDGET)
+        self.assertEqual(500_000, DEFAULT_TOKEN_BUDGET)
 
     def test_generation_factor_constant_is_pinned(self):
         # The one place the constant's value is asserted. Every other
@@ -1399,10 +1399,16 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertIn("default", message)
 
     def test_unit_migration_preserves_an_approver_set_limit(self):
+        # Derived, never a literal: this test can only tell "preserved the
+        # approver's limit" from "reset to the default" while the fixture is
+        # not the default. A hardcoded value silently stops discriminating the
+        # next time the ceiling moves onto it, which has now happened twice.
+        approver_limit = DEFAULT_TOKEN_BUDGET + 100_000
         budget = self.work / "budget.json"
         budget.write_text(
             json.dumps({
-                "limit": 500_000, "used": 120_000, "unit": "generation_tokens_v1",
+                "limit": approver_limit, "used": 120_000,
+                "unit": "generation_tokens_v1",
             }) + "\n",
             encoding="utf-8",
         )
@@ -1411,8 +1417,11 @@ class GovernedDelegationTest(unittest.TestCase):
 
         # `used` cannot be reinterpreted across units and is discarded; the
         # approver-set limit is a separate decision and must survive.
-        self.assertEqual({"limit": 500_000, "used": 0, "unit": BUDGET_UNIT}, reset)
-        self.assertEqual(500_000, budget_status(budget)["limit"])
+        self.assertNotEqual(DEFAULT_TOKEN_BUDGET, approver_limit)
+        self.assertEqual(
+            {"limit": approver_limit, "used": 0, "unit": BUDGET_UNIT}, reset,
+        )
+        self.assertEqual(approver_limit, budget_status(budget)["limit"])
 
     def test_request_declaring_a_superseded_unit_names_the_skew(self):
         request = self.work / "delegation-request.json"
