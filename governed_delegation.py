@@ -22,7 +22,18 @@ import uuid
 from codex_delegation import run_codex_delegate
 
 
-DEFAULT_TOKEN_BUDGET = 250_000
+# Sized against the maximal compact roster rather than chosen as a backstop:
+# both top-tier proof tasks at 45,000, the security and adversarial specialists
+# at 20,000 each, both conditional generated tasks at 20,000 each, the verifier
+# at 30,000 and the omission pass at 25,000 — 225,000 — plus the 50,000 owner
+# reserve, so 275,000. The former 250,000 was picked before any stage had been
+# metered and sat below that, which is what made it brittle; 400,000 leaves real
+# headroom above a correctly-sized roster instead of landing exactly on it.
+# Raising this widens NEW budget files only. initialize_budget writes it when no
+# budget file exists, and update_budget preserves an existing approver-set
+# `limit`, including across a superseded-unit reset, so a live thread keeps the
+# limit it already has until an approver runs `delegation budget set`.
+DEFAULT_TOKEN_BUDGET = 400_000
 BUDGET_UNIT = "generation_tokens_v2"
 LEGACY_BUDGET_UNIT = "raw_tokens_legacy"
 SUPERSEDED_BUDGET_UNITS = ("generation_tokens_v1",)

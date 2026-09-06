@@ -379,16 +379,16 @@ class GovernedDelegationTest(unittest.TestCase):
 
     def test_legacy_raw_budget_requires_named_approver_reset(self):
         path = self.work / "budget.json"
-        path.write_text('{"limit":250000,"used":1125414}\n', encoding="utf-8")
+        path.write_text('{"limit":300000,"used":1125414}\n', encoding="utf-8")
         state = budget_status(path)
         self.assertEqual(LEGACY_BUDGET_UNIT, state["unit"])
         with self.assertRaisesRegex(DelegationError, "must be reset"):
             update_budget(path, add_tokens=1)
         with self.assertRaisesRegex(DelegationError, "must be reset"):
-            update_budget(path, limit=300_000)
+            update_budget(path, limit=350_000)
         reset = update_budget(path, reset=True)
         self.assertEqual(
-            {"limit": 250_000, "used": 0, "unit": BUDGET_UNIT}, reset
+            {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}, reset
         )
         self.assertEqual(reset, json.loads(path.read_text(encoding="utf-8")))
 
@@ -399,7 +399,7 @@ class GovernedDelegationTest(unittest.TestCase):
         reset = update_budget(path, reset=True)
 
         self.assertEqual(
-            {"limit": 250_000, "used": 0, "unit": BUDGET_UNIT}, reset
+            {"limit": DEFAULT_TOKEN_BUDGET, "used": 0, "unit": BUDGET_UNIT}, reset
         )
 
     def test_owner_restart_clears_only_stage_allocation_exhaustion(self):
@@ -571,7 +571,10 @@ class GovernedDelegationTest(unittest.TestCase):
 
         result = run_claude_delegate(
             ["claude", "-p", "--output-format", "stream-json"], "work",
-            cwd=str(self.work), env={}, token_limit=250_000, timeout=10,
+            cwd=str(self.work), env={}, # A per-call limit, not the thread ceiling: the property only holds
+            # while it sits between the 31,203 generated and 1,125,414 raw
+            # tokens below, so it must not track a constant that can pass either.
+            token_limit=500_000, timeout=10,
             on_process=lambda _value: None,
         )
 
@@ -1115,6 +1118,14 @@ class GovernedDelegationTest(unittest.TestCase):
                         {"CARGO_CHIEF_CODEX_GENERATION_FACTOR": value}
                     )
 
+    def test_default_token_budget_is_pinned(self):
+        # The one place the per-thread ceiling's value is asserted. Every other
+        # expectation derives from DEFAULT_TOKEN_BUDGET, so a re-sizing is a
+        # deliberate, reviewed two-line change here rather than an invisible
+        # one-line diff that widens every new approver-gated thread budget.
+        # Update this assertion together with the constant.
+        self.assertEqual(400_000, DEFAULT_TOKEN_BUDGET)
+
     def test_generation_factor_constant_is_pinned(self):
         # The one place the constant's value is asserted. Every other
         # expectation derives from it, so a re-measurement is a deliberate,
@@ -1340,7 +1351,9 @@ class GovernedDelegationTest(unittest.TestCase):
         budget = self.work / "budget.json"
         budget.write_text(
             json.dumps({
-                "limit": 250_000, "used": 45_000, "unit": "generation_tokens_v1",
+                # Deliberately not DEFAULT_TOKEN_BUDGET, so preserving the
+                # approver-set limit is provable rather than coincidental.
+                "limit": 300_000, "used": 45_000, "unit": "generation_tokens_v1",
             }) + "\n",
             encoding="utf-8",
         )
@@ -1365,12 +1378,12 @@ class GovernedDelegationTest(unittest.TestCase):
         run.assert_not_called()
 
         reset = update_budget(budget, reset=True)
-        self.assertEqual({"limit": 250_000, "used": 0, "unit": BUDGET_UNIT}, reset)
+        self.assertEqual({"limit": 300_000, "used": 0, "unit": BUDGET_UNIT}, reset)
 
     def test_legacy_raw_token_budget_refusal_names_its_own_unit(self):
         budget = self.work / "budget.json"
         budget.write_text(
-            json.dumps({"limit": 250_000, "used": 45_000}) + "\n", encoding="utf-8",
+            json.dumps({"limit": 300_000, "used": 45_000}) + "\n", encoding="utf-8",
         )
         self.assertEqual(LEGACY_BUDGET_UNIT, budget_status(budget)["unit"])
 

@@ -128,7 +128,11 @@ class CodexDelegationTest(unittest.TestCase):
         result = run_codex_delegate(
             ["codex", "app-server", "--stdio"], "work", cwd="/work", env={},
             model="gpt-5.6-sol", effort="medium", read_only=True,
-            token_limit=250_000, timeout=10, on_process=lambda _value: None,
+            # A per-call limit, not the thread ceiling: the property only holds
+            # while it sits between the 31,203 generated and 1,125,414 raw
+            # tokens below, so it must not track a constant that can pass either.
+            token_limit=500_000, timeout=10,
+            on_process=lambda _value: None,
         )
 
         self.assertEqual(31_203, result.tokens)
