@@ -571,7 +571,10 @@ class GovernedDelegationTest(unittest.TestCase):
 
         result = run_claude_delegate(
             ["claude", "-p", "--output-format", "stream-json"], "work",
-            cwd=str(self.work), env={}, token_limit=DEFAULT_TOKEN_BUDGET, timeout=10,
+            cwd=str(self.work), env={}, # A per-call limit, not the thread ceiling: the property only holds
+            # while it sits between the 31,203 generated and 1,125,414 raw
+            # tokens below, so it must not track a constant that can pass either.
+            token_limit=500_000, timeout=10,
             on_process=lambda _value: None,
         )
 
