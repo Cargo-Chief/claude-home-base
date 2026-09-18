@@ -562,6 +562,29 @@ def _generation_tokens(usage: Mapping[str, object]) -> int | None:
     return None
 
 
+def _claude_failure_reason(result_event: Mapping[str, object] | None, returncode: int) -> str:
+    """Classify a failed Claude run from fixed vocabulary; the result text is never echoed."""
+    event = result_event or {}
+    status = event.get("api_error_status")
+    if isinstance(status, str) and status.isdigit():
+        status = int(status)
+    if isinstance(status, int) and not isinstance(status, bool):
+        if status in (401, 403):
+            return f"authentication rejected (HTTP {status})"
+        if status == 429:
+            return "rate or usage limit reached (HTTP 429)"
+        if status >= 500:
+            return f"provider unavailable (HTTP {status})"
+        return f"provider rejected the request (HTTP {status})"
+    subtype = event.get("subtype")
+    if (
+        event.get("is_error") is True and isinstance(subtype, str)
+        and re.fullmatch(r"[a-z_]{1,40}", subtype) and subtype != "success"
+    ):
+        return f"run ended with {subtype}"
+    return f"exit status {returncode}"
+
+
 def _stream_reader(stream, output: queue.Queue) -> None:
     try:
         for line in stream:
@@ -586,6 +609,7 @@ def run_claude_delegate(
     result_text = ""
     seen_messages: set[str] = set()
     completed = False
+    result_event: dict | None = None
     deadline = time.monotonic() + timeout
     try:
         process = subprocess.Popen(
@@ -642,6 +666,7 @@ def run_claude_delegate(
                             tool_uses=tool_uses, budget_exhausted=True,
                         )
             elif event.get("type") == "result":
+                result_event = event
                 usage = event.get("usage") or {}
                 if not isinstance(usage, dict):
                     return DelegateResult(
@@ -675,7 +700,9 @@ def run_claude_delegate(
         process.wait(timeout=5)
         if process.returncode != 0:
             return DelegateResult(
-                tokens=tokens, raw_tokens=raw_tokens, error="Claude delegate failed",
+                tokens=tokens, raw_tokens=raw_tokens,
+                error="Claude delegate failed: "
+                + _claude_failure_reason(result_event, process.returncode),
             )
         if tokens < 1:
             return DelegateResult(
