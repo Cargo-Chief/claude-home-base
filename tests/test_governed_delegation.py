@@ -12,6 +12,7 @@ from unittest.mock import patch
 from codex_delegation import CodexDelegateResult
 
 from governed_delegation import (
+    _delegate_credential_env,
     _acquire_delegate_lock,
     _append_audit,
     _normalized_charge,
@@ -202,9 +203,22 @@ class GovernedDelegationTest(unittest.TestCase):
         (self.docs_worktree / "plans").mkdir(parents=True)
         self.plan = self.docs_worktree / "plans" / "plan.md"
         self.plan.write_text(PLAN)
+        # Keep launches away from the real secret file on the machine running the suite.
+        self.secrets = tempfile.TemporaryDirectory()
+        self.secret_file = Path(self.secrets.name) / "home-base.env"
+        default = patch(
+            "governed_delegation._default_secret_env_file", return_value=self.secret_file,
+        )
+        default.start()
+        self.addCleanup(default.stop)
 
     def tearDown(self):
         self.temp.cleanup()
+        self.secrets.cleanup()
+
+    def _write_secret_file(self, text, mode=0o600):
+        self.secret_file.write_text(text)
+        self.secret_file.chmod(mode)
 
     def _claim(self, text=None):
         claim = self.work / "implementation-claim.txt"
@@ -666,6 +680,77 @@ class GovernedDelegationTest(unittest.TestCase):
             "Claude delegate failed: authentication rejected (HTTP 401)", result.error,
         )
         self.assertEqual("", result.text)
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_not_logged_in_is_named(self, popen):
+        # Captured shape: a delegate with no usable credential never reaches the API.
+        result = self._failed_claude_run(popen, {
+            "type": "result", "subtype": "success", "is_error": True,
+            "api_error_status": None, "result": "Not logged in · Please run /login",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        })
+
+        self.assertEqual(
+            "Claude delegate failed: not logged in (no credential reached the delegate)",
+            result.error,
+        )
+
+    def test_delegate_credential_is_read_from_the_secret_file(self):
+        env = {"CARGO_CHIEF_ROOT": str(self.root), "KEEP": "1"}
+        cases = (
+            ("CLAUDE_CODE_OAUTH_TOKEN=plain-value\n", "plain-value"),
+            ("export CLAUDE_CODE_OAUTH_TOKEN='quoted value'\n", "quoted value"),
+            ('OTHER=x\n  export CLAUDE_CODE_OAUTH_TOKEN = "spaced"  \n', "spaced"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self._write_secret_file(text)
+                child = _delegate_credential_env(env)
+                self.assertEqual(expected, child["CLAUDE_CODE_OAUTH_TOKEN"])
+                self.assertEqual("1", child["KEEP"])
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+
+    def test_delegate_credential_file_overrides_a_stale_shell_value(self):
+        self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=from-file\n")
+        child = _delegate_credential_env({
+            "CARGO_CHIEF_ROOT": str(self.root), "CLAUDE_CODE_OAUTH_TOKEN": "stale",
+        })
+
+        self.assertEqual("from-file", child["CLAUDE_CODE_OAUTH_TOKEN"])
+
+    def test_delegate_credential_absent_file_or_key_leaves_env_unchanged(self):
+        env = {"CARGO_CHIEF_ROOT": str(self.root), "CLAUDE_CODE_OAUTH_TOKEN": "shell"}
+        self.assertEqual(env, _delegate_credential_env(env))
+        self._write_secret_file("OTHER=x\nCLAUDE_CODE_OAUTH_TOKEN=\n")
+        self.assertEqual(env, _delegate_credential_env(env))
+
+    def test_delegate_credential_unsafe_file_refuses_without_echoing(self):
+        env = {"CARGO_CHIEF_ROOT": str(self.root)}
+        self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=secret-marker\n", mode=0o644)
+        with self.assertRaises(DelegationError) as caught:
+            _delegate_credential_env(env)
+        self.assertNotIn("secret-marker", str(caught.exception))
+
+        inside = self.root / "home-base.env"
+        inside.write_text("CLAUDE_CODE_OAUTH_TOKEN=secret-marker\n")
+        inside.chmod(0o600)
+        with self.assertRaises(DelegationError) as caught:
+            _delegate_credential_env({**env, "CARGO_CHIEF_ENV_FILE": str(inside)})
+        self.assertNotIn("secret-marker", str(caught.exception))
+
+    @patch("governed_delegation.run_claude_delegate")
+    def test_claude_launch_passes_the_file_credential_to_the_delegate(self, run):
+        self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=launch-value\n")
+        run.return_value = DelegateResult(text="evidence", tokens=10, raw_tokens=10)
+        values = self._launch_environment(
+            self._bounded_request(), self.work / "budget.json", provider="claude",
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, launch_from_environment(values))
+
+        self.assertEqual("launch-value", run.call_args.kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"])
+        self.assertNotIn("launch-value", (self.work / "audit.log").read_text())
 
     @patch("governed_delegation.subprocess.Popen")
     def test_claude_stream_skips_non_object_and_oversized_json_lines(self, popen):

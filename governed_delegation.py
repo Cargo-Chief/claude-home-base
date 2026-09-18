@@ -19,6 +19,7 @@ import time
 from typing import Callable, Mapping
 import uuid
 
+from cargo_chief_safety import SafetyError, validate_secret_env_path
 from codex_delegation import run_codex_delegate
 
 
@@ -562,6 +563,42 @@ def _generation_tokens(usage: Mapping[str, object]) -> int | None:
     return None
 
 
+DELEGATE_CREDENTIAL_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def _default_secret_env_file() -> Path:
+    return Path.home() / ".config" / "cargo-chief" / "home-base.env"
+
+
+def _delegate_credential_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Give the Claude delegate the harness token, which the owner's shell may not carry.
+
+    The value is read from the same file bot.py loads and set only on the child's
+    environment; it never passes through the owner model's shell.
+    """
+    child = dict(env)
+    path = Path(env.get("CARGO_CHIEF_ENV_FILE") or _default_secret_env_file())
+    if not path.exists() and not path.is_symlink():
+        return child
+    try:
+        path = validate_secret_env_path(path, workspace_root=Path(env["CARGO_CHIEF_ROOT"]))
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (SafetyError, OSError, UnicodeDecodeError) as exc:
+        raise DelegationError("delegate credential file is unsafe or unreadable") from exc
+    for line in lines:
+        match = re.fullmatch(
+            rf"\s*(?:export\s+)?{DELEGATE_CREDENTIAL_KEY}\s*=\s*(.*?)\s*", line,
+        )
+        if not match:
+            continue
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if value:
+            child[DELEGATE_CREDENTIAL_KEY] = value
+    return child
+
+
 def _claude_failure_reason(result_event: Mapping[str, object] | None, returncode: int) -> str:
     """Classify a failed Claude run from fixed vocabulary; the result text is never echoed."""
     event = result_event or {}
@@ -579,6 +616,9 @@ def _claude_failure_reason(result_event: Mapping[str, object] | None, returncode
     subtype = event.get("subtype")
     if isinstance(subtype, str) and re.fullmatch(r"error_[a-z_]{1,40}", subtype):
         return f"run ended with {subtype}"
+    result = event.get("result")
+    if event.get("is_error") is True and isinstance(result, str) and result.startswith("Not logged in"):
+        return "not logged in (no credential reached the delegate)"
     return f"exit status {returncode}"
 
 
@@ -696,7 +736,7 @@ def run_claude_delegate(
                 error="Claude delegate ended without completion",
             )
         process.wait(timeout=5)
-        if process.returncode != 0 or result_event.get("is_error") is True:
+        if process.returncode != 0 or (result_event or {}).get("is_error") is True:
             return DelegateResult(
                 tokens=tokens, raw_tokens=raw_tokens,
                 error="Claude delegate failed: "
@@ -1114,7 +1154,8 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         if not request.mutation:
             command.extend(["--allowedTools", "Read,Grep,Glob"])
         result = run_claude_delegate(
-            command, prompt, cwd=os.getcwd(), env=env, token_limit=call_token_limit,
+            command, prompt, cwd=os.getcwd(), env=_delegate_credential_env(env),
+            token_limit=call_token_limit,
             timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),
         )
