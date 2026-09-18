@@ -134,6 +134,8 @@ ENV_FILE = Path(
 ).expanduser()
 ENV_FILE = validate_secret_env_path(ENV_FILE, workspace_root=WORKSPACE_ROOT)
 load_dotenv(dotenv_path=ENV_FILE)
+# Pin the file actually loaded; the governed launcher reads the delegate's token from it.
+os.environ["CARGO_CHIEF_ENV_FILE"] = str(ENV_FILE)
 
 os.umask(0o077)
 RUNTIME_POLICY = RuntimePolicy.from_env(source_dir=SOURCE_DIR, workspace_root=WORKSPACE_ROOT)
