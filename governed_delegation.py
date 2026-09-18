@@ -19,7 +19,7 @@ import time
 from typing import Callable, Mapping
 import uuid
 
-from cargo_chief_safety import SafetyError, validate_secret_env_path
+from cargo_chief_safety import SafetyError, find_workspace_root, validate_secret_env_path
 from codex_delegation import run_codex_delegate
 
 
@@ -570,32 +570,37 @@ def _default_secret_env_file() -> Path:
     return Path.home() / ".config" / "cargo-chief" / "home-base.env"
 
 
+def _harness_workspace_root() -> Path:
+    return find_workspace_root(Path(__file__).resolve().parent)
+
+
 def _delegate_credential_env(env: Mapping[str, str]) -> dict[str, str]:
     """Give the Claude delegate the harness token, which the owner's shell may not carry.
 
-    The value is read from the same file bot.py loads and set only on the child's
-    environment; it never passes through the owner model's shell.
+    Read from the file bot.py loaded (it exports the resolved path) with the same
+    parser, and set only on the child's environment.
     """
     child = dict(env)
-    path = Path(env.get("CARGO_CHIEF_ENV_FILE") or _default_secret_env_file())
+    configured = env.get("CARGO_CHIEF_ENV_FILE")
+    path = Path(configured).expanduser() if configured else _default_secret_env_file()
     if not path.exists() and not path.is_symlink():
+        if configured:
+            raise DelegationError(f"configured delegate credential file is missing: {path}")
         return child
     try:
-        path = validate_secret_env_path(path, workspace_root=Path(env["CARGO_CHIEF_ROOT"]))
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (SafetyError, OSError, UnicodeDecodeError) as exc:
-        raise DelegationError("delegate credential file is unsafe or unreadable") from exc
-    for line in lines:
-        match = re.fullmatch(
-            rf"\s*(?:export\s+)?{DELEGATE_CREDENTIAL_KEY}\s*=\s*(.*?)\s*", line,
-        )
-        if not match:
-            continue
-        value = match.group(1)
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        if value:
-            child[DELEGATE_CREDENTIAL_KEY] = value
+        path = validate_secret_env_path(path, workspace_root=_harness_workspace_root())
+    except SafetyError as exc:
+        raise DelegationError(f"delegate credential file refused: {exc}") from exc
+    try:
+        from dotenv import dotenv_values
+    except ImportError as exc:
+        raise DelegationError("python-dotenv is required to read the delegate credential file") from exc
+    try:
+        value = dotenv_values(path).get(DELEGATE_CREDENTIAL_KEY)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DelegationError("delegate credential file is unreadable") from exc
+    if value:
+        child[DELEGATE_CREDENTIAL_KEY] = value
     return child
 
 
@@ -1087,6 +1092,11 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
     # and refusing it only on an openai thread would destroy the request file and
     # the implementation claim over a value the environment already got wrong.
     configured_factor = codex_generation_factor(env)
+    # Also before any one-shot input: a bad credential file must not consume the request.
+    delegate_env = (
+        _delegate_credential_env(env)
+        if env["CARGO_CHIEF_OWNER_PROVIDER"] == "claude" else dict(env)
+    )
     root = Path(env["CARGO_CHIEF_ROOT"]).resolve()
     request = load_request(Path(env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"]))
     request_id = delegation_request_id(request)
@@ -1154,7 +1164,7 @@ def _launch_from_environment_unlocked(env: Mapping[str, str]) -> int:
         if not request.mutation:
             command.extend(["--allowedTools", "Read,Grep,Glob"])
         result = run_claude_delegate(
-            command, prompt, cwd=os.getcwd(), env=_delegate_credential_env(env),
+            command, prompt, cwd=os.getcwd(), env=delegate_env,
             token_limit=call_token_limit,
             timeout=timeout,
             on_process=lambda process: _write_pid(pid_file, process),

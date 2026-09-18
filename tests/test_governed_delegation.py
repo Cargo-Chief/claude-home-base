@@ -1,13 +1,18 @@
 import contextlib
 import fcntl
+import importlib.util
 import io
+import os
 import json
 import math
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+
+HAVE_DOTENV = importlib.util.find_spec("dotenv") is not None
 
 from codex_delegation import CodexDelegateResult
 
@@ -211,6 +216,11 @@ class GovernedDelegationTest(unittest.TestCase):
         )
         default.start()
         self.addCleanup(default.stop)
+        harness_root = patch(
+            "governed_delegation._harness_workspace_root", return_value=self.root,
+        )
+        harness_root.start()
+        self.addCleanup(harness_root.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -695,12 +705,16 @@ class GovernedDelegationTest(unittest.TestCase):
             result.error,
         )
 
-    def test_delegate_credential_is_read_from_the_secret_file(self):
+    @unittest.skipUnless(HAVE_DOTENV, "requires python-dotenv from requirements.txt")
+    def test_delegate_credential_matches_bot_dotenv_parsing(self):
         env = {"CARGO_CHIEF_ROOT": str(self.root), "KEEP": "1"}
         cases = (
             ("CLAUDE_CODE_OAUTH_TOKEN=plain-value\n", "plain-value"),
             ("export CLAUDE_CODE_OAUTH_TOKEN='quoted value'\n", "quoted value"),
-            ('OTHER=x\n  export CLAUDE_CODE_OAUTH_TOKEN = "spaced"  \n', "spaced"),
+            ("CLAUDE_CODE_OAUTH_TOKEN=fake-tok # rotated\n", "fake-tok"),
+            ('CLAUDE_CODE_OAUTH_TOKEN="fake-tok"  # rotated\n', "fake-tok"),
+            ("BASE=abc\nCLAUDE_CODE_OAUTH_TOKEN=${BASE}def\n", "abcdef"),
+            ("﻿CLAUDE_CODE_OAUTH_TOKEN=bom-value\n", "bom-value"),
         )
         for text, expected in cases:
             with self.subTest(text=text):
@@ -710,6 +724,7 @@ class GovernedDelegationTest(unittest.TestCase):
                 self.assertEqual("1", child["KEEP"])
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
 
+    @unittest.skipUnless(HAVE_DOTENV, "requires python-dotenv from requirements.txt")
     def test_delegate_credential_file_overrides_a_stale_shell_value(self):
         self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=from-file\n")
         child = _delegate_credential_env({
@@ -718,26 +733,62 @@ class GovernedDelegationTest(unittest.TestCase):
 
         self.assertEqual("from-file", child["CLAUDE_CODE_OAUTH_TOKEN"])
 
-    def test_delegate_credential_absent_file_or_key_leaves_env_unchanged(self):
+    @unittest.skipUnless(HAVE_DOTENV, "requires python-dotenv from requirements.txt")
+    def test_delegate_credential_absent_default_or_key_leaves_env_unchanged(self):
         env = {"CARGO_CHIEF_ROOT": str(self.root), "CLAUDE_CODE_OAUTH_TOKEN": "shell"}
         self.assertEqual(env, _delegate_credential_env(env))
-        self._write_secret_file("OTHER=x\nCLAUDE_CODE_OAUTH_TOKEN=\n")
+        self._write_secret_file("OTHER=x\n")
         self.assertEqual(env, _delegate_credential_env(env))
 
-    def test_delegate_credential_unsafe_file_refuses_without_echoing(self):
+    @unittest.skipUnless(HAVE_DOTENV, "requires python-dotenv from requirements.txt")
+    def test_delegate_credential_configured_path_is_expanded_and_required(self):
+        self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=tilde-value\n")
+        with patch.dict(os.environ, {"HOME": self.secrets.name}):
+            child = _delegate_credential_env({
+                "CARGO_CHIEF_ROOT": str(self.root), "CARGO_CHIEF_ENV_FILE": "~/home-base.env",
+            })
+        self.assertEqual("tilde-value", child["CLAUDE_CODE_OAUTH_TOKEN"])
+
+        with self.assertRaisesRegex(DelegationError, "configured delegate credential file is missing"):
+            _delegate_credential_env({
+                "CARGO_CHIEF_ROOT": str(self.root),
+                "CARGO_CHIEF_ENV_FILE": str(Path(self.secrets.name) / "moved.env"),
+            })
+
+    def test_delegate_credential_without_dotenv_refuses_clearly(self):
+        self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=secret-marker\n")
+        with patch.dict(sys.modules, {"dotenv": None}):
+            with self.assertRaisesRegex(DelegationError, "python-dotenv is required") as caught:
+                _delegate_credential_env({"CARGO_CHIEF_ROOT": str(self.root)})
+        self.assertNotIn("secret-marker", str(caught.exception))
+
+    def test_delegate_credential_unsafe_file_names_the_reason_without_echoing(self):
         env = {"CARGO_CHIEF_ROOT": str(self.root)}
         self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=secret-marker\n", mode=0o644)
-        with self.assertRaises(DelegationError) as caught:
+        with self.assertRaisesRegex(DelegationError, "mode 600") as caught:
             _delegate_credential_env(env)
         self.assertNotIn("secret-marker", str(caught.exception))
 
         inside = self.root / "home-base.env"
         inside.write_text("CLAUDE_CODE_OAUTH_TOKEN=secret-marker\n")
         inside.chmod(0o600)
-        with self.assertRaises(DelegationError) as caught:
+        with self.assertRaisesRegex(DelegationError, "outside the Cargo Chief workspace") as caught:
             _delegate_credential_env({**env, "CARGO_CHIEF_ENV_FILE": str(inside)})
         self.assertNotIn("secret-marker", str(caught.exception))
 
+    @patch("governed_delegation.run_claude_delegate")
+    def test_unsafe_credential_file_refuses_before_consuming_the_request(self, run):
+        self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=x\n", mode=0o644)
+        request = self._bounded_request()
+        values = self._launch_environment(request, self.work / "budget.json", provider="claude")
+
+        with self.assertRaisesRegex(DelegationError, "delegate credential file refused"):
+            launch_from_environment(values)
+
+        run.assert_not_called()
+        self.assertTrue(request.is_file())
+
+    @unittest.skipUnless(HAVE_DOTENV, "requires python-dotenv from requirements.txt")
     @patch("governed_delegation.run_claude_delegate")
     def test_claude_launch_passes_the_file_credential_to_the_delegate(self, run):
         self._write_secret_file("CLAUDE_CODE_OAUTH_TOKEN=launch-value\n")
