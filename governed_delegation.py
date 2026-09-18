@@ -566,9 +566,9 @@ def _claude_failure_reason(result_event: Mapping[str, object] | None, returncode
     """Classify a failed Claude run from fixed vocabulary; the result text is never echoed."""
     event = result_event or {}
     status = event.get("api_error_status")
-    if isinstance(status, str) and status.isdigit():
+    if isinstance(status, str) and re.fullmatch(r"[0-9]{3}", status):
         status = int(status)
-    if isinstance(status, int) and not isinstance(status, bool):
+    if isinstance(status, int) and not isinstance(status, bool) and 400 <= status <= 599:
         if status in (401, 403):
             return f"authentication rejected (HTTP {status})"
         if status == 429:
@@ -577,10 +577,7 @@ def _claude_failure_reason(result_event: Mapping[str, object] | None, returncode
             return f"provider unavailable (HTTP {status})"
         return f"provider rejected the request (HTTP {status})"
     subtype = event.get("subtype")
-    if (
-        event.get("is_error") is True and isinstance(subtype, str)
-        and re.fullmatch(r"[a-z_]{1,40}", subtype) and subtype != "success"
-    ):
+    if isinstance(subtype, str) and re.fullmatch(r"error_[a-z_]{1,40}", subtype):
         return f"run ended with {subtype}"
     return f"exit status {returncode}"
 
@@ -632,7 +629,9 @@ def run_claude_delegate(
                 break
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
                 continue
             if event.get("type") == "assistant":
                 message = event.get("message") or {}
@@ -667,30 +666,29 @@ def run_claude_delegate(
                         )
             elif event.get("type") == "result":
                 result_event = event
+                # Error results (e.g. error_max_turns) carry no `result` text; they are
+                # classified below, keeping any assistant usage already metered.
+                is_error = event.get("is_error") is True
                 usage = event.get("usage") or {}
-                if not isinstance(usage, dict):
+                generated = _generation_tokens(usage) if isinstance(usage, dict) else None
+                raw = _total_tokens(usage) if isinstance(usage, dict) else 0
+                if generated is not None and raw >= generated:
+                    # Claude Code's result usage is authoritative for the complete turn.
+                    # Assistant usage remains useful for interrupting between turns.
+                    tokens = generated
+                    raw_tokens = raw
+                elif not is_error:
                     return DelegateResult(
                         tokens=tokens, raw_tokens=raw_tokens,
                         error="Claude delegate returned invalid usage",
                     )
-                generated = _generation_tokens(usage)
-                raw = _total_tokens(usage)
-                if generated is None or raw < generated:
-                    return DelegateResult(
-                        tokens=tokens, raw_tokens=raw_tokens,
-                        error="Claude delegate returned invalid usage",
-                    )
-                # Claude Code's result usage is authoritative for the complete turn.
-                # Assistant usage remains useful for interrupting between turns.
-                tokens = generated
-                raw_tokens = raw
                 text = event.get("result")
-                if not isinstance(text, str):
+                if not is_error and not isinstance(text, str):
                     return DelegateResult(
                         tokens=tokens, raw_tokens=raw_tokens,
                         error="Claude delegate returned invalid output",
                     )
-                result_text = text.strip()
+                result_text = text.strip() if isinstance(text, str) else ""
                 completed = True
         if not completed:
             return DelegateResult(
@@ -698,7 +696,7 @@ def run_claude_delegate(
                 error="Claude delegate ended without completion",
             )
         process.wait(timeout=5)
-        if process.returncode != 0:
+        if process.returncode != 0 or result_event.get("is_error") is True:
             return DelegateResult(
                 tokens=tokens, raw_tokens=raw_tokens,
                 error="Claude delegate failed: "

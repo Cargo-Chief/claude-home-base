@@ -616,16 +616,78 @@ class GovernedDelegationTest(unittest.TestCase):
             ({"api_error_status": 429}, "rate or usage limit reached (HTTP 429)"),
             ({"api_error_status": "529"}, "provider unavailable (HTTP 529)"),
             ({"api_error_status": 400}, "provider rejected the request (HTTP 400)"),
-            ({"is_error": True, "subtype": "error_max_turns"}, "run ended with error_max_turns"),
-            ({"is_error": True, "subtype": "Error; rm -rf"}, "exit status 1"),
-            ({}, "exit status 1"),
+            ({"api_error_status": 200}, "exit status 1"),
+            ({"api_error_status": 600}, "exit status 1"),
+            ({"api_error_status": -1}, "exit status 1"),
+            ({"api_error_status": "\u00b2"}, "exit status 1"),
+            ({"api_error_status": "9" * 5000}, "exit status 1"),
+            ({"api_error_status": True}, "exit status 1"),
+            ({"subtype": "error_during_execution"}, "run ended with error_during_execution"),
+            ({"subtype": "Error; rm -rf"}, "exit status 1"),
+            ({"subtype": "success"}, "exit status 1"),
+            ({"subtype": ["error_max_turns"]}, "exit status 1"),
         )
         for fields, reason in cases:
             with self.subTest(fields=fields):
                 result = self._failed_claude_run(popen, {
-                    "type": "result", "result": "x", "usage": usage, **fields,
+                    "type": "result", "is_error": True, "usage": usage, **fields,
                 })
                 self.assertEqual(f"Claude delegate failed: {reason}", result.error)
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_max_turns_result_without_text_is_classified(self, popen):
+        # Captured shape: error subtypes carry no `result` key.
+        result = self._failed_claude_run(popen, {
+            "type": "result", "subtype": "error_max_turns", "is_error": True,
+            "errors": [], "usage": {"input_tokens": 9, "output_tokens": 40},
+        })
+
+        self.assertEqual("Claude delegate failed: run ended with error_max_turns", result.error)
+        self.assertEqual(40, result.tokens)
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_error_result_without_usage_is_still_classified(self, popen):
+        result = self._failed_claude_run(popen, {
+            "type": "result", "is_error": True, "api_error_status": 429,
+        })
+
+        self.assertEqual(
+            "Claude delegate failed: rate or usage limit reached (HTTP 429)", result.error,
+        )
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_error_result_with_zero_exit_is_still_a_failure(self, popen):
+        result = self._failed_claude_run(popen, {
+            "type": "result", "is_error": True, "api_error_status": 401,
+            "result": "Failed to authenticate.", "usage": {"output_tokens": 0},
+        }, returncode=0)
+
+        self.assertEqual(
+            "Claude delegate failed: authentication rejected (HTTP 401)", result.error,
+        )
+        self.assertEqual("", result.text)
+
+    @patch("governed_delegation.subprocess.Popen")
+    def test_claude_stream_skips_non_object_and_oversized_json_lines(self, popen):
+        process = _StreamProcess([
+            "[]\n",
+            "5\n",
+            '{"n": ' + "9" * 5000 + "}\n",
+            json.dumps({
+                "type": "result", "result": "done",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }) + "\n",
+        ])
+        popen.return_value = process
+
+        result = run_claude_delegate(
+            ["claude", "-p", "--output-format", "stream-json"], "work",
+            cwd=str(self.work), env={}, token_limit=500_000, timeout=10,
+            on_process=lambda _value: None,
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual("done", result.text)
 
     @patch("governed_delegation.subprocess.Popen")
     def test_claude_result_usage_replaces_placeholder_assistant_usage(self, popen):
