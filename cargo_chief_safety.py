@@ -853,6 +853,43 @@ def preflight_room(policy: RoomPolicy) -> list[str]:
     return warnings
 
 
+NATIVE_DELEGATION_PROMPT = (
+    "- Delegate with the Agent tool, routed on task shape: cargo-chief-bounded for bounded "
+    "implementation or targeted verification, cargo-chief-mechanical for mechanical high-volume "
+    "work, cargo-chief-explore for read-only search. Keep decisions, production-touching work, "
+    "credentials and final verification in this owning session. Verify every load-bearing "
+    "delegate return before acting on it."
+)
+
+
+def auto_memory_directory(root: Path, home: Path | None = None) -> Path:
+    """The auto-memory directory an interactive session launched at ``root`` uses."""
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(root))
+    return (home or Path.home()) / ".claude" / "projects" / slug / "memory"
+
+
+def owner_settings(root: Path, home: Path | None = None) -> dict:
+    """Settings a thread session would get if it were launched at the workspace root.
+
+    Shared project settings load only from the launch directory, and auto memory is keyed by
+    it, so a thread launched in its scratch directory or bundle would otherwise miss the root's
+    project rules and start every thread with an empty memory.
+    """
+    settings: dict = {}
+    project = root / ".claude" / "settings.json"
+    try:
+        loaded = json.loads(project.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        loaded = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyError(f"unreadable project settings {project}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise SafetyError(f"project settings {project} must contain an object")
+    settings.update(loaded)
+    settings["autoMemoryDirectory"] = str(auto_memory_directory(root, home))
+    return settings
+
+
 def build_claude_command(
     policy: RoomPolicy,
     *,
@@ -862,12 +899,10 @@ def build_claude_command(
     escalation_message_file: Path,
     bundle_claim_file: Path,
     parking_claim_file: Path,
-    delegation_request_file: Path,
-    implementation_claim_file: Path,
-    delegate_timeout: int,
     identity_prompt: str = "",
     model_prompt: str = "",
     session_id: str | None = None,
+    home: Path | None = None,
 ) -> list[str]:
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
     harness_prompt = _build_harness_prompt(
@@ -877,14 +912,7 @@ def build_claude_command(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=bundle_claim_file,
         parking_claim_file=parking_claim_file,
-        delegation_request_file=delegation_request_file,
-        implementation_claim_file=implementation_claim_file,
-        delegate_timeout=delegate_timeout,
-        delegation=(
-            "Delegate only through the governed launcher described below. Do not invoke Agent, Task, "
-            "Explore, Plan, general-purpose, or any other provider-native subagent. Verify every "
-            "load-bearing delegate return before acting on it."
-        ),
+        delegation=NATIVE_DELEGATION_PROMPT,
     )
     appended = "\n\n".join(
         part for part in (overlay, harness_prompt, identity_prompt.strip(), model_prompt.strip()) if part
@@ -898,11 +926,48 @@ def build_claude_command(
         "--effort", policy.effort,
         "--model", policy.model,
         "--permission-mode", policy.permission_mode,
+        "--agents", json.dumps(APPROVED_DELEGATES, separators=(",", ":")),
+        "--settings", json.dumps(owner_settings(policy.root, home), separators=(",", ":")),
         "--append-system-prompt", appended,
     ]
     if session_id:
         command.extend(["--resume", session_id])
     return command
+
+
+def governed_delegation_prompt(
+    *,
+    transport_python: Path,
+    transport_script: Path,
+    delegation_request_file: Path,
+    implementation_claim_file: Path,
+    delegate_timeout: int,
+    owner_rule: str,
+) -> str:
+    """The launcher contract for an owning session with no native subagents (Codex fallback)."""
+    return (
+        "- To delegate, write exactly one JSON object with `tier`, `prompt`, boolean `mutation`, "
+        "`budget_unit`, and `planned_tokens` keys to "
+        f"{delegation_request_file}. Allowed tiers are implementation, bounded, mechanical, and "
+        "explore. The supported unit is `generation_tokens_v2`; `planned_tokens` is the positive "
+        "maximum generated-token allocation for this call. When a coordinator supplies those "
+        "values, copy both exactly. "
+        f"Each delegated call has a wall-clock limit of {delegate_timeout} seconds; size the task "
+        "so it can return evidence within that limit. "
+        "Every mutation=true request requires first writing the absolute path of the implementation-ready "
+        f"docs-worktree plan to {implementation_claim_file}. Then run exactly:\n"
+        f"  {shlex.quote(str(transport_python))} "
+        f"{shlex.quote(str(transport_script.parent / 'governed_delegation.py'))}\n"
+        "  The launcher consumes the one-shot files, validates the plan when required, enforces the "
+        "thread budget, selects the provider-equivalent model and effort, and returns evidence.\n"
+        "- After a delegate returns, independently verify its load-bearing result with at least one "
+        "tool call. Only then run this exact command to release the owner response:\n"
+        f"  {shlex.quote(str(transport_python))} "
+        f"{shlex.quote(str(transport_script.parent / 'governed_delegation.py'))} --verify\n"
+        "  If that verification receipt is missing at turn end, the harness withholds the substantive "
+        "owner response.\n"
+        f"- {owner_rule}"
+    )
 
 
 def _build_harness_prompt(
@@ -913,9 +978,6 @@ def _build_harness_prompt(
     escalation_message_file: Path,
     bundle_claim_file: Path,
     parking_claim_file: Path,
-    delegation_request_file: Path,
-    implementation_claim_file: Path,
-    delegate_timeout: int,
     delegation: str,
 ) -> str:
     return (
@@ -948,27 +1010,7 @@ def _build_harness_prompt(
         f"  {shlex.quote(str(transport_python))} "
         f"{shlex.quote(str(transport_script))} --check-parking\n"
         "The harness validates and consumes the same claim at turn end.\n"
-        "- To delegate, write exactly one JSON object with `tier`, `prompt`, boolean `mutation`, "
-        "`budget_unit`, and `planned_tokens` keys to "
-        f"{delegation_request_file}. Allowed tiers are implementation, bounded, mechanical, and "
-        "explore. The supported unit is `generation_tokens_v2`; `planned_tokens` is the positive "
-        "maximum generated-token allocation for this call. When a coordinator supplies those "
-        "values, copy both exactly. "
-        f"Each delegated call has a wall-clock limit of {delegate_timeout} seconds; size the task "
-        "so it can return evidence within that limit. "
-        "Every mutation=true request requires first writing the absolute path of the implementation-ready "
-        f"docs-worktree plan to {implementation_claim_file}. Then run exactly:\n"
-        f"  {shlex.quote(str(transport_python))} "
-        f"{shlex.quote(str(transport_script.parent / 'governed_delegation.py'))}\n"
-        "  The launcher consumes the one-shot files, validates the plan when required, enforces the "
-        "thread budget, selects the provider-equivalent model and effort, and returns evidence.\n"
-        "- After a delegate returns, independently verify its load-bearing result with at least one "
-        "tool call. Only then run this exact command to release the owner response:\n"
-        f"  {shlex.quote(str(transport_python))} "
-        f"{shlex.quote(str(transport_script.parent / 'governed_delegation.py'))} --verify\n"
-        "  If that verification receipt is missing at turn end, the harness withholds the substantive "
-        "owner response.\n"
-        f"- {delegation}\n"
+        f"{delegation}\n"
         "- When a normal worktree_task.sh run creates a ticket bundle for this thread, write only "
         f"its bundle directory name (CN-####-lowercase-slug) to {bundle_claim_file}. The harness "
         "validates ownership, safety, and the live-bundle cap before persisting the mapping."
@@ -998,14 +1040,18 @@ def build_codex_prompt(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=bundle_claim_file,
         parking_claim_file=parking_claim_file,
-        delegation_request_file=delegation_request_file,
-        implementation_claim_file=implementation_claim_file,
-        delegate_timeout=delegate_timeout,
-        delegation=(
-            "Delegate only through the governed launcher described below; raw Codex collaboration "
-            "is disabled. Keep decisions, production-touching work, credentials, and final "
-            "verification in this owning gpt-5.6-sol/high thread. Verify every load-bearing delegate "
-            "return before acting on it."
+        delegation=governed_delegation_prompt(
+            transport_python=transport_python,
+            transport_script=transport_script,
+            delegation_request_file=delegation_request_file,
+            implementation_claim_file=implementation_claim_file,
+            delegate_timeout=delegate_timeout,
+            owner_rule=(
+                "Delegate only through the governed launcher described below; raw Codex collaboration "
+                "is disabled. Keep decisions, production-touching work, credentials, and final "
+                "verification in this owning gpt-5.6-sol/high thread. Verify every load-bearing delegate "
+                "return before acting on it."
+            ),
         ),
     )
     parts = (overlay, harness, identity_prompt.strip(), inbound_prompt)

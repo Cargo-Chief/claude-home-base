@@ -22,11 +22,13 @@ from cargo_chief_safety import (
     resolve_thread_bundle,
     thread_workspace_key,
     build_authority_envelope,
+    auto_memory_directory,
     build_claude_command,
     build_codex_command,
     build_codex_prompt,
     find_workspace_root,
     format_audit_metadata,
+    owner_settings,
     preflight_room,
     resolve_room_policy,
     validate_secret_env_path,
@@ -630,9 +632,6 @@ class PreflightTest(unittest.TestCase):
             escalation_message_file=Path("/workspace/work/escalation.txt"),
             bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
             parking_claim_file=Path("/workspace/work/parking-claim.txt"),
-            delegation_request_file=Path("/workspace/work/delegation-request.json"),
-            implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
-            delegate_timeout=1_800,
             identity_prompt="agent identity",
             model_prompt="room prompt",
             session_id="session-1",
@@ -641,7 +640,9 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("--forward-subagent-text", command)
         self.assertNotIn("bypassPermissions", command)
         self.assertEqual("claude-opus-4-8[1m]", command[command.index("--model") + 1])
-        self.assertNotIn("--agents", command)
+        self.assertEqual(
+            APPROVED_DELEGATES, json.loads(command[command.index("--agents") + 1])
+        )
         appended = command[command.index("--append-system-prompt") + 1]
         self.assertTrue(appended.startswith(
             "autonomous\n\nCargo Chief harness authority and routing:"
@@ -659,11 +660,9 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("/workspace/work/parking-claim.txt", appended)
         self.assertIn("/workspace/work/escalation.txt", appended)
         self.assertIn("/workspace/work/bundle-claim.txt", appended)
-        self.assertIn("/workspace/work/delegation-request.json", appended)
-        self.assertIn("/workspace/work/implementation-claim.txt", appended)
-        self.assertIn("wall-clock limit of 1800 seconds", appended)
+        self.assertNotIn("governed_delegation.py", appended)
         self.assertNotIn("--channel D1", appended)
-        self.assertIn("Do not invoke Agent, Task, Explore, Plan", appended)
+        self.assertIn("Delegate with the Agent tool", appended)
         self.assertIn("agent identity", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
@@ -674,22 +673,6 @@ class PreflightTest(unittest.TestCase):
         # delegation in every thread refuses and no other test notices.
         from governed_delegation import BUDGET_UNIT
 
-        command = build_claude_command(
-            self.policy,
-            initial_prompt="context",
-            transport_python=Path("/venv/bin/python"),
-            transport_script=Path("/home-base/bot.py"),
-            escalation_message_file=Path("/workspace/work/escalation.txt"),
-            bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
-            parking_claim_file=Path("/workspace/work/parking-claim.txt"),
-            delegation_request_file=Path("/workspace/work/delegation-request.json"),
-            implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
-            delegate_timeout=1_800,
-            identity_prompt="agent identity",
-            model_prompt="room prompt",
-            session_id="session-1",
-        )
-        claude_prompt = command[command.index("--append-system-prompt") + 1]
         codex_prompt = build_codex_prompt(
             self.policy,
             inbound_prompt="authority envelope",
@@ -703,8 +686,49 @@ class PreflightTest(unittest.TestCase):
             delegate_timeout=1_200,
             identity_prompt="agent identity",
         )
-        for prompt in (claude_prompt, codex_prompt):
-            self.assertIn("The supported unit is `%s`" % BUDGET_UNIT, prompt)
+        self.assertIn("The supported unit is `%s`" % BUDGET_UNIT, codex_prompt)
+        self.assertIn("wall-clock limit of 1200 seconds", codex_prompt)
+        self.assertIn("/workspace/implementation-claim.txt", codex_prompt)
+
+    def test_claude_session_gets_root_settings_and_one_memory_directory(self):
+        settings_dir = self.root / ".claude"
+        settings_dir.mkdir(exist_ok=True)
+        (settings_dir / "settings.json").write_text(
+            json.dumps({"permissions": {"allow": ["Bash(ls)"]}})
+        )
+        command = build_claude_command(
+            self.policy,
+            initial_prompt="context",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/work/escalation.txt"),
+            bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
+            parking_claim_file=Path("/workspace/work/parking-claim.txt"),
+            home=Path("/Users/agent"),
+        )
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual({"allow": ["Bash(ls)"]}, settings["permissions"])
+        self.assertEqual(str(auto_memory_directory(self.root, Path("/Users/agent"))), settings["autoMemoryDirectory"])
+
+    def test_auto_memory_directory_matches_the_interactive_project_key(self):
+        self.assertEqual(
+            Path("/Users/ned/.claude/projects/-Users-ned-Code-cargo-chief/memory"),
+            auto_memory_directory(Path("/Users/ned/Code/cargo_chief"), Path("/Users/ned")),
+        )
+
+    def test_owner_settings_without_project_file_only_pins_memory(self):
+        settings = owner_settings(self.root / "missing-root", Path("/Users/agent"))
+        self.assertEqual(["autoMemoryDirectory"], list(settings))
+
+    def test_owner_settings_refuses_unreadable_project_file(self):
+        settings_dir = self.root / ".claude"
+        settings_dir.mkdir(exist_ok=True)
+        (settings_dir / "settings.json").write_text("[1, 2]")
+        with self.assertRaisesRegex(SafetyError, "must contain an object"):
+            owner_settings(self.root, Path("/Users/agent"))
+        (settings_dir / "settings.json").write_text("{not json")
+        with self.assertRaisesRegex(SafetyError, "unreadable project settings"):
+            owner_settings(self.root, Path("/Users/agent"))
 
     def test_codex_command_uses_governed_profile_model_and_effort(self):
         command = build_codex_command(self.policy, cwd=Path("/workspace/work/thread"))

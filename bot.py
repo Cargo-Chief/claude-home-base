@@ -815,9 +815,6 @@ def _spawn_claude_process(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=workspace.bundle_claim_file,
         parking_claim_file=workspace.parking_claim_file,
-        delegation_request_file=workspace.delegation_request_file,
-        implementation_claim_file=workspace.implementation_claim_file,
-        delegate_timeout=DELEGATE_TIMEOUT,
         identity_prompt=_identity_prompt(),
         model_prompt=model_prompt,
         session_id=session_id,
@@ -842,17 +839,11 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
     proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
     proc_env["CARGO_CHIEF_ROOT"] = str(policy.root)
-    proc_env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"] = str(workspace.delegation_request_file)
-    proc_env["CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE"] = str(workspace.implementation_claim_file)
-    proc_env["CARGO_CHIEF_DELEGATION_BUDGET_FILE"] = str(workspace.delegation_budget_file)
-    proc_env["CARGO_CHIEF_DELEGATE_PID_FILE"] = str(workspace.delegate_pid_file)
-    proc_env["CARGO_CHIEF_DELEGATE_VERIFICATION_FILE"] = str(workspace.delegate_verification_file)
-    proc_env["CARGO_CHIEF_AUDIT_LOG"] = str(delegation_audit_path(policy.root))
+    # Claude sessions delegate natively; the launcher variables would arm delegation-guard.sh.
     proc_env["CARGO_CHIEF_OWNER_PROVIDER"] = "claude"
     proc_env["CARGO_CHIEF_OWNER_MODEL"] = policy.model
     proc_env["CARGO_CHIEF_OWNER_EFFORT"] = policy.effort
     proc_env["CARGO_CHIEF_CURRENT_USER"] = user_id
-    proc_env["CARGO_CHIEF_DELEGATE_TIMEOUT"] = str(DELEGATE_TIMEOUT)
     bundle = resolve_thread_bundle(workspace)
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
