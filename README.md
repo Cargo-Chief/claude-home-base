@@ -18,15 +18,16 @@ agent process. Claude remains primary; a room can move to its OpenAI fallback on
 harness recognizes Claude's account credit-limit response.
 
 Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.
-The governed launcher reads `CLAUDE_CODE_OAUTH_TOKEN` from that same file (or
+The governed launcher still supports Claude delegates, although no thread routes one there now
+that Claude owners delegate natively; for them it reads `CLAUDE_CODE_OAUTH_TOKEN` from that same file (or
 `CARGO_CHIEF_ENV_FILE`) and sets it only on the Claude delegate's environment, because the
 owner session's shell does not reliably carry it.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
 `CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live sessions and stops a turn after at most 15
-minutes without owner output or a live governed delegate. A governed delegate retains its own
-bounded call timeout and generation-token allocation; its held launcher lock keeps the owner alive long
-enough for the launcher to meter the return, and the owner receives a fresh inactivity window when
-the delegate exits. A one-hour hard limit still prevents a continuously noisy or repeatedly
+minutes without owner output; a native subagent's streamed events count as output. On the OpenAI
+fallback a governed delegate retains its own bounded call timeout and generation-token allocation;
+its held launcher lock keeps the owner alive long enough for the launcher to meter the return, and
+the owner receives a fresh inactivity window when the delegate exits. A one-hour hard limit still prevents a continuously noisy or repeatedly
 delegating turn from holding one of the two admission slots forever. Gate A also writes metadata-only audit records, removes stale temporary files
 at startup, and refuses file transfer or transcript search. Additional Slack threads wait behind
 the two active turns and start automatically when capacity is available; requests are not

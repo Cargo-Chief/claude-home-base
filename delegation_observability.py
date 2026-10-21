@@ -74,6 +74,10 @@ class DelegationTracker:
                 for tool_id in self.completed:
                     self.records[tool_id].owner_verification_tools += tool_count
 
+    def has_running(self) -> bool:
+        """Whether a subagent has started and not yet reported completion."""
+        return any(tool_id not in self.completed for tool_id in self.records)
+
     def finish_turn(self) -> list[DelegationRecord]:
         finished_ids = [tool_id for tool_id in self.records if tool_id in self.completed]
         result = [self.records.pop(tool_id) for tool_id in finished_ids]

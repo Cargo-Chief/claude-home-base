@@ -100,6 +100,7 @@ class DelegationTrackerTest(unittest.TestCase):
         # is still running. In-flight state must not be audited or discarded.
         self.assertEqual([], tracker.finish_turn())
         self.assertIn("tool-bg", tracker.records)
+        self.assertTrue(tracker.has_running())
 
         tracker.observe({
             "type": "assistant", "parent_tool_use_id": "tool-bg",
@@ -110,6 +111,7 @@ class DelegationTrackerTest(unittest.TestCase):
             "tool_use_id": "tool-bg", "status": "completed",
             "usage": {"total_tokens": 4000, "tool_uses": 2, "duration_ms": 9000},
         })
+        self.assertFalse(tracker.has_running())
         tracker.observe({
             "type": "assistant", "message": {"content": [
                 {"type": "tool_use", "name": "Bash", "input": {"command": "hidden"}},

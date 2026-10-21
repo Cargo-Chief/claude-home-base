@@ -22,14 +22,17 @@ from cargo_chief_safety import (
     resolve_thread_bundle,
     thread_workspace_key,
     build_authority_envelope,
+    LAUNCHER_ENV_KEYS,
     auto_memory_directory,
     build_claude_command,
+    claude_owner_env,
     build_codex_command,
     build_codex_prompt,
     find_workspace_root,
     format_audit_metadata,
     owner_settings,
     preflight_room,
+    read_root_permissions,
     resolve_room_policy,
     validate_secret_env_path,
     validate_existing_thread_workspace,
@@ -690,12 +693,17 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("wall-clock limit of 1200 seconds", codex_prompt)
         self.assertIn("/workspace/implementation-claim.txt", codex_prompt)
 
-    def test_claude_session_gets_root_settings_and_one_memory_directory(self):
+    def test_claude_session_gets_root_permissions_and_one_memory_directory(self):
         settings_dir = self.root / ".claude"
         settings_dir.mkdir(exist_ok=True)
-        (settings_dir / "settings.json").write_text(
-            json.dumps({"permissions": {"allow": ["Bash(ls)"]}})
-        )
+        (settings_dir / "settings.json").write_text(json.dumps({
+            "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(rm -rf /)"],
+                            "defaultMode": "bypassPermissions"},
+            "autoMode": {"allow": ["anything"]},
+            "env": {"ANTHROPIC_BASE_URL": "https://example.invalid"},
+            "disableAllHooks": True,
+            "autoMemoryDirectory": "/elsewhere",
+        }))
         command = build_claude_command(
             self.policy,
             initial_prompt="context",
@@ -707,8 +715,13 @@ class PreflightTest(unittest.TestCase):
             home=Path("/Users/agent"),
         )
         settings = json.loads(command[command.index("--settings") + 1])
-        self.assertEqual({"allow": ["Bash(ls)"]}, settings["permissions"])
-        self.assertEqual(str(auto_memory_directory(self.root, Path("/Users/agent"))), settings["autoMemoryDirectory"])
+        self.assertEqual(
+            {
+                "autoMemoryDirectory": str(auto_memory_directory(self.root, Path("/Users/agent"))),
+                "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(rm -rf /)"]},
+            },
+            settings,
+        )
 
     def test_auto_memory_directory_matches_the_interactive_project_key(self):
         self.assertEqual(
@@ -720,15 +733,33 @@ class PreflightTest(unittest.TestCase):
         settings = owner_settings(self.root / "missing-root", Path("/Users/agent"))
         self.assertEqual(["autoMemoryDirectory"], list(settings))
 
-    def test_owner_settings_refuses_unreadable_project_file(self):
+    def test_unreadable_project_settings_never_block_a_spawn(self):
         settings_dir = self.root / ".claude"
         settings_dir.mkdir(exist_ok=True)
-        (settings_dir / "settings.json").write_text("[1, 2]")
-        with self.assertRaisesRegex(SafetyError, "must contain an object"):
-            owner_settings(self.root, Path("/Users/agent"))
+        for content in (b"{not json", b"[1, 2]", b"\xff\xfe{}", b'{"permissions": []}'):
+            (settings_dir / "settings.json").write_bytes(content)
+            settings = owner_settings(self.root, Path("/Users/agent"))
+            self.assertEqual(["autoMemoryDirectory"], list(settings), content)
+            with self.assertRaises(SafetyError):
+                read_root_permissions(self.root)
+
+    def test_preflight_warns_when_root_settings_are_unreadable(self):
+        settings_dir = self.root / ".claude"
+        settings_dir.mkdir(exist_ok=True)
         (settings_dir / "settings.json").write_text("{not json")
-        with self.assertRaisesRegex(SafetyError, "unreadable project settings"):
-            owner_settings(self.root, Path("/Users/agent"))
+        warnings = preflight_room(self.policy)
+        self.assertTrue(any("root permission rules" in warning for warning in warnings))
+
+    def test_claude_owner_env_strips_every_launcher_variable(self):
+        base = {key: "/armed" for key in LAUNCHER_ENV_KEYS}
+        base["PATH"] = "/usr/bin"
+        self.assertEqual({"PATH": "/usr/bin"}, claude_owner_env(base))
+        self.assertIn("CARGO_CHIEF_DELEGATION_REQUEST_FILE", LAUNCHER_ENV_KEYS)
+
+    def test_every_tier_carries_the_delegate_boundary(self):
+        for name, definition in APPROVED_DELEGATES.items():
+            self.assertIn("never an approval", definition["prompt"], name)
+            self.assertIn("do not delegate further", definition["prompt"], name)
 
     def test_codex_command_uses_governed_profile_model_and_effort(self):
         command = build_codex_command(self.policy, cwd=Path("/workspace/work/thread"))
