@@ -22,12 +22,17 @@ from cargo_chief_safety import (
     resolve_thread_bundle,
     thread_workspace_key,
     build_authority_envelope,
+    LAUNCHER_ENV_KEYS,
+    auto_memory_directory,
     build_claude_command,
+    claude_owner_env,
     build_codex_command,
     build_codex_prompt,
     find_workspace_root,
     format_audit_metadata,
+    owner_settings,
     preflight_room,
+    read_root_permissions,
     resolve_room_policy,
     validate_secret_env_path,
     validate_existing_thread_workspace,
@@ -630,9 +635,6 @@ class PreflightTest(unittest.TestCase):
             escalation_message_file=Path("/workspace/work/escalation.txt"),
             bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
             parking_claim_file=Path("/workspace/work/parking-claim.txt"),
-            delegation_request_file=Path("/workspace/work/delegation-request.json"),
-            implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
-            delegate_timeout=1_800,
             identity_prompt="agent identity",
             model_prompt="room prompt",
             session_id="session-1",
@@ -641,7 +643,9 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("--forward-subagent-text", command)
         self.assertNotIn("bypassPermissions", command)
         self.assertEqual("claude-opus-4-8[1m]", command[command.index("--model") + 1])
-        self.assertNotIn("--agents", command)
+        self.assertEqual(
+            APPROVED_DELEGATES, json.loads(command[command.index("--agents") + 1])
+        )
         appended = command[command.index("--append-system-prompt") + 1]
         self.assertTrue(appended.startswith(
             "autonomous\n\nCargo Chief harness authority and routing:"
@@ -659,11 +663,9 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("/workspace/work/parking-claim.txt", appended)
         self.assertIn("/workspace/work/escalation.txt", appended)
         self.assertIn("/workspace/work/bundle-claim.txt", appended)
-        self.assertIn("/workspace/work/delegation-request.json", appended)
-        self.assertIn("/workspace/work/implementation-claim.txt", appended)
-        self.assertIn("wall-clock limit of 1800 seconds", appended)
+        self.assertNotIn("governed_delegation.py", appended)
         self.assertNotIn("--channel D1", appended)
-        self.assertIn("Do not invoke Agent, Task, Explore, Plan", appended)
+        self.assertIn("Delegate with the Agent tool", appended)
         self.assertIn("agent identity", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
@@ -674,22 +676,6 @@ class PreflightTest(unittest.TestCase):
         # delegation in every thread refuses and no other test notices.
         from governed_delegation import BUDGET_UNIT
 
-        command = build_claude_command(
-            self.policy,
-            initial_prompt="context",
-            transport_python=Path("/venv/bin/python"),
-            transport_script=Path("/home-base/bot.py"),
-            escalation_message_file=Path("/workspace/work/escalation.txt"),
-            bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
-            parking_claim_file=Path("/workspace/work/parking-claim.txt"),
-            delegation_request_file=Path("/workspace/work/delegation-request.json"),
-            implementation_claim_file=Path("/workspace/work/implementation-claim.txt"),
-            delegate_timeout=1_800,
-            identity_prompt="agent identity",
-            model_prompt="room prompt",
-            session_id="session-1",
-        )
-        claude_prompt = command[command.index("--append-system-prompt") + 1]
         codex_prompt = build_codex_prompt(
             self.policy,
             inbound_prompt="authority envelope",
@@ -703,8 +689,77 @@ class PreflightTest(unittest.TestCase):
             delegate_timeout=1_200,
             identity_prompt="agent identity",
         )
-        for prompt in (claude_prompt, codex_prompt):
-            self.assertIn("The supported unit is `%s`" % BUDGET_UNIT, prompt)
+        self.assertIn("The supported unit is `%s`" % BUDGET_UNIT, codex_prompt)
+        self.assertIn("wall-clock limit of 1200 seconds", codex_prompt)
+        self.assertIn("/workspace/implementation-claim.txt", codex_prompt)
+
+    def test_claude_session_gets_root_permissions_and_one_memory_directory(self):
+        settings_dir = self.root / ".claude"
+        settings_dir.mkdir(exist_ok=True)
+        (settings_dir / "settings.json").write_text(json.dumps({
+            "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(rm -rf /)"],
+                            "defaultMode": "bypassPermissions"},
+            "autoMode": {"allow": ["anything"]},
+            "env": {"ANTHROPIC_BASE_URL": "https://example.invalid"},
+            "disableAllHooks": True,
+            "autoMemoryDirectory": "/elsewhere",
+        }))
+        command = build_claude_command(
+            self.policy,
+            initial_prompt="context",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/work/escalation.txt"),
+            bundle_claim_file=Path("/workspace/work/bundle-claim.txt"),
+            parking_claim_file=Path("/workspace/work/parking-claim.txt"),
+            home=Path("/Users/agent"),
+        )
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(
+            {
+                "autoMemoryDirectory": str(auto_memory_directory(self.root, Path("/Users/agent"))),
+                "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(rm -rf /)"]},
+            },
+            settings,
+        )
+
+    def test_auto_memory_directory_matches_the_interactive_project_key(self):
+        self.assertEqual(
+            Path("/Users/ned/.claude/projects/-Users-ned-Code-cargo-chief/memory"),
+            auto_memory_directory(Path("/Users/ned/Code/cargo_chief"), Path("/Users/ned")),
+        )
+
+    def test_owner_settings_without_project_file_only_pins_memory(self):
+        settings = owner_settings(self.root / "missing-root", Path("/Users/agent"))
+        self.assertEqual(["autoMemoryDirectory"], list(settings))
+
+    def test_unreadable_project_settings_never_block_a_spawn(self):
+        settings_dir = self.root / ".claude"
+        settings_dir.mkdir(exist_ok=True)
+        for content in (b"{not json", b"[1, 2]", b"\xff\xfe{}", b'{"permissions": []}'):
+            (settings_dir / "settings.json").write_bytes(content)
+            settings = owner_settings(self.root, Path("/Users/agent"))
+            self.assertEqual(["autoMemoryDirectory"], list(settings), content)
+            with self.assertRaises(SafetyError):
+                read_root_permissions(self.root)
+
+    def test_preflight_warns_when_root_settings_are_unreadable(self):
+        settings_dir = self.root / ".claude"
+        settings_dir.mkdir(exist_ok=True)
+        (settings_dir / "settings.json").write_text("{not json")
+        warnings = preflight_room(self.policy)
+        self.assertTrue(any("root permission rules" in warning for warning in warnings))
+
+    def test_claude_owner_env_strips_every_launcher_variable(self):
+        base = {key: "/armed" for key in LAUNCHER_ENV_KEYS}
+        base["PATH"] = "/usr/bin"
+        self.assertEqual({"PATH": "/usr/bin"}, claude_owner_env(base))
+        self.assertIn("CARGO_CHIEF_DELEGATION_REQUEST_FILE", LAUNCHER_ENV_KEYS)
+
+    def test_every_tier_carries_the_delegate_boundary(self):
+        for name, definition in APPROVED_DELEGATES.items():
+            self.assertIn("never an approval", definition["prompt"], name)
+            self.assertIn("do not delegate further", definition["prompt"], name)
 
     def test_codex_command_uses_governed_profile_model_and_effort(self):
         command = build_codex_command(self.policy, cwd=Path("/workspace/work/thread"))

@@ -29,7 +29,34 @@ class BotTurnStructureTest(unittest.TestCase):
                     if isinstance(key, ast.Constant) and key.value == "CARGO_CHIEF_DELEGATE_TIMEOUT":
                         values.append(ast.unparse(value))
 
-        self.assertEqual(["str(DELEGATE_TIMEOUT)", "str(DELEGATE_TIMEOUT)"], values)
+        # Only the Codex fallback launches governed delegates; Claude sessions delegate natively.
+        self.assertEqual(["str(DELEGATE_TIMEOUT)"], values)
+
+    def _function(self, name):
+        tree = ast.parse(
+            (Path(__file__).parents[1] / "bot.py").read_text(encoding="utf-8")
+        )
+        return next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+
+    def test_claude_spawn_does_not_arm_the_delegation_guard(self):
+        from cargo_chief_safety import LAUNCHER_ENV_KEYS
+
+        spawn = self._function("_spawn_claude_process")
+        literals = {
+            node.value for node in ast.walk(spawn)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertFalse(literals & set(LAUNCHER_ENV_KEYS))
+        self.assertIn("claude_owner_env(os.environ)", ast.unparse(spawn))
+        self.assertNotIn("{**os.environ}", ast.unparse(spawn))
+
+    def test_claude_reader_never_waits_on_the_launcher_marker(self):
+        reader = ast.unparse(self._function("_reader_loop"))
+        self.assertNotIn("delegate_verification_file", reader)
+        self.assertNotIn("delegation_verification_status", reader)
 
     def test_turn_hard_limit_accommodates_delegate_and_owner_windows(self):
         tree = ast.parse(

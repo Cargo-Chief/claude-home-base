@@ -52,6 +52,7 @@ from cargo_chief_safety import (
     build_claude_command,
     build_codex_command,
     build_codex_prompt,
+    claude_owner_env,
     cleanup_thread_workspaces,
     consume_bundle_claim,
     consume_parking_claim,
@@ -791,22 +792,16 @@ def _spawn_claude_process(
     workspace = prepare_thread_workspace(
         policy.root, channel=channel, thread=thread_ts, session_id=session_id
     )
-    prepare_owner_delegation_state(
-        workspace.delegation_budget_file,
-        workspace.delegate_verification_file,
-    )
     escalation_message_file = workspace.escalation_message_file
     escalation_receipt_file = workspace.escalation_receipt_file
     for stale_path in (
         escalation_message_file, escalation_receipt_file,
         workspace.escalation_attempt_file, workspace.parking_claim_file,
-        workspace.delegation_request_file, workspace.implementation_claim_file,
     ):
         try:
             stale_path.unlink()
         except FileNotFoundError:
             pass
-    cleanup_stale_delegate_pid(workspace.delegate_pid_file)
     cmd = build_claude_command(
         policy,
         initial_prompt=battery_context,
@@ -815,9 +810,6 @@ def _spawn_claude_process(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=workspace.bundle_claim_file,
         parking_claim_file=workspace.parking_claim_file,
-        delegation_request_file=workspace.delegation_request_file,
-        implementation_claim_file=workspace.implementation_claim_file,
-        delegate_timeout=DELEGATE_TIMEOUT,
         identity_prompt=_identity_prompt(),
         model_prompt=model_prompt,
         session_id=session_id,
@@ -827,7 +819,7 @@ def _spawn_claude_process(
         mode="w+", suffix=".stderr", delete=False, dir=TEMP_DIR
     )
 
-    proc_env = {**os.environ}
+    proc_env = claude_owner_env(os.environ)
     if thread_ts:
         proc_env["CLAUDE_THREAD_TS"] = thread_ts
     if channel:
@@ -842,17 +834,10 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
     proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
     proc_env["CARGO_CHIEF_ROOT"] = str(policy.root)
-    proc_env["CARGO_CHIEF_DELEGATION_REQUEST_FILE"] = str(workspace.delegation_request_file)
-    proc_env["CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE"] = str(workspace.implementation_claim_file)
-    proc_env["CARGO_CHIEF_DELEGATION_BUDGET_FILE"] = str(workspace.delegation_budget_file)
-    proc_env["CARGO_CHIEF_DELEGATE_PID_FILE"] = str(workspace.delegate_pid_file)
-    proc_env["CARGO_CHIEF_DELEGATE_VERIFICATION_FILE"] = str(workspace.delegate_verification_file)
-    proc_env["CARGO_CHIEF_AUDIT_LOG"] = str(delegation_audit_path(policy.root))
     proc_env["CARGO_CHIEF_OWNER_PROVIDER"] = "claude"
     proc_env["CARGO_CHIEF_OWNER_MODEL"] = policy.model
     proc_env["CARGO_CHIEF_OWNER_EFFORT"] = policy.effort
     proc_env["CARGO_CHIEF_CURRENT_USER"] = user_id
-    proc_env["CARGO_CHIEF_DELEGATE_TIMEOUT"] = str(DELEGATE_TIMEOUT)
     bundle = resolve_thread_bundle(workspace)
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
@@ -1048,12 +1033,6 @@ def _reader_loop(session: LiveSession) -> None:
                 if session.private_escalation_pending:
                     continue
 
-                if (session.workspace
-                        and session.workspace.delegate_verification_file.is_file()):
-                    # The delegate return is visible inside the owner context but may not reach
-                    # Slack until the owner records an independent verification.
-                    continue
-
                 _track_model(session, data)
                 _track_context(session, data)
                 has_tool_use = any(
@@ -1133,18 +1112,6 @@ def _reader_loop(session: LiveSession) -> None:
                                 session.user_id, session.channel, session.thread_ts,
                                 parking.kind, parking.path.relative_to(session.workspace.root),
                             )
-                verification_status = (
-                    delegation_verification_status(
-                        session.workspace.delegate_verification_file
-                    ) if session.workspace else None
-                )
-                verification_missing = verification_status in {"pending", "invalid"}
-                if verification_missing:
-                    audit_logger.warning(
-                        "DELEGATION_VERIFICATION | USER:%s | CHANNEL:%s | THREAD:%s "
-                        "| OWNER_VERIFY_TOOLS:0 | STATUS:missing",
-                        session.user_id, session.channel, session.thread_ts,
-                    )
                 sid = data.get("session_id")
                 if sid:
                     session.session_id = sid
@@ -1173,45 +1140,10 @@ def _reader_loop(session: LiveSession) -> None:
                     )
                     if session._on_text:
                         session._on_text(status)
-                elif verification_missing:
-                    if session._on_text:
-                        session._on_text(
-                            "Delegate result withheld: independent owner verification is missing."
-                        )
-                elif verification_status not in {"allocation_exhausted", "budget_exhausted"}:
+                else:
                     for text in session.pre_tool_text:
                         if session._on_text:
                             session._on_text(text)
-                if verification_status == "budget_exhausted" and session.workspace:
-                    consumed = consume_budget_exhaustion(
-                        session.workspace.delegate_verification_file
-                    )
-                    if session._on_text:
-                        recovery = (
-                            "Owner-only replies remain available."
-                            if consumed else
-                            "The exhaustion notice could not be cleared; retry an owner-only "
-                            "reply or ask a named approver to reset the budget."
-                        )
-                        session._on_text(
-                            "Delegate result withheld: thread delegation budget exhausted; "
-                            "further delegation requires a named approver to reset or raise "
-                            f"the budget. {recovery}"
-                        )
-                elif verification_status == "allocation_exhausted" and session.workspace:
-                    consumed = consume_allocation_exhaustion(
-                        session.workspace.delegate_verification_file
-                    )
-                    if session._on_text:
-                        recovery = (
-                            "Owner-only replies and the remaining thread budget are available."
-                            if consumed else
-                            "The allocation notice could not be cleared; retry an owner-only reply."
-                        )
-                        session._on_text(
-                            "Delegate result withheld: stage generation-token allocation "
-                            f"exhausted. {recovery}"
-                        )
                 session.private_escalation_pending = False
                 session.first_tool_seen = False
                 session.pre_tool_text.clear()
@@ -2535,6 +2467,26 @@ def _interrupt_session(session: LiveSession) -> bool:
     return False
 
 
+def _stop_background_delegates(session) -> None:
+    """End a process whose owner turn is over but whose background subagents still run."""
+    session.proc.terminate()
+    try:
+        session.proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        session.proc.kill()
+        session.proc.wait(timeout=5)
+    note = "stopped the background subagents; the thread resumes with full context on your next message"
+    try:
+        slack_client.chat_postMessage(
+            channel=session.channel, thread_ts=session.thread_ts,
+            text=f"Stopped: {note}",
+            blocks=[{"type": "context", "elements": [
+                {"type": "mrkdwn", "text": f":octagonal_sign: _{note}_"}]}],
+        )
+    except Exception:
+        pass
+
+
 def _maybe_stop_from_message(event: dict) -> bool:
     """In-thread Esc: Slack blocks slash commands in thread reply boxes, so a
     bare 'stop' (or 'esc') in a thread with a running turn interrupts it
@@ -2584,6 +2536,10 @@ def _maybe_stop_from_message(event: dict) -> bool:
             blocks=[{"type": "context", "elements": [
                 {"type": "mrkdwn", "text": f":octagonal_sign: _{note}_"}]}],
         )
+        return True
+    if (session and session.proc.poll() is None and not session.turn_lock.locked()
+            and session.delegation_tracker.has_running()):
+        threading.Thread(target=_stop_background_delegates, args=(session,), daemon=True).start()
         return True
     if not session or session.proc.poll() is not None or not session.turn_lock.locked():
         if delegate_stopped:

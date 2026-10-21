@@ -18,15 +18,16 @@ agent process. Claude remains primary; a room can move to its OpenAI fallback on
 harness recognizes Claude's account credit-limit response.
 
 Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.
-The governed launcher reads `CLAUDE_CODE_OAUTH_TOKEN` from that same file (or
+The governed launcher still supports Claude delegates, although no thread routes one there now
+that Claude owners delegate natively; for them it reads `CLAUDE_CODE_OAUTH_TOKEN` from that same file (or
 `CARGO_CHIEF_ENV_FILE`) and sets it only on the Claude delegate's environment, because the
 owner session's shell does not reliably carry it.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
 `CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live sessions and stops a turn after at most 15
-minutes without owner output or a live governed delegate. A governed delegate retains its own
-bounded call timeout and generation-token allocation; its held launcher lock keeps the owner alive long
-enough for the launcher to meter the return, and the owner receives a fresh inactivity window when
-the delegate exits. A one-hour hard limit still prevents a continuously noisy or repeatedly
+minutes without owner output; a native subagent's streamed events count as output. On the OpenAI
+fallback a governed delegate retains its own bounded call timeout and generation-token allocation;
+its held launcher lock keeps the owner alive long enough for the launcher to meter the return, and
+the owner receives a fresh inactivity window when the delegate exits. A one-hour hard limit still prevents a continuously noisy or repeatedly
 delegating turn from holding one of the two admission slots forever. Gate A also writes metadata-only audit records, removes stale temporary files
 at startup, and refuses file transfer or transcript search. Additional Slack threads wait behind
 the two active turns and start automatically when capacity is available; requests are not
@@ -92,9 +93,15 @@ the parked source thread. The first named-approver reply is atomically delivered
 Claude or OpenAI session, including after a daemon restart. Duplicate, expired, malformed, and
 non-approver replies cannot start an unrelated DM task or consume the active decision route.
 
-Delegation is pinned by the harness rather than inherited from a machine default. Raw Claude Agent
-calls and Codex multi-agent are disabled; both providers use the same one-shot governed launcher.
-Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,
+Claude sessions delegate with the native Agent tool. The harness passes the three tier definitions
+(`cargo-chief-bounded`, `-mechanical`, `-explore`) with `--agents`, and records content-free audit
+metadata for each subagent run. Each Claude spawn also receives the workspace root's project
+settings and a pinned `autoMemoryDirectory` through `--settings`, because shared settings and auto
+memory are keyed by the launch directory. Without that, a thread launched in its scratch directory
+or bundle misses the root's rules and starts with an empty memory.
+
+The OpenAI fallback has no native subagents, so Codex multi-agent stays disabled and Codex turns
+delegate through the one-shot governed launcher. Implementation requires a validated `implementation-ready` plan in a real docs worktree. Bounded,
 mechanical, and explore tiers route to the approved provider-equivalent model and effort. Every
 thread has a persistent 500,000 generated/reasoning-token ceiling; only a named approver can inspect,
 reset, or change it, and bare `stop` terminates an active delegate. That default applies to *new*
@@ -305,7 +312,7 @@ file is mode `0600` and never contains prompts or delegate returns.
 - **Per-room models** — `model-config.json` picks which model and reasoning effort answers in each channel or DM, plus an optional per-model system prompt; read fresh on every spawn (no restart), editable from the file explorer's `/models` page. Name a `default_model` there and the page's default row becomes a dropdown too, so you can move every unconfigured room to a different model in one pick
 - **Prompt cadence** — a per-model prompt is in the Claude system prompt at spawn and can be re-sent every Nth message so a standing instruction does not decay
 - **Credit-limit fallback** — a recognized Claude account limit moves the Slack thread to its explicit, profile-governed OpenAI model while preserving the authority envelope and durable session id
-- **Governed delegation** — one provider-neutral launcher enforces implementation-plan readiness, exact model/effort routing, a persistent 500k thread budget, metadata-only audit, and the shared stop path. Usage is enforced at provider call boundaries: once a Claude stream event or Codex app-server notification reaches the remaining allowance, the launcher interrupts before another model call, charges the full observed usage, and withholds that turn's return. The withholding notice is consumed after delivery so later owner-only replies remain available, while the numeric budget continues to refuse further delegates. One already-running provider call can cross the exact token boundary because usage arrives only after that call completes
+- **Governed delegation (OpenAI fallback)** — one launcher enforces implementation-plan readiness, exact model/effort routing, a persistent 500k thread budget, metadata-only audit, and the shared stop path. Usage is enforced at provider call boundaries: once a Claude stream event or Codex app-server notification reaches the remaining allowance, the launcher interrupts before another model call, charges the full observed usage, and withholds that turn's return. The withholding notice is consumed after delivery so later owner-only replies remain available, while the numeric budget continues to refuse further delegates. One already-running provider call can cross the exact token boundary because usage arrives only after that call completes
 - **Interactive buttons** — button clicks and menu picks route back into the thread's Claude session as messages, so your AI can offer approve/hold/snooze choices and act on the answer (requires Interactivity enabled in your Slack app config; Request URL = the same `/slack/events` endpoint)
 - **In-thread stop** — type a bare `stop` in a thread where the bot is mid-run to interrupt it (like Esc in the terminal); the session survives with full context, so your next message steers it in the new direction
 - **Mid-turn steering** — message a thread while the bot is mid-run and it sees your message at the next tool-call boundary, inside the same turn (like typing without Esc in the terminal); no more waiting for the whole task to finish before you can course-correct
