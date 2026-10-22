@@ -27,8 +27,9 @@ Logs, session maps, forwards, votes, stderr, and temporary artifacts live under 
 minutes without owner output; a native subagent's streamed events count as output. On the OpenAI
 fallback a governed delegate retains its own bounded call timeout and generation-token allocation;
 its held launcher lock keeps the owner alive long enough for the launcher to meter the return, and
-the owner receives a fresh inactivity window when the delegate exits. A one-hour hard limit still prevents a continuously noisy or repeatedly
-delegating turn from holding one of the two admission slots forever. Gate A also writes metadata-only audit records, removes stale temporary files
+the owner receives a fresh inactivity window when the delegate exits. A hard limit, `MAX_TURN_RUNTIME` (default three hours, 600–21600 seconds), still
+prevents a continuously noisy or repeatedly delegating turn from holding one of the two admission
+slots forever; the status line and progress notices show a long turn is moving. Gate A also writes metadata-only audit records, removes stale temporary files
 at startup, and refuses file transfer or transcript search. Additional Slack threads wait behind
 the two active turns and start automatically when capacity is available; requests are not
 discarded at the session cap.
@@ -307,7 +308,7 @@ file is mode `0600` and never contains prompts or delegate returns.
 - **Thread continuity** — session IDs persist per thread
 - **File handling** — upstream capability; disabled by the Cargo Chief Gate A runtime policy
 - **Proactive messaging** — send DMs, post to channels, reply in threads via CLI
-- **Turn reporting** (Claude path) — narration between tool calls edits one live status line per turn instead of posting a message each time. A text block starting with ❓ (question) or 💬 (message for a person) posts as its own message, and the text written after the turn's last tool call posts as the reply when the turn ends. A heartbeat refreshes the status every minute with elapsed time and time since last activity, and posts a short "still working" note after 20 quiet minutes. Context and skill notices join the status line. The OpenAI fallback still posts its texts at turn end
+- **Turn reporting** (Claude path) — narration between tool calls edits one live status line per turn instead of posting a message each time. A text block starting with ❓ (question) or 💬 (message for a person) posts as its own message, and the text written after the turn's last tool call posts as the reply when the turn ends. A heartbeat refreshes the status every minute with elapsed time and time since last activity, and posts a short "still working" note after 20 quiet minutes. Context and skill notices join the status line. Output the process produces after its turn has ended (a background task finishing) is not posted; the thread gets a one-line notice instead, and the reporting prompt tells the agent not to end a turn with background work running. The OpenAI fallback still posts its texts at turn end
 - **Native tables** — markdown tables in responses render as real Slack tables (Block Kit `markdown` block)
 - **Per-room models** — `model-config.json` picks which model and reasoning effort answers in each channel or DM, plus an optional per-model system prompt; read fresh on every spawn (no restart), editable from the file explorer's `/models` page. Name a `default_model` there and the page's default row becomes a dropdown too, so you can move every unconfigured room to a different model in one pick
 - **Prompt cadence** — a per-model prompt is in the Claude system prompt at spawn and can be re-sent every Nth message so a standing instruction does not decay

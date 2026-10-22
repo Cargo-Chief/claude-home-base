@@ -83,7 +83,7 @@ from agent_status import (
     reboot_request_is_exact,
 )
 from delegation_observability import DelegationTracker, format_delegation_audit
-from turn_reporter import TurnReporter, tick_all
+from turn_reporter import TurnReporter, format_elapsed, tick_all
 from openai_fallback import (
     fallback_error_kind,
     is_claude_limit_notice,
@@ -212,10 +212,7 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 CLAUDE_TIMEOUT = RUNTIME_POLICY.claude_timeout
 DELEGATE_TIMEOUT = delegate_timeout_from_env(os.environ)
-MAX_TURN_RUNTIME = max(
-    4 * CLAUDE_TIMEOUT,
-    DELEGATE_TIMEOUT + CLAUDE_TIMEOUT,
-)
+MAX_TURN_RUNTIME = max(RUNTIME_POLICY.max_turn_runtime, DELEGATE_TIMEOUT + CLAUDE_TIMEOUT)
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -660,6 +657,8 @@ class LiveSession:
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
+    # Set once output arrives with no turn running; cleared when the next turn starts
+    after_turn_noticed: bool = False
 
 
 # thread_ts → LiveSession
@@ -1080,6 +1079,8 @@ def _reader_loop(session: LiveSession) -> None:
                     if isinstance(block, dict) and block.get("type") == "text"
                     and block.get("text", "").strip()
                 ]
+                if not session.turn_lock.locked() and not session.after_turn_noticed:
+                    _notice_output_after_turn(session)
                 if not session.first_tool_seen:
                     session.pre_tool_text.extend(text_blocks)
                     if not has_tool_use:
@@ -2384,6 +2385,9 @@ def process_message_async(event: dict) -> None:
             with session.turn_lock:
                 turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
                 session._on_text = on_text
+                if session.reporter and session.reporter.active:
+                    session.reporter.finish(state="stopped")
+                session.after_turn_noticed = False
                 session.reporter = TurnReporter(
                     post=on_text,
                     post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
@@ -2423,7 +2427,7 @@ def process_message_async(event: dict) -> None:
                         channel=channel, thread_ts=thread_ts,
                         text=(
                             f"Turn reached its {minutes}-minute inactivity limit or "
-                            f"{MAX_TURN_RUNTIME // 60}-minute hard limit; stopped. "
+                            f"{format_elapsed(MAX_TURN_RUNTIME)} hard limit; stopped. "
                             "Working files and thread continuity were preserved; "
                             "tell me to resume when ready."
                         ),
@@ -2547,6 +2551,19 @@ def _stop_background_delegates(session) -> None:
         )
     except Exception:
         pass
+
+
+def _notice_output_after_turn(session: LiveSession) -> None:
+    """The process woke after its turn ended (e.g. a background task finished); say so once."""
+    session.after_turn_noticed = True
+    note = "kept working after the turn ended; reply in this thread to see the result"
+    try:
+        slack_client.chat_postMessage(
+            channel=session.channel, thread_ts=session.thread_ts, text=note,
+            blocks=_context_blocks(f":information_source: _{note}_"),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to post after-turn notice: {exc}")
 
 
 def _reporter_heartbeat() -> None:
