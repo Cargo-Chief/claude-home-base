@@ -254,7 +254,7 @@ class ReaderResilienceTest(unittest.TestCase):
     def test_a_process_that_ignores_sigterm_is_killed(self):
         session = FakeSession([], alive=True, ignores_term=True, events_raise=OSError("pipe"))
         load_functions()["_reader_loop"](session)
-        self.assertEqual(["terminate", "wait", "kill"], session.proc.calls)
+        self.assertEqual(["terminate", "wait", "kill", "wait"], session.proc.calls)
 
     def test_a_normal_end_of_output_leaves_the_process_alone(self):
         session = FakeSession([result()], alive=True)

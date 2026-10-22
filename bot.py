@@ -1045,6 +1045,10 @@ def _stop_unread_process(session: LiveSession) -> None:
         session.proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         session.proc.kill()
+        try:
+            session.proc.wait(timeout=5)
+        except Exception as e:
+            logger.warning(f"pid={session.proc.pid} not reaped after SIGKILL: {e}")
     except Exception as e:
         logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
 
