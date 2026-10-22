@@ -1,9 +1,12 @@
 import ast
+import builtins
 import json
 import logging
+import re
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -13,40 +16,75 @@ from session_lifecycle import owner_stream_event_is_activity
 
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
-    "_reader_loop", "_close_turn_after_error", "_post_context_notice", "_track_context",
+    "_reader_loop", "_deliver_text", "_stop_unread_process", "_post_context_notice", "_track_context",
 )
+
+
+class SafetyError(Exception):
+    pass
+
+
+def _bot_tree():
+    return ast.parse(BOT.read_text(encoding="utf-8"))
+
+
+def _globals_used(functions):
+    """Names the functions read from module scope; every one must be stubbed."""
+    used = set()
+    for function in functions:
+        local = {arg.arg for arg in function.args.args}
+        for node in ast.walk(function):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                local.add(node.id)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                local.add(node.name)
+        for node in ast.walk(function):
+            if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                    and node.id not in local and not hasattr(builtins, node.id)):
+                used.add(node.id)
+    return used
 
 
 def load_functions(**overrides):
     """Compile the named bot.py functions against stub globals; bot itself needs Slack to import."""
-    tree = ast.parse(BOT.read_text(encoding="utf-8"))
+    tree = _bot_tree()
     wanted = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS]
     constants = [
         node for node in tree.body
         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
         and node.targets[0].id.startswith("CTX_")
     ]
-    module = ast.Module(body=constants + wanted, type_ignores=[])
     namespace = {
         "LiveSession": object,
+        "Path": Path,
+        "RUNTIME_POLICY": None,
+        "SOURCE_DIR": Path("."),
+        "SafetyError": SafetyError,
         "json": json,
-        "time": __import__("time"),
+        "time": time,
+        "sys": sys,
         "subprocess": subprocess,
         "logger": logging.getLogger("test-reader"),
         "audit_logger": logging.getLogger("test-reader-audit"),
         "owner_stream_event_is_activity": owner_stream_event_is_activity,
+        "contains_private_escalation_action": lambda *args: False,
+        "private_escalation_status": lambda **kwargs: "escalated",
+        "consume_bundle_claim": lambda *args, **kwargs: None,
+        "consume_parking_claim": lambda *args, **kwargs: None,
+        "prepare_thread_workspace": lambda *args, **kwargs: None,
+        "_save_session": lambda thread_ts, sid: None,
         "_track_model": lambda session, data: None,
         "_notice_output_after_turn": lambda session: None,
         "_post_skill_notice": lambda *args: None,
         "is_claude_limit_notice": lambda text: False,
-        "_ATTACH_PATTERN": __import__("re").compile(r"\A\Z"),
+        "_ATTACH_PATTERN": re.compile(r"\A\Z"),
         "format_delegation_audit": lambda *args, **kwargs: "",
         "_live_sessions_lock": threading.Lock(),
         "_live_sessions": {},
         "slack_client": None,
     }
     namespace.update(overrides)
-    exec(compile(module, str(BOT), "exec"), namespace)
+    exec(compile(ast.Module(body=constants + wanted, type_ignores=[]), str(BOT), "exec"), namespace)
     return namespace
 
 
@@ -70,40 +108,47 @@ class FakeReporter:
     def finish(self, **kwargs):
         self.finished.append(kwargs)
 
-    def text(self, text):
-        pass
-
-    def tool_used(self):
-        pass
-
     def activity(self):
         pass
 
 
 class FakeProc:
-    def __init__(self, events, alive=False):
-        self.stdout = [json.dumps(event) + "\n" for event in events]
+    def __init__(self, events, *, alive=False, ignores_term=False, events_raise=None):
+        self.lines = [json.dumps(event) + "\n" for event in events]
+        self.events_raise = events_raise
         self.pid = 4242
         self.alive = alive
-        self.terminated = False
+        self.ignores_term = ignores_term
+        self.calls = []
+
+    @property
+    def stdout(self):
+        yield from self.lines
+        if self.events_raise:
+            raise self.events_raise
 
     def poll(self):
         return None if self.alive else 0
 
     def terminate(self):
-        self.terminated = True
-        self.alive = False
+        self.calls.append("terminate")
+        if not self.ignores_term:
+            self.alive = False
 
     def wait(self, timeout=None):
+        self.calls.append("wait")
+        if self.alive:
+            raise subprocess.TimeoutExpired("claude", timeout)
         return 0
 
     def kill(self):
+        self.calls.append("kill")
         self.alive = False
 
 
 class FakeSession:
-    def __init__(self, events, *, on_text=None, alive=False, reporter=None):
-        self.proc = FakeProc(events, alive=alive)
+    def __init__(self, events, *, on_text=None, reporter=None, **proc):
+        self.proc = FakeProc(events, **proc)
         self.thread_ts = "1.0"
         self.channel = "C1"
         self.user_id = "U1"
@@ -112,6 +157,7 @@ class FakeSession:
         self.reporter = reporter
         self.delegation_tracker = FakeTracker()
         self.escalation_message_file = None
+        self.escalation_receipt_file = None
         self.private_escalation_pending = False
         self.first_tool_seen = False
         self.pre_tool_text = []
@@ -126,12 +172,25 @@ class FakeSession:
         self.ctx_warned = False
 
 
-def assistant_text(text):
-    return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+def assistant_text(*texts):
+    return {"type": "assistant", "message": {"content": [{"type": "text", "text": t} for t in texts]}}
+
+
+def result(sid="s-2"):
+    return {"type": "result", "session_id": sid}
+
+
+class HarnessTest(unittest.TestCase):
+    def test_every_global_the_functions_read_is_stubbed(self):
+        tree = _bot_tree()
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS]
+        self.assertEqual(len(FUNCTIONS), len(functions))
+        missing = _globals_used(functions) - set(load_functions())
+        self.assertEqual(set(), missing)
 
 
 class ReaderResilienceTest(unittest.TestCase):
-    def test_a_failed_slack_post_does_not_end_the_reader(self):
+    def test_a_failed_post_skips_only_that_post(self):
         posted = []
 
         def on_text(text):
@@ -139,56 +198,79 @@ class ReaderResilienceTest(unittest.TestCase):
                 raise TimeoutError("The read operation timed out")
             posted.append(text)
 
-        session = FakeSession(
-            [assistant_text("first"), {"type": "result"}, assistant_text("second"), {"type": "result"}],
-            on_text=on_text,
-        )
+        session = FakeSession([assistant_text("first", "second"), result()], on_text=on_text)
+        session.first_tool_seen = True
         load_functions()["_reader_loop"](session)
         self.assertEqual(["second"], posted)
-        self.assertTrue(session._turn_done.is_set())
+        self.assertEqual("s-2", session.session_id, "the result event was not processed")
 
-    def test_a_failure_inside_the_result_event_still_closes_the_turn(self):
+    def test_a_failed_post_in_the_result_event_still_finishes_the_turn(self):
+        saved = []
+        reporter = FakeReporter()
+
         def on_text(text):
             raise TimeoutError("The read operation timed out")
 
-        reporter = FakeReporter()
-        session = FakeSession([assistant_text("reply"), {"type": "result"}], on_text=on_text, reporter=reporter)
-        session.pre_tool_text = []
-        observed = []
-        functions = load_functions()
-        original = session._turn_done.set
+        session = FakeSession([assistant_text("reply"), result("s-9")], on_text=on_text, reporter=reporter)
+        load_functions(_save_session=lambda thread, sid: saved.append(sid))["_reader_loop"](session)
+        self.assertEqual(["s-9"], saved)
+        self.assertEqual({"post_reply": True}, reporter.finished[0])
 
-        def record_set():
-            observed.append(list(reporter.finished))
+    def test_non_object_json_is_skipped_and_reading_continues(self):
+        session = FakeSession([[1, 2], result("s-3")])
+        load_functions()["_reader_loop"](session)
+        self.assertEqual("s-3", session.session_id)
+
+    def test_an_escalation_check_error_still_ends_the_reader(self):
+        posted = []
+
+        def broken(*args):
+            raise ValueError("lstat: embedded null character in path")
+
+        session = FakeSession([assistant_text("private"), assistant_text("later"), result()],
+                              on_text=posted.append, alive=True)
+        session.escalation_message_file = Path("escalation.txt")
+        session.first_tool_seen = True
+        load_functions(contains_private_escalation_action=broken)["_reader_loop"](session)
+        self.assertEqual([], posted)
+        self.assertEqual(["terminate", "wait"], session.proc.calls)
+
+    def test_a_failed_reader_drops_the_session_before_stopping_its_process(self):
+        sessions = {}
+        order = []
+        session = FakeSession([], alive=True, events_raise=UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
+        sessions[session.thread_ts] = session
+        original = session.proc.terminate
+
+        def terminate():
+            order.append(("registered", session.thread_ts in sessions, "done", session._turn_done.is_set()))
             original()
 
-        session._turn_done.set = record_set
-        functions["_reader_loop"](session)
-        self.assertTrue(observed, "turn was never marked done")
-        self.assertEqual({"post_reply": True}, observed[0][0])
-        self.assertEqual([], session.pre_tool_text)
-
-    def test_non_object_json_is_skipped(self):
-        session = FakeSession([[1, 2], {"type": "result"}])
-        load_functions()["_reader_loop"](session)
+        session.proc.terminate = terminate
+        load_functions(_live_sessions=sessions)["_reader_loop"](session)
+        self.assertEqual([("registered", False, "done", False)], order)
         self.assertTrue(session._turn_done.is_set())
 
-    def test_an_unread_process_is_stopped_when_the_reader_ends(self):
-        session = FakeSession([], alive=True)
+    def test_a_process_that_ignores_sigterm_is_killed(self):
+        session = FakeSession([], alive=True, ignores_term=True, events_raise=OSError("pipe"))
         load_functions()["_reader_loop"](session)
-        self.assertTrue(session.proc.terminated)
+        self.assertEqual(["terminate", "wait", "kill"], session.proc.calls)
 
-    def test_an_exited_process_is_left_alone(self):
-        session = FakeSession([], alive=False)
+    def test_a_normal_end_of_output_leaves_the_process_alone(self):
+        session = FakeSession([result()], alive=True)
         load_functions()["_reader_loop"](session)
-        self.assertFalse(session.proc.terminated)
+        self.assertEqual([], session.proc.calls)
 
 
 class FakeSlack:
-    def __init__(self):
+    def __init__(self, fail_first=False):
         self.posts = []
+        self.fail_first = fail_first
 
     def chat_postMessage(self, **kwargs):
+        if self.fail_first:
+            self.fail_first = False
+            raise ConnectionError("no route")
         self.posts.append(kwargs["text"])
 
 
@@ -196,32 +278,41 @@ def usage_event(tokens):
     return {"type": "assistant", "message": {"usage": {"cache_read_input_tokens": tokens}, "content": []}}
 
 
+def track_all(slack, session, readings):
+    track = load_functions(slack_client=slack)["_track_context"]
+    for tokens in readings:
+        track(session, usage_event(tokens))
+
+
 class ContextNoticeTest(unittest.TestCase):
     def test_thread_gets_one_message_at_eighty_percent_and_status_line_gets_every_step(self):
         slack = FakeSlack()
-        track = load_functions(slack_client=slack)["_track_context"]
         reporter = FakeReporter(active=True)
         session = FakeSession([], reporter=reporter)
-        for tokens in (150_000, 450_000, 750_000, 810_000, 910_000, 960_000):
-            track(session, usage_event(tokens))
+        track_all(slack, session, (150_000, 450_000, 750_000, 810_000, 910_000, 960_000))
         self.assertEqual(1, len(slack.posts))
         self.assertIn("81%", slack.posts[0])
         self.assertEqual(["context 15%", "context 45%", "context 75%", "context 81%", "context 91%"], reporter.notes)
 
-    def test_no_message_below_the_warning_line_outside_a_turn(self):
+    def test_no_message_below_the_warning_line(self):
         slack = FakeSlack()
-        track = load_functions(slack_client=slack)["_track_context"]
-        session = FakeSession([])
-        for tokens in (150_000, 450_000, 790_000):
-            track(session, usage_event(tokens))
+        track_all(slack, FakeSession([]), (150_000, 450_000, 790_000))
         self.assertEqual([], slack.posts)
+
+    def test_a_failed_warning_is_retried_at_the_next_step(self):
+        slack = FakeSlack(fail_first=True)
+        track_all(slack, FakeSession([]), (810_000, 910_000))
+        self.assertEqual(1, len(slack.posts))
+        self.assertIn("91%", slack.posts[0])
+
+    def test_hovering_at_the_line_does_not_repeat_the_warning(self):
+        slack = FakeSlack()
+        track_all(slack, FakeSession([]), (805_000, 798_000, 803_000))
+        self.assertEqual(1, len(slack.posts))
 
     def test_compaction_re_arms_the_warning(self):
         slack = FakeSlack()
-        track = load_functions(slack_client=slack)["_track_context"]
-        session = FakeSession([])
-        for tokens in (850_000, 120_000, 820_000):
-            track(session, usage_event(tokens))
+        track_all(slack, FakeSession([]), (850_000, 120_000, 820_000))
         self.assertEqual(2, len(slack.posts))
 
 

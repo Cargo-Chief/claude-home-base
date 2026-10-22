@@ -865,10 +865,12 @@ def _spawn_claude_process(
 
 
 # Context utilization goes in the turn's status line every N tokens; the thread
-# gets one message, when it first crosses CTX_WARN_FRACTION (bot-side only).
+# gets one message when it crosses CTX_WARN_FRACTION, re-armed below CTX_REARM_FRACTION
+# (bot-side only — the notice never enters Claude's context).
 CTX_NOTIFY_STEP = 100_000
 CTX_WINDOW = 1_000_000
 CTX_WARN_FRACTION = 0.8
+CTX_REARM_FRACTION = 0.7
 
 
 def _post_context_notice(session: LiveSession, ctx: int) -> None:
@@ -878,7 +880,6 @@ def _post_context_notice(session: LiveSession, ctx: int) -> None:
             session.reporter.set_note(f"context {ctx / CTX_WINDOW:.0%}")
         if session.ctx_warned or ctx < CTX_WARN_FRACTION * CTX_WINDOW:
             return
-        session.ctx_warned = True
         note = (f"context window at {ctx / CTX_WINDOW:.0%}; the session compacts itself near the limit, "
                 f"and a new thread for the next task starts fresh")
         slack_client.chat_postMessage(
@@ -887,6 +888,7 @@ def _post_context_notice(session: LiveSession, ctx: int) -> None:
             blocks=[{"type": "context", "elements": [
                 {"type": "mrkdwn", "text": f":brain: _{note}_"}]}],
         )
+        session.ctx_warned = True
     except Exception as e:
         logger.warning(f"Failed to post context notice: {e}")
 
@@ -1022,21 +1024,29 @@ def _track_context(session: LiveSession, data: dict) -> None:
         _post_context_notice(session, ctx)
     elif level < session.ctx_notified_level:
         session.ctx_notified_level = level
-    if ctx < CTX_WARN_FRACTION * CTX_WINDOW:
+    if ctx < CTX_REARM_FRACTION * CTX_WINDOW:
         session.ctx_warned = False
 
 
-def _close_turn_after_error(session: LiveSession) -> None:
-    """End a turn whose result event failed part way, so the thread is not left waiting."""
+def _deliver_text(session: LiveSession, text: str) -> None:
+    """Post turn text; a failed Slack call is logged so the reader keeps draining the process."""
     try:
-        if session.reporter:
-            session.reporter.finish(post_reply=not session.private_escalation_pending)
-    except Exception:
-        logger.exception(f"Reporter finish failed for thread {session.thread_ts}")
-    session.private_escalation_pending = False
-    session.first_tool_seen = False
-    session.pre_tool_text.clear()
-    session._turn_done.set()
+        session._on_text(text)
+    except Exception as e:
+        logger.warning(f"Failed to post to thread {session.thread_ts}: {e}")
+
+
+def _stop_unread_process(session: LiveSession) -> None:
+    if session.proc.poll() is not None:
+        return
+    logger.warning(f"Stopping unread Claude process pid={session.proc.pid}")
+    try:
+        session.proc.terminate()
+        session.proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        session.proc.kill()
+    except Exception as e:
+        logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
 
 
 def _reader_loop(session: LiveSession) -> None:
@@ -1044,219 +1054,206 @@ def _reader_loop(session: LiveSession) -> None:
 
     Runs in a dedicated thread for each live session.
     """
+    failed = False
     try:
         for line in session.proc.stdout:
-            msg_type = None
+            line = line.strip()
+            if not line:
+                continue
             try:
-                line = line.strip()
-                if not line:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            msg_type = data.get("type")
+            # Provider and tool-result output proves the owner is working. An
+            # echoed inbound user event does not extend a hung turn's deadline.
+            if owner_stream_event_is_activity(data):
+                session.last_activity = time.time()
+                session.turn_activity = time.monotonic()
+                if session.reporter:
+                    session.reporter.activity()
+            session.delegation_tracker.observe(data)
+
+            if msg_type == "system":
+                sid = data.get("session_id")
+                if sid:
+                    session.session_id = sid
+
+            elif msg_type == "assistant":
+                content = data.get("message", {}).get("content", [])
+                # Subagent (Agent/Task) events stream through the same stdout
+                # with parent_tool_use_id set — their text is internal chatter,
+                # not a reply to the human. Only main-loop text reaches Slack.
+                if data.get("parent_tool_use_id"):
                     continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
+                if (session.escalation_message_file
+                        and contains_private_escalation_action(
+                            content,
+                            session.escalation_message_file,
+                            Path(sys.executable),
+                            SOURCE_DIR / "bot.py",
+                        )):
+                    session.private_escalation_pending = True
+                    session.pre_tool_text.clear()
+                if session.private_escalation_pending:
                     continue
 
-                msg_type = data.get("type")
-                # Provider and tool-result output proves the owner is working. An
-                # echoed inbound user event does not extend a hung turn's deadline.
-                if owner_stream_event_is_activity(data):
-                    session.last_activity = time.time()
-                    session.turn_activity = time.monotonic()
-                    if session.reporter:
-                        session.reporter.activity()
-                session.delegation_tracker.observe(data)
-
-                if msg_type == "system":
-                    sid = data.get("session_id")
-                    if sid:
-                        session.session_id = sid
-
-                elif msg_type == "assistant":
-                    content = data.get("message", {}).get("content", [])
-                    # Subagent (Agent/Task) events stream through the same stdout
-                    # with parent_tool_use_id set — their text is internal chatter,
-                    # not a reply to the human. Only main-loop text reaches Slack.
-                    if data.get("parent_tool_use_id"):
+                _track_model(session, data)
+                _track_context(session, data)
+                has_tool_use = any(
+                    isinstance(block, dict) and block.get("type") == "tool_use"
+                    for block in content
+                )
+                text_blocks = [
+                    block.get("text", "").strip()
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                    and block.get("text", "").strip()
+                ]
+                if not session.turn_lock.locked() and not session.after_turn_noticed:
+                    _notice_output_after_turn(session)
+                if not session.first_tool_seen:
+                    session.pre_tool_text.extend(text_blocks)
+                    if not has_tool_use:
                         continue
-                    if (session.escalation_message_file
-                            and contains_private_escalation_action(
-                                content,
-                                session.escalation_message_file,
-                                Path(sys.executable),
-                                SOURCE_DIR / "bot.py",
-                            )):
-                        session.private_escalation_pending = True
-                        session.pre_tool_text.clear()
-                    if session.private_escalation_pending:
-                        continue
-
-                    _track_model(session, data)
-                    _track_context(session, data)
-                    has_tool_use = any(
-                        isinstance(block, dict) and block.get("type") == "tool_use"
-                        for block in content
-                    )
-                    text_blocks = [
-                        block.get("text", "").strip()
-                        for block in content
-                        if isinstance(block, dict) and block.get("type") == "text"
-                        and block.get("text", "").strip()
-                    ]
-                    if not session.turn_lock.locked() and not session.after_turn_noticed:
-                        _notice_output_after_turn(session)
-                    if not session.first_tool_seen:
-                        session.pre_tool_text.extend(text_blocks)
-                        if not has_tool_use:
-                            continue
-                        session.first_tool_seen = True
-                        text_blocks = list(session.pre_tool_text)
-                        session.pre_tool_text.clear()
-                    for block in content:
-                        # Skill visibility: announce main-loop skill invocations in a
-                        # grey context block (bot-side only, never enters Claude's
-                        # context).
-                        if (isinstance(block, dict) and block.get("type") == "tool_use"
-                                and block.get("name") == "Skill"):
-                            inp = block.get("input") or {}
-                            args_str = str(inp.get("args") or "")[:120]
-                            _post_skill_notice(session, inp.get("skill", "?"), args_str)
-                    if session.reporter and session.reporter.active:
-                        for text in text_blocks:
-                            if (text.strip() == "SKIP" or is_claude_limit_notice(text)
-                                    or _ATTACH_PATTERN.search(text)):
-                                if session._on_text:
-                                    session._on_text(text)
-                            else:
-                                session.reporter.text(text)
-                        if has_tool_use:
-                            session.reporter.tool_used()
-                    else:
-                        for text in text_blocks:
+                    session.first_tool_seen = True
+                    text_blocks = list(session.pre_tool_text)
+                    session.pre_tool_text.clear()
+                for block in content:
+                    # Skill visibility: announce main-loop skill invocations in a
+                    # grey context block (bot-side only, never enters Claude's
+                    # context).
+                    if (isinstance(block, dict) and block.get("type") == "tool_use"
+                            and block.get("name") == "Skill"):
+                        inp = block.get("input") or {}
+                        args_str = str(inp.get("args") or "")[:120]
+                        _post_skill_notice(session, inp.get("skill", "?"), args_str)
+                if session.reporter and session.reporter.active:
+                    for text in text_blocks:
+                        if (text.strip() == "SKIP" or is_claude_limit_notice(text)
+                                or _ATTACH_PATTERN.search(text)):
                             if session._on_text:
-                                session._on_text(text)
+                                _deliver_text(session, text)
+                        else:
+                            session.reporter.text(text)
+                    if has_tool_use:
+                        session.reporter.tool_used()
+                else:
+                    for text in text_blocks:
+                        if session._on_text:
+                            _deliver_text(session, text)
 
-                elif msg_type == "result":
-                    for record in session.delegation_tracker.finish_turn():
-                        audit_logger.info(format_delegation_audit(
-                            record,
-                            user=session.user_id,
-                            channel=session.channel,
-                            thread=session.thread_ts,
-                        ))
-                    if session.workspace and session.workspace.bundle_claim_file.exists():
-                        try:
-                            bundle = consume_bundle_claim(
-                                session.workspace,
-                                max_live_bundles=RUNTIME_POLICY.max_live_bundles,
-                            )
-                        except SafetyError as exc:
-                            audit_logger.warning(
-                                "BUNDLE_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
-                                session.user_id, session.channel, session.thread_ts, str(exc),
-                            )
-                            if session._on_text:
-                                session._on_text(f"Worktree bundle mapping refused: {exc}")
-                        else:
-                            if bundle:
-                                audit_logger.info(
-                                    "BUNDLE_BOUND | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s",
-                                    session.user_id, session.channel, session.thread_ts, bundle.name,
-                                )
-                    parking = None
-                    parking_refused = None
-                    if session.workspace and session.workspace.parking_claim_file.exists():
-                        try:
-                            parking = consume_parking_claim(session.workspace)
-                        except SafetyError as exc:
-                            parking_refused = str(exc)
-                            audit_logger.warning(
-                                "PARKING_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
-                                session.user_id, session.channel, session.thread_ts, parking_refused,
-                            )
-                            if session._on_text and not session.private_escalation_pending:
-                                session._on_text(f"Parking record refused: {parking_refused}")
-                        else:
-                            if parking:
-                                audit_logger.info(
-                                    "WORK_PARKED | USER:%s | CHANNEL:%s | THREAD:%s | KIND:%s | RECORD:%s",
-                                    session.user_id, session.channel, session.thread_ts,
-                                    parking.kind, parking.path.relative_to(session.workspace.root),
-                                )
-                    sid = data.get("session_id")
-                    if sid:
-                        session.session_id = sid
-                        _save_session(session.thread_ts, sid)
-                        if session.workspace:
-                            prepare_thread_workspace(
-                                session.workspace.root,
-                                channel=session.channel,
-                                thread=session.thread_ts,
-                                session_id=sid,
-                            )
-                    if session.private_escalation_pending:
-                        delivered = bool(
-                            session.escalation_receipt_file
-                            and session.escalation_receipt_file.is_file()
+            elif msg_type == "result":
+                for record in session.delegation_tracker.finish_turn():
+                    audit_logger.info(format_delegation_audit(
+                        record,
+                        user=session.user_id,
+                        channel=session.channel,
+                        thread=session.thread_ts,
+                    ))
+                if session.workspace and session.workspace.bundle_claim_file.exists():
+                    try:
+                        bundle = consume_bundle_claim(
+                            session.workspace,
+                            max_live_bundles=RUNTIME_POLICY.max_live_bundles,
                         )
-                        if session.escalation_receipt_file:
-                            try:
-                                session.escalation_receipt_file.unlink()
-                            except OSError:
-                                pass
-                        status = private_escalation_status(
-                            delivered=delivered,
-                            parking=parking,
-                            parking_refused=bool(parking_refused),
+                    except SafetyError as exc:
+                        audit_logger.warning(
+                            "BUNDLE_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+                            session.user_id, session.channel, session.thread_ts, str(exc),
                         )
                         if session._on_text:
-                            session._on_text(status)
+                            _deliver_text(session, f"Worktree bundle mapping refused: {exc}")
                     else:
-                        for text in session.pre_tool_text:
-                            if session._on_text:
-                                session._on_text(text)
-                    if session.reporter:
-                        session.reporter.finish(post_reply=not session.private_escalation_pending)
-                    session.private_escalation_pending = False
-                    session.first_tool_seen = False
-                    session.pre_tool_text.clear()
-                    # Clear eyes reactions from steering messages this turn absorbed
-                    while session.pending_reactions:
-                        ch, ts = session.pending_reactions.pop(0)
+                        if bundle:
+                            audit_logger.info(
+                                "BUNDLE_BOUND | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s",
+                                session.user_id, session.channel, session.thread_ts, bundle.name,
+                            )
+                parking = None
+                parking_refused = None
+                if session.workspace and session.workspace.parking_claim_file.exists():
+                    try:
+                        parking = consume_parking_claim(session.workspace)
+                    except SafetyError as exc:
+                        parking_refused = str(exc)
+                        audit_logger.warning(
+                            "PARKING_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+                            session.user_id, session.channel, session.thread_ts, parking_refused,
+                        )
+                        if session._on_text and not session.private_escalation_pending:
+                            _deliver_text(session, f"Parking record refused: {parking_refused}")
+                    else:
+                        if parking:
+                            audit_logger.info(
+                                "WORK_PARKED | USER:%s | CHANNEL:%s | THREAD:%s | KIND:%s | RECORD:%s",
+                                session.user_id, session.channel, session.thread_ts,
+                                parking.kind, parking.path.relative_to(session.workspace.root),
+                            )
+                sid = data.get("session_id")
+                if sid:
+                    session.session_id = sid
+                    _save_session(session.thread_ts, sid)
+                    if session.workspace:
+                        prepare_thread_workspace(
+                            session.workspace.root,
+                            channel=session.channel,
+                            thread=session.thread_ts,
+                            session_id=sid,
+                        )
+                if session.private_escalation_pending:
+                    delivered = bool(
+                        session.escalation_receipt_file
+                        and session.escalation_receipt_file.is_file()
+                    )
+                    if session.escalation_receipt_file:
                         try:
-                            slack_client.reactions_remove(channel=ch, name="eyes", timestamp=ts)
-                        except Exception:
+                            session.escalation_receipt_file.unlink()
+                        except OSError:
                             pass
-                    session._turn_done.set()
-            except Exception:
-                # One failed Slack call must not end the reader: the process keeps
-                # writing to a pipe nobody drains, and the thread goes silent.
-                logger.exception(f"Reader event error for thread {session.thread_ts}; continuing")
-                if msg_type == "result":
-                    _close_turn_after_error(session)
+                    status = private_escalation_status(
+                        delivered=delivered,
+                        parking=parking,
+                        parking_refused=bool(parking_refused),
+                    )
+                    if session._on_text:
+                        _deliver_text(session, status)
+                else:
+                    for text in session.pre_tool_text:
+                        if session._on_text:
+                            _deliver_text(session, text)
+                if session.reporter:
+                    session.reporter.finish(post_reply=not session.private_escalation_pending)
+                session.private_escalation_pending = False
+                session.first_tool_seen = False
+                session.pre_tool_text.clear()
+                # Clear eyes reactions from steering messages this turn absorbed
+                while session.pending_reactions:
+                    ch, ts = session.pending_reactions.pop(0)
+                    try:
+                        slack_client.reactions_remove(channel=ch, name="eyes", timestamp=ts)
+                    except Exception:
+                        pass
+                session._turn_done.set()
 
     except Exception as e:
         logger.error(f"Reader loop error for thread {session.thread_ts}: {e}")
+        failed = True
     finally:
-        # Process ended — unblock any thread waiting on a response
-        session._turn_done.set()
-        logger.info(f"Reader loop ended for thread {session.thread_ts} (pid={session.proc.pid})")
-        if session.proc.poll() is None:
-            # Nobody reads this process any more; a resumed session would run beside it.
-            logger.warning(f"Stopping unread Claude process pid={session.proc.pid}")
-            try:
-                session.proc.terminate()
-                session.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                session.proc.kill()
-            except Exception:
-                logger.exception(f"Could not stop pid={session.proc.pid}")
-        if session.reporter:
-            session.reporter.finish(state="stopped")
         with _live_sessions_lock:
             if _live_sessions.get(session.thread_ts) is session:
                 _live_sessions.pop(session.thread_ts, None)
+        if failed:
+            # Nothing reads this process any more; stop it so a resume does not run beside it.
+            _stop_unread_process(session)
+        # Process ended — unblock any thread waiting on a response
+        session._turn_done.set()
+        logger.info(f"Reader loop ended for thread {session.thread_ts} (pid={session.proc.pid})")
+        if session.reporter:
+            session.reporter.finish(state="stopped")
 
 
 def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "") -> LiveSession:
