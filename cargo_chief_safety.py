@@ -203,6 +203,10 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
     raise SafetyError(f"{key} must be true or false")
 
 
+DEFAULT_MAX_TURN_RUNTIME = 3 * 3600
+MAX_TURN_RUNTIME_BOUNDS = (600, 6 * 3600)
+
+
 @dataclass(frozen=True)
 class RuntimePolicy:
     root: Path
@@ -214,7 +218,7 @@ class RuntimePolicy:
     max_live_bundles: int
     file_transfer_enabled: bool
     transcript_search_enabled: bool
-    max_turn_runtime: int = 3 * 3600
+    max_turn_runtime: int = DEFAULT_MAX_TURN_RUNTIME
 
     @classmethod
     def from_env(
@@ -243,10 +247,11 @@ class RuntimePolicy:
             timeout = int(env.get("CLAUDE_TIMEOUT", "600"))
             max_sessions = int(env.get("MAX_LIVE_SESSIONS", "2"))
             max_bundles = int(env.get("MAX_LIVE_BUNDLES", "3"))
-            max_turn_runtime = int(env.get("MAX_TURN_RUNTIME", str(3 * 3600)))
+            max_turn_runtime = int(env.get("MAX_TURN_RUNTIME", str(DEFAULT_MAX_TURN_RUNTIME)))
         except ValueError as exc:
             raise SafetyError(
-                "CLAUDE_TIMEOUT, MAX_LIVE_SESSIONS, MAX_LIVE_BUNDLES and MAX_TURN_RUNTIME must be integers"
+                "CLAUDE_TIMEOUT, MAX_LIVE_SESSIONS, MAX_LIVE_BUNDLES, and MAX_TURN_RUNTIME "
+                "must be integers"
             ) from exc
         if not 1 <= timeout <= 900:
             raise SafetyError("CLAUDE_TIMEOUT must be between 1 and 900 seconds for Gate A")
@@ -254,8 +259,9 @@ class RuntimePolicy:
             raise SafetyError("MAX_LIVE_SESSIONS must be between 1 and 2 for Gate A")
         if not 1 <= max_bundles <= 5:
             raise SafetyError("MAX_LIVE_BUNDLES must be between 1 and 5")
-        if not 600 <= max_turn_runtime <= 6 * 3600:
-            raise SafetyError("MAX_TURN_RUNTIME must be between 600 and 21600 seconds")
+        low, high = MAX_TURN_RUNTIME_BOUNDS
+        if not low <= max_turn_runtime <= high:
+            raise SafetyError(f"MAX_TURN_RUNTIME must be between {low} and {high} seconds")
 
         file_transfer = _env_bool(env, "ENABLE_FILE_TRANSFER", False)
         transcript_search = _env_bool(env, "ENABLE_TRANSCRIPT_SEARCH", False)
@@ -893,7 +899,9 @@ SLACK_REPORTING_PROMPT = (
     "your last tool call is your reply, posted when the turn ends. At the end of a ticket or piece "
     "of work, make it a summary of what was done, the major decisions, and any issues. A tool "
     "call that comes back interrupted may be the harness ending your turn at its time limit, not "
-    "a person declining: write your state to TASK.md and stop."
+    "a person declining: write your state to TASK.md and stop. Do not end a turn with background "
+    "work still running: wait for it in short tool calls or stop it, and record anything still "
+    "pending in TASK.md, because output after your turn ends is not posted."
 )
 
 # Variables that point a process at the governed launcher; any one of them arms

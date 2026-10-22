@@ -249,13 +249,6 @@ class TurnReporterTest(unittest.TestCase):
         self.assertFalse(ended.active)
         self.assertEqual(["final words"], ended_slack.posts)
 
-    def test_add_reply_is_posted_without_a_status_line(self):
-        turn, slack, _ = reporter()
-        turn.add_reply("Summary written after the turn ended.")
-        turn.finish()
-        self.assertEqual(["Summary written after the turn ended."], slack.posts)
-        self.assertEqual([], slack.status_posts)
-
     def test_helpers(self):
         self.assertTrue(is_for_human("  ❓ question"))
         self.assertFalse(is_for_human("plain narration"))

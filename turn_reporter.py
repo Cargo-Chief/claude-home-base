@@ -135,12 +135,6 @@ class TurnReporter:
                 actions += self._render(now, force=self.status_ts is None)
         _run(actions)
 
-    def add_reply(self, text: str) -> None:
-        """Text known to be part of the reply, held for finish() without touching the status."""
-        with self._lock:
-            if self.active:
-                self.tail.append(text)
-
     def tool_used(self) -> None:
         """Text before a tool call is narration, not the reply."""
         with self._lock:

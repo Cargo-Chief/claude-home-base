@@ -83,7 +83,7 @@ from agent_status import (
     reboot_request_is_exact,
 )
 from delegation_observability import DelegationTracker, format_delegation_audit
-from turn_reporter import TurnReporter, tick_all
+from turn_reporter import TurnReporter, format_elapsed, tick_all
 from openai_fallback import (
     fallback_error_kind,
     is_claude_limit_notice,
@@ -657,8 +657,8 @@ class LiveSession:
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
-    # A turn the process started on its own, e.g. a background task finishing after the turn ended
-    unsolicited_turn: bool = False
+    # Set once output arrives with no turn running; cleared when the next turn starts
+    after_turn_noticed: bool = False
 
 
 # thread_ts → LiveSession
@@ -1079,9 +1079,8 @@ def _reader_loop(session: LiveSession) -> None:
                     if isinstance(block, dict) and block.get("type") == "text"
                     and block.get("text", "").strip()
                 ]
-                if (not session.turn_lock.locked()
-                        and not (session.reporter and session.reporter.active)):
-                    _start_unsolicited_turn(session)
+                if not session.turn_lock.locked() and not session.after_turn_noticed:
+                    _notice_output_after_turn(session)
                 if not session.first_tool_seen:
                     session.pre_tool_text.extend(text_blocks)
                     if not has_tool_use:
@@ -1190,13 +1189,10 @@ def _reader_loop(session: LiveSession) -> None:
                         session._on_text(status)
                 else:
                     for text in session.pre_tool_text:
-                        if session.unsolicited_turn and session.reporter:
-                            session.reporter.add_reply(text)
-                        elif session._on_text:
+                        if session._on_text:
                             session._on_text(text)
                 if session.reporter:
                     session.reporter.finish(post_reply=not session.private_escalation_pending)
-                session.unsolicited_turn = False
                 session.private_escalation_pending = False
                 session.first_tool_seen = False
                 session.pre_tool_text.clear()
@@ -2391,7 +2387,7 @@ def process_message_async(event: dict) -> None:
                 session._on_text = on_text
                 if session.reporter and session.reporter.active:
                     session.reporter.finish(state="stopped")
-                session.unsolicited_turn = False
+                session.after_turn_noticed = False
                 session.reporter = TurnReporter(
                     post=on_text,
                     post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
@@ -2431,7 +2427,7 @@ def process_message_async(event: dict) -> None:
                         channel=channel, thread_ts=thread_ts,
                         text=(
                             f"Turn reached its {minutes}-minute inactivity limit or "
-                            f"{MAX_TURN_RUNTIME // 60}-minute hard limit; stopped. "
+                            f"{format_elapsed(MAX_TURN_RUNTIME)} hard limit; stopped. "
                             "Working files and thread continuity were preserved; "
                             "tell me to resume when ready."
                         ),
@@ -2557,17 +2553,17 @@ def _stop_background_delegates(session) -> None:
         pass
 
 
-def _start_unsolicited_turn(session: LiveSession) -> None:
-    """Report output the process produced with no turn running, so it reaches the thread."""
-    channel, thread_ts = session.channel, session.thread_ts
-    session.unsolicited_turn = True
-    session.reporter = TurnReporter(
-        post=lambda text: post_response(channel, text, thread_ts=thread_ts),
-        post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
-        post_status=lambda line: _post_status_line(channel, thread_ts, line),
-        update_status=lambda ts, line: _update_status_line(channel, ts, line),
-    )
-    session.reporter.begin()
+def _notice_output_after_turn(session: LiveSession) -> None:
+    """The process woke after its turn ended (e.g. a background task finished); say so once."""
+    session.after_turn_noticed = True
+    note = "kept working after the turn ended; reply in this thread to see the result"
+    try:
+        slack_client.chat_postMessage(
+            channel=session.channel, thread_ts=session.thread_ts, text=note,
+            blocks=_context_blocks(f":information_source: _{note}_"),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to post after-turn notice: {exc}")
 
 
 def _reporter_heartbeat() -> None:
@@ -2578,11 +2574,7 @@ def _reporter_heartbeat() -> None:
             with _live_sessions_lock:
                 sessions = list(_live_sessions.values())
             tick_all(
-                (
-                    session.reporter,
-                    (session.turn_lock.locked() or session.unsolicited_turn)
-                    and session.proc.poll() is None,
-                )
+                (session.reporter, session.turn_lock.locked() and session.proc.poll() is None)
                 for session in sessions
                 if session.reporter
             )
