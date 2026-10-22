@@ -94,6 +94,12 @@ sudo launchctl print system/com.cargo-chief.daily-diary
 The daemon explicitly drops privileges to the configured service user and group before invoking
 the diary script. The schedule is still 3:30 AM local and runs without an interactive login.
 
+launchd does not give the job the bot's Claude token, so the script runs `claude` through
+`with_harness_credential.py`. That reads `CLAUDE_CODE_OAUTH_TOKEN` from the bot's secret env file
+(`CARGO_CHIEF_ENV_FILE`, default `~/.config/cargo-chief/home-base.env`) and refuses to run without
+it, instead of falling back to an interactive login that expires. It needs the home-base venv's
+Python (`CARGO_CHIEF_HOME_BASE_PYTHON` overrides the default). `--dry-run` checks the credential too.
+
 Run one explicit live acceptance (this writes today's entry, or skips if one already exists):
 
 ```bash
