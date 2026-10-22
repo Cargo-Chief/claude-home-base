@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -220,6 +221,14 @@ class RuntimePolicyTest(unittest.TestCase):
         inside.chmod(0o600)
         with self.assertRaisesRegex(SafetyError, "outside the Cargo Chief workspace"):
             validate_secret_env_path(inside, workspace_root=self.workspace)
+
+    def test_credential_file_must_belong_to_the_running_user(self):
+        credentials = self.base / "credentials.env"
+        credentials.write_text("PLACEHOLDER=value\n")
+        credentials.chmod(0o600)
+        with mock.patch("cargo_chief_safety.os.getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(SafetyError, "owned by the running user"):
+                validate_secret_env_path(credentials, workspace_root=self.workspace)
 
     def test_finds_workspace_from_canonical_and_worktree_checkouts(self):
         self.assertEqual(self.workspace, find_workspace_root(self.source))

@@ -97,6 +97,8 @@ def validate_secret_env_path(path: Path, *, workspace_root: Path) -> Path:
         raise SafetyError(f"external credential file is missing or unsafe: {path}")
     if path.stat().st_mode & 0o777 != 0o600:
         raise SafetyError("CARGO_CHIEF_ENV_FILE must have mode 600")
+    if path.stat().st_uid != os.getuid():
+        raise SafetyError("CARGO_CHIEF_ENV_FILE must be owned by the running user")
     return path
 
 
