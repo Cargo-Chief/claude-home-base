@@ -212,10 +212,7 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 CLAUDE_TIMEOUT = RUNTIME_POLICY.claude_timeout
 DELEGATE_TIMEOUT = delegate_timeout_from_env(os.environ)
-MAX_TURN_RUNTIME = max(
-    4 * CLAUDE_TIMEOUT,
-    DELEGATE_TIMEOUT + CLAUDE_TIMEOUT,
-)
+MAX_TURN_RUNTIME = max(RUNTIME_POLICY.max_turn_runtime, DELEGATE_TIMEOUT + CLAUDE_TIMEOUT)
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -660,6 +657,8 @@ class LiveSession:
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
+    # A turn the process started on its own, e.g. a background task finishing after the turn ended
+    unsolicited_turn: bool = False
 
 
 # thread_ts → LiveSession
@@ -1080,6 +1079,9 @@ def _reader_loop(session: LiveSession) -> None:
                     if isinstance(block, dict) and block.get("type") == "text"
                     and block.get("text", "").strip()
                 ]
+                if (not session.turn_lock.locked()
+                        and not (session.reporter and session.reporter.active)):
+                    _start_unsolicited_turn(session)
                 if not session.first_tool_seen:
                     session.pre_tool_text.extend(text_blocks)
                     if not has_tool_use:
@@ -1188,10 +1190,13 @@ def _reader_loop(session: LiveSession) -> None:
                         session._on_text(status)
                 else:
                     for text in session.pre_tool_text:
-                        if session._on_text:
+                        if session.unsolicited_turn and session.reporter:
+                            session.reporter.add_reply(text)
+                        elif session._on_text:
                             session._on_text(text)
                 if session.reporter:
                     session.reporter.finish(post_reply=not session.private_escalation_pending)
+                session.unsolicited_turn = False
                 session.private_escalation_pending = False
                 session.first_tool_seen = False
                 session.pre_tool_text.clear()
@@ -2384,6 +2389,9 @@ def process_message_async(event: dict) -> None:
             with session.turn_lock:
                 turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
                 session._on_text = on_text
+                if session.reporter and session.reporter.active:
+                    session.reporter.finish(state="stopped")
+                session.unsolicited_turn = False
                 session.reporter = TurnReporter(
                     post=on_text,
                     post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
@@ -2549,6 +2557,19 @@ def _stop_background_delegates(session) -> None:
         pass
 
 
+def _start_unsolicited_turn(session: LiveSession) -> None:
+    """Report output the process produced with no turn running, so it reaches the thread."""
+    channel, thread_ts = session.channel, session.thread_ts
+    session.unsolicited_turn = True
+    session.reporter = TurnReporter(
+        post=lambda text: post_response(channel, text, thread_ts=thread_ts),
+        post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
+        post_status=lambda line: _post_status_line(channel, thread_ts, line),
+        update_status=lambda ts, line: _update_status_line(channel, ts, line),
+    )
+    session.reporter.begin()
+
+
 def _reporter_heartbeat() -> None:
     """Refresh live status lines; end any left active by a turn that finished abnormally."""
     while True:
@@ -2557,7 +2578,11 @@ def _reporter_heartbeat() -> None:
             with _live_sessions_lock:
                 sessions = list(_live_sessions.values())
             tick_all(
-                (session.reporter, session.turn_lock.locked() and session.proc.poll() is None)
+                (
+                    session.reporter,
+                    (session.turn_lock.locked() or session.unsolicited_turn)
+                    and session.proc.poll() is None,
+                )
                 for session in sessions
                 if session.reporter
             )

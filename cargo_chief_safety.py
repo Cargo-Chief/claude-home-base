@@ -214,6 +214,7 @@ class RuntimePolicy:
     max_live_bundles: int
     file_transfer_enabled: bool
     transcript_search_enabled: bool
+    max_turn_runtime: int = 3 * 3600
 
     @classmethod
     def from_env(
@@ -242,9 +243,10 @@ class RuntimePolicy:
             timeout = int(env.get("CLAUDE_TIMEOUT", "600"))
             max_sessions = int(env.get("MAX_LIVE_SESSIONS", "2"))
             max_bundles = int(env.get("MAX_LIVE_BUNDLES", "3"))
+            max_turn_runtime = int(env.get("MAX_TURN_RUNTIME", str(3 * 3600)))
         except ValueError as exc:
             raise SafetyError(
-                "CLAUDE_TIMEOUT, MAX_LIVE_SESSIONS, and MAX_LIVE_BUNDLES must be integers"
+                "CLAUDE_TIMEOUT, MAX_LIVE_SESSIONS, MAX_LIVE_BUNDLES and MAX_TURN_RUNTIME must be integers"
             ) from exc
         if not 1 <= timeout <= 900:
             raise SafetyError("CLAUDE_TIMEOUT must be between 1 and 900 seconds for Gate A")
@@ -252,6 +254,8 @@ class RuntimePolicy:
             raise SafetyError("MAX_LIVE_SESSIONS must be between 1 and 2 for Gate A")
         if not 1 <= max_bundles <= 5:
             raise SafetyError("MAX_LIVE_BUNDLES must be between 1 and 5")
+        if not 600 <= max_turn_runtime <= 6 * 3600:
+            raise SafetyError("MAX_TURN_RUNTIME must be between 600 and 21600 seconds")
 
         file_transfer = _env_bool(env, "ENABLE_FILE_TRANSFER", False)
         transcript_search = _env_bool(env, "ENABLE_TRANSCRIPT_SEARCH", False)
@@ -270,6 +274,7 @@ class RuntimePolicy:
             max_live_bundles=max_bundles,
             file_transfer_enabled=file_transfer,
             transcript_search_enabled=transcript_search,
+            max_turn_runtime=max_turn_runtime,
         )
 
     def prepare(self) -> None:
@@ -886,7 +891,9 @@ SLACK_REPORTING_PROMPT = (
     "question, or with 💬 for anything else a person should read now, such as an answer to their "
     "mid-turn message or feedback that needs a human; those post immediately. Text written after "
     "your last tool call is your reply, posted when the turn ends. At the end of a ticket or piece "
-    "of work, make it a summary of what was done, the major decisions, and any issues."
+    "of work, make it a summary of what was done, the major decisions, and any issues. A tool "
+    "call that comes back interrupted may be the harness ending your turn at its time limit, not "
+    "a person declining: write your state to TASK.md and stop."
 )
 
 # Variables that point a process at the governed launcher; any one of them arms

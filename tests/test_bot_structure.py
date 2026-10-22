@@ -71,9 +71,20 @@ class BotTurnStructureTest(unittest.TestCase):
         }
 
         self.assertEqual(
-            "max(4 * CLAUDE_TIMEOUT, DELEGATE_TIMEOUT + CLAUDE_TIMEOUT)",
+            "max(RUNTIME_POLICY.max_turn_runtime, DELEGATE_TIMEOUT + CLAUDE_TIMEOUT)",
             assignments["MAX_TURN_RUNTIME"],
         )
+
+    def test_output_with_no_turn_running_is_reported_as_its_own_turn(self):
+        reader = ast.unparse(self._function("_reader_loop"))
+        self.assertIn("if not session.turn_lock.locked() and (not (session.reporter and session.reporter.active)):", reader)
+        self.assertIn("_start_unsolicited_turn(session)", reader)
+        self.assertIn("session.reporter.add_reply(text)", reader)
+        self.assertIn("session.unsolicited_turn = False", reader)
+        heartbeat = ast.unparse(self._function("_reporter_heartbeat"))
+        self.assertIn("session.turn_lock.locked() or session.unsolicited_turn", heartbeat)
+        start = ast.unparse(self._function("_start_unsolicited_turn"))
+        self.assertIn("post_response(channel, text, thread_ts=thread_ts)", start)
 
     def test_normal_claude_turn_is_sibling_of_steering_branch(self):
         tree = ast.parse(

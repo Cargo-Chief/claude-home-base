@@ -254,6 +254,15 @@ class RuntimePolicyTest(unittest.TestCase):
             RuntimePolicy.from_env(self.env(MAX_LIVE_BUNDLES="0"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
         with self.assertRaisesRegex(SafetyError, "MAX_LIVE_BUNDLES"):
             RuntimePolicy.from_env(self.env(MAX_LIVE_BUNDLES="6"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        for value in ("599", "21601", "three-hours"):
+            with self.assertRaisesRegex(SafetyError, "MAX_TURN_RUNTIME"):
+                RuntimePolicy.from_env(self.env(MAX_TURN_RUNTIME=value), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+
+    def test_turn_runtime_defaults_to_three_hours_and_is_configurable(self):
+        default = RuntimePolicy.from_env(self.env(), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        self.assertEqual(3 * 3600, default.max_turn_runtime)
+        configured = RuntimePolicy.from_env(self.env(MAX_TURN_RUNTIME="5400"), source_dir=self.source, workspace_root=self.workspace, home=self.base)
+        self.assertEqual(5400, configured.max_turn_runtime)
 
     def test_rejects_file_transfer_and_transcript_search(self):
         with self.assertRaisesRegex(SafetyError, "ENABLE_FILE_TRANSFER"):
