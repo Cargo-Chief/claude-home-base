@@ -878,6 +878,15 @@ NATIVE_DELEGATION_PROMPT = (
     "delegate return before acting on it."
 )
 
+SLACK_REPORTING_PROMPT = (
+    "Slack reporting: text you write between tool calls updates one live status line in the "
+    "thread and is not posted as a message. Start a text block with ❓ to ask a person a "
+    "question, or with 💬 for anything else a person should read now, such as an answer to their "
+    "mid-turn message or feedback that needs a human; those post immediately. Text written after "
+    "your last tool call is your reply, posted when the turn ends. At the end of a ticket or piece "
+    "of work, make it a summary of what was done, the major decisions, and any issues."
+)
+
 # Variables that point a process at the governed launcher; any one of them arms
 # agent-kit's delegation-guard.sh, which would deny native Agent calls.
 LAUNCHER_ENV_KEYS = (
@@ -965,7 +974,12 @@ def build_claude_command(
         delegation=NATIVE_DELEGATION_PROMPT,
     )
     appended = "\n\n".join(
-        part for part in (overlay, harness_prompt, identity_prompt.strip(), model_prompt.strip()) if part
+        part
+        for part in (
+            overlay, harness_prompt, SLACK_REPORTING_PROMPT, identity_prompt.strip(),
+            model_prompt.strip(),
+        )
+        if part
     )
     command = [
         "claude", "-p", initial_prompt,

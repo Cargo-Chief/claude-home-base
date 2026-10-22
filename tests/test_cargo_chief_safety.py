@@ -23,6 +23,7 @@ from cargo_chief_safety import (
     thread_workspace_key,
     build_authority_envelope,
     LAUNCHER_ENV_KEYS,
+    SLACK_REPORTING_PROMPT,
     auto_memory_directory,
     build_claude_command,
     claude_owner_env,
@@ -666,6 +667,7 @@ class PreflightTest(unittest.TestCase):
         self.assertNotIn("governed_delegation.py", appended)
         self.assertNotIn("--channel D1", appended)
         self.assertIn("Delegate with the Agent tool", appended)
+        self.assertIn(SLACK_REPORTING_PROMPT, appended)
         self.assertIn("agent identity", appended)
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])

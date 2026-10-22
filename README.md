@@ -307,7 +307,7 @@ file is mode `0600` and never contains prompts or delegate returns.
 - **Thread continuity** — session IDs persist per thread
 - **File handling** — upstream capability; disabled by the Cargo Chief Gate A runtime policy
 - **Proactive messaging** — send DMs, post to channels, reply in threads via CLI
-- **Streaming output** — real-time responses as Claude generates
+- **Turn reporting** (Claude path) — narration between tool calls edits one live status line per turn instead of posting a message each time. A text block starting with ❓ (question) or 💬 (message for a person) posts as its own message, and the text written after the turn's last tool call posts as the reply when the turn ends. A heartbeat refreshes the status every minute with elapsed time and time since last activity, and posts a short "still working" note after 20 quiet minutes. Context and skill notices join the status line. The OpenAI fallback still posts its texts at turn end
 - **Native tables** — markdown tables in responses render as real Slack tables (Block Kit `markdown` block)
 - **Per-room models** — `model-config.json` picks which model and reasoning effort answers in each channel or DM, plus an optional per-model system prompt; read fresh on every spawn (no restart), editable from the file explorer's `/models` page. Name a `default_model` there and the page's default row becomes a dropdown too, so you can move every unconfigured room to a different model in one pick
 - **Prompt cadence** — a per-model prompt is in the Claude system prompt at spawn and can be re-sent every Nth message so a standing instruction does not decay
