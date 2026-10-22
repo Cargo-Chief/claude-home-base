@@ -130,6 +130,17 @@ class BotTurnStructureTest(unittest.TestCase):
 
         self.assertEqual([], offenders)
 
+    def test_claude_turns_report_through_the_turn_reporter(self):
+        reader = ast.unparse(self._function("_reader_loop"))
+        self.assertIn("session.reporter.text(text)", reader)
+        self.assertIn("session.reporter.tool_used()", reader)
+        self.assertIn(
+            "session.reporter.finish(post_reply=not session.private_escalation_pending)", reader
+        )
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("session.reporter.begin()", process)
+        self.assertIn("session.reporter.finish(post_reply=False, state='stopped')", process)
+
 
 if __name__ == "__main__":
     unittest.main()
