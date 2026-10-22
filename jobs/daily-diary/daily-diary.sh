@@ -36,8 +36,11 @@ REVIEW_PROMPT_FILE="$HOME/scripts/diary-review-prompt.md"
 LOG_FILE="$HOME/scripts/diary-cron.log"
 TIMEOUT=2700  # 45 minutes — kill the run if it hangs
 PIPELINE="$HOME_BASE_DIR/diary_pipeline.py"
+# claude runs with the bot's token: launchd does not start this job with it, and the fallback login expires
+HOME_BASE_PYTHON="$HOME/.local/share/cargo-chief/home-base-venv/bin/python"
+CREDENTIAL_WRAPPER="$HOME_BASE_DIR/with_harness_credential.py"
 
-for required in "$AUTHOR_PROMPT_FILE" "$REVIEW_PROMPT_FILE" "$PIPELINE"; do
+for required in "$AUTHOR_PROMPT_FILE" "$REVIEW_PROMPT_FILE" "$PIPELINE" "$CREDENTIAL_WRAPPER"; do
     if [[ ! -r "$required" ]]; then
         echo "Diary pipeline file is missing or unreadable: $required" >&2
         exit 2
@@ -55,8 +58,19 @@ if ! command -v claude >/dev/null; then
     echo "Claude CLI is unavailable" >&2
     exit 2
 fi
+if [[ ! -x "$HOME_BASE_PYTHON" ]]; then
+    echo "Home-base Python is missing: $HOME_BASE_PYTHON" >&2
+    exit 2
+fi
+credential_available() {
+    "$HOME_BASE_PYTHON" "$CREDENTIAL_WRAPPER" --check
+}
 
 if $DRY_RUN; then
+    if ! credential_available; then
+        echo "Harness credential is unavailable; claude would fall back to an expiring login" >&2
+        exit 2
+    fi
     printf 'DIARY_DRY_RUN_OK date=%s target=%s\n' "$DATE" "$DIARY_FILE"
     exit 0
 fi
@@ -75,6 +89,11 @@ if [ -f "$DIARY_FILE" ]; then
     exit 0
 fi
 
+if ! credential_available 2>> "$LOG_FILE"; then
+    echo "[$DATE] ERROR: harness credential unavailable; refusing to run claude on a fallback login" >> "$LOG_FILE"
+    exit 2
+fi
+
 echo "[$DATE] Starting diary generation..." >> "$LOG_FILE"
 
 if ! STAGE_DIR=$(python3 "$PIPELINE" prepare --root "$IDENTITY_DIR" --date "$DATE"); then
@@ -85,7 +104,9 @@ fi
 run_model() {
     local phase="$1"
     local prompt="$2"
-    (cd "$WORKSPACE_ROOT" && claude -p --permission-mode auto "$prompt" \
+    # exec so the watchdog's TERM reaches claude rather than an intermediate subshell
+    (cd "$WORKSPACE_ROOT" && exec "$HOME_BASE_PYTHON" "$CREDENTIAL_WRAPPER" -- \
+        claude -p --permission-mode auto "$prompt" \
         >/dev/null 2>> "$LOG_FILE") &
     local model_pid=$!
     (sleep "$TIMEOUT" && kill -TERM "$model_pid" 2>/dev/null && \

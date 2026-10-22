@@ -55,7 +55,8 @@ same generated `AGENTS.md`/`CLAUDE.md` and permission rails govern reflection. A
 the job; it never falls back to an ungoverned working directory.
 
 Run the non-mutating preflight before loading launchd. It validates paths, the identity store,
-required commands, and the target date without invoking a model or writing a diary entry:
+required commands, the harness credential, and the target date without invoking a model or writing
+a diary entry. Install the bot's secret env file first, because the preflight needs it:
 
 ```bash
 ~/scripts/daily-diary.sh --dry-run
@@ -93,6 +94,13 @@ sudo launchctl print system/com.cargo-chief.daily-diary
 
 The daemon explicitly drops privileges to the configured service user and group before invoking
 the diary script. The schedule is still 3:30 AM local and runs without an interactive login.
+
+launchd does not give the job the bot's Claude token, so the script runs `claude` through
+`with_harness_credential.py` with the home-base venv's Python. The wrapper reads
+`CLAUDE_CODE_OAUTH_TOKEN` only from the bot's secret env file (the same file and checks the bot
+uses), ignores any inherited value, runs nothing but `claude`, and refuses to run without the token
+instead of falling back to an interactive login that expires. The diary's `claude` then holds that
+token in its environment, as the bot's own sessions do.
 
 Run one explicit live acceptance (this writes today's entry, or skips if one already exists):
 
