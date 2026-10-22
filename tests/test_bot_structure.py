@@ -137,9 +137,21 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn(
             "session.reporter.finish(post_reply=not session.private_escalation_pending)", reader
         )
+        self.assertIn("session.reporter.finish(state='stopped')", reader)
+        self.assertIn("_live_sessions.get(session.thread_ts) is session", reader)
         process = ast.unparse(self._function("process_message_async"))
         self.assertIn("session.reporter.begin()", process)
-        self.assertIn("session.reporter.finish(post_reply=False, state='stopped')", process)
+        self.assertIn("session.reporter.finish(state='stopped')", process)
+        self.assertIn("session.reporter.mark_stopped()", ast.unparse(self._function("_maybe_stop_from_message")))
+
+    def test_reader_keeps_on_text_filters_for_skip_limit_and_attachments(self):
+        reader = ast.unparse(self._function("_reader_loop"))
+        self.assertIn("text.strip() == 'SKIP' or is_claude_limit_notice(text) or _ATTACH_PATTERN.search(text)", reader)
+
+    def test_heartbeat_uses_the_guarded_pass(self):
+        heartbeat = ast.unparse(self._function("_reporter_heartbeat"))
+        self.assertIn("tick_all(", heartbeat)
+        self.assertIn("except Exception", heartbeat)
 
 
 if __name__ == "__main__":

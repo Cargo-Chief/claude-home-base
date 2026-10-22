@@ -83,7 +83,7 @@ from agent_status import (
     reboot_request_is_exact,
 )
 from delegation_observability import DelegationTracker, format_delegation_audit
-from turn_reporter import TurnReporter
+from turn_reporter import TurnReporter, tick_all
 from openai_fallback import (
     fallback_error_kind,
     is_claude_limit_notice,
@@ -872,10 +872,10 @@ CTX_WINDOW = 1_000_000
 def _post_context_notice(session: LiveSession, ctx: int) -> None:
     """Post a small grey context-block notice about context utilization."""
     try:
-        note = f"context window: ~{ctx / 1000:.0f}k of {CTX_WINDOW // 1000}k tokens ({ctx / CTX_WINDOW:.0%})"
         if session.reporter and session.reporter.active:
             session.reporter.set_note(f"context {ctx / CTX_WINDOW:.0%}")
             return
+        note = f"context window: ~{ctx / 1000:.0f}k of {CTX_WINDOW // 1000}k tokens ({ctx / CTX_WINDOW:.0%})"
         slack_client.chat_postMessage(
             channel=session.channel, thread_ts=session.thread_ts,
             text=note,
@@ -891,7 +891,7 @@ def _post_skill_notice(session: LiveSession, skill: str, args_str: str) -> None:
     try:
         note = f"skill: {skill}" + (f" · {args_str}" if args_str else "")
         if session.reporter and session.reporter.active:
-            session.reporter.set_note(f"skill: {skill}")
+            session.reporter.set_note(note)
             return
         slack_client.chat_postMessage(
             channel=session.channel, thread_ts=session.thread_ts,
@@ -903,19 +903,27 @@ def _post_skill_notice(session: LiveSession, skill: str, args_str: str) -> None:
         logger.warning(f"Failed to post skill notice: {e}")
 
 
+def _context_blocks(text: str) -> list[dict]:
+    return [{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}]
+
+
 def _post_status_line(channel: str, thread_ts: str, text: str) -> str | None:
     """Post the turn's live status line; returns its ts for in-place updates."""
     result = slack_client.chat_postMessage(
-        channel=channel, thread_ts=thread_ts, text=text,
-        blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}],
+        channel=channel, thread_ts=thread_ts, text=text, blocks=_context_blocks(text),
     )
     return result["ts"]
 
 
 def _update_status_line(channel: str, ts: str, text: str) -> None:
-    slack_client.chat_update(
-        channel=channel, ts=ts, text=text,
-        blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}],
+    slack_client.chat_update(channel=channel, ts=ts, text=text, blocks=_context_blocks(text))
+
+
+def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
+    """A harness progress notice: a new message so it notifies, never counted as agent output."""
+    text = f":hourglass_flowing_sand: _{note}_"
+    slack_client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts, text=note, blocks=_context_blocks(text),
     )
 
 
@@ -1090,7 +1098,12 @@ def _reader_loop(session: LiveSession) -> None:
                         _post_skill_notice(session, inp.get("skill", "?"), args_str)
                 if session.reporter and session.reporter.active:
                     for text in text_blocks:
-                        session.reporter.text(text)
+                        if (text.strip() == "SKIP" or is_claude_limit_notice(text)
+                                or _ATTACH_PATTERN.search(text)):
+                            if session._on_text:
+                                session._on_text(text)
+                        else:
+                            session.reporter.text(text)
                     if has_tool_use:
                         session.reporter.tool_used()
                 else:
@@ -1197,8 +1210,11 @@ def _reader_loop(session: LiveSession) -> None:
         # Process ended — unblock any thread waiting on a response
         session._turn_done.set()
         logger.info(f"Reader loop ended for thread {session.thread_ts} (pid={session.proc.pid})")
+        if session.reporter:
+            session.reporter.finish(state="stopped")
         with _live_sessions_lock:
-            _live_sessions.pop(session.thread_ts, None)
+            if _live_sessions.get(session.thread_ts) is session:
+                _live_sessions.pop(session.thread_ts, None)
 
 
 def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "") -> LiveSession:
@@ -2370,6 +2386,7 @@ def process_message_async(event: dict) -> None:
                 session._on_text = on_text
                 session.reporter = TurnReporter(
                     post=on_text,
+                    post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
                     post_status=lambda line: _post_status_line(channel, thread_ts, line),
                     update_status=lambda ts, line: _update_status_line(channel, ts, line),
                 )
@@ -2399,7 +2416,7 @@ def process_message_async(event: dict) -> None:
                         except Exception:
                             pass
                     if session.reporter:
-                        session.reporter.finish(post_reply=False, state="stopped")
+                        session.reporter.finish(state="stopped")
                     stopped_cleanly = stop_timed_out_session(session, _interrupt_session)
                     minutes = CLAUDE_TIMEOUT // 60
                     slack_client.chat_postMessage(
@@ -2512,6 +2529,8 @@ def _interrupt_session(session: LiveSession) -> bool:
 
 def _stop_background_delegates(session) -> None:
     """End a process whose owner turn is over but whose background subagents still run."""
+    if session.reporter:
+        session.reporter.mark_stopped()
     session.proc.terminate()
     try:
         session.proc.wait(timeout=5)
@@ -2534,16 +2553,16 @@ def _reporter_heartbeat() -> None:
     """Refresh live status lines; end any left active by a turn that finished abnormally."""
     while True:
         time.sleep(60)
-        with _live_sessions_lock:
-            sessions = list(_live_sessions.values())
-        for session in sessions:
-            reporter = session.reporter
-            if not reporter or not reporter.active:
-                continue
-            if session.turn_lock.locked() and session.proc.poll() is None:
-                reporter.tick()
-            else:
-                reporter.finish(post_reply=False, state="stopped")
+        try:
+            with _live_sessions_lock:
+                sessions = list(_live_sessions.values())
+            tick_all(
+                (session.reporter, session.turn_lock.locked() and session.proc.poll() is None)
+                for session in sessions
+                if session.reporter
+            )
+        except Exception as exc:
+            logger.warning(f"Reporter heartbeat pass failed: {exc}")
 
 
 def _maybe_stop_from_message(event: dict) -> bool:
@@ -2610,6 +2629,8 @@ def _maybe_stop_from_message(event: dict) -> bool:
         return False  # nothing running here — treat as a normal message
 
     def _do_stop():
+        if session.reporter:
+            session.reporter.mark_stopped()
         clean = _interrupt_session(session)
         note = ("stopped mid-run — tell me where to go instead" if clean
                 else "had to hard-kill the process; the thread resumes with full context on your next message")
