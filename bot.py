@@ -642,6 +642,8 @@ class LiveSession:
     pending_reactions: list = field(default_factory=list)
     # Highest 100k context threshold already announced in the thread
     ctx_notified_level: int = 0
+    # Whether the one-time high-context warning has been posted since the last compaction
+    ctx_warned: bool = False
     # Model last announced in the thread (from message.model on assistant
     # events — the served model, not the --model flag). "" = not yet announced.
     model_notified: str = ""
@@ -862,25 +864,31 @@ def _spawn_claude_process(
     return proc, workspace
 
 
-# Announce context utilization in the thread every N tokens (bot-side only —
-# the notice never enters Claude's context)
+# Context utilization goes in the turn's status line every N tokens; the thread
+# gets one message when it crosses CTX_WARN_FRACTION, re-armed below CTX_REARM_FRACTION
+# (bot-side only — the notice never enters Claude's context).
 CTX_NOTIFY_STEP = 100_000
 CTX_WINDOW = 1_000_000
+CTX_WARN_FRACTION = 0.8
+CTX_REARM_FRACTION = 0.7
 
 
 def _post_context_notice(session: LiveSession, ctx: int) -> None:
-    """Post a small grey context-block notice about context utilization."""
+    """Note context use in the status line; warn in the thread once when it runs high."""
     try:
         if session.reporter and session.reporter.active:
             session.reporter.set_note(f"context {ctx / CTX_WINDOW:.0%}")
+        if session.ctx_warned or ctx < CTX_WARN_FRACTION * CTX_WINDOW:
             return
-        note = f"context window: ~{ctx / 1000:.0f}k of {CTX_WINDOW // 1000}k tokens ({ctx / CTX_WINDOW:.0%})"
+        note = (f"context window at {ctx / CTX_WINDOW:.0%}; the session compacts itself near the limit, "
+                f"and a new thread for the next task starts fresh")
         slack_client.chat_postMessage(
             channel=session.channel, thread_ts=session.thread_ts,
             text=note,
             blocks=[{"type": "context", "elements": [
                 {"type": "mrkdwn", "text": f":brain: _{note}_"}]}],
         )
+        session.ctx_warned = True
     except Exception as e:
         logger.warning(f"Failed to post context notice: {e}")
 
@@ -1016,6 +1024,33 @@ def _track_context(session: LiveSession, data: dict) -> None:
         _post_context_notice(session, ctx)
     elif level < session.ctx_notified_level:
         session.ctx_notified_level = level
+    if ctx < CTX_REARM_FRACTION * CTX_WINDOW:
+        session.ctx_warned = False
+
+
+def _deliver_text(session: LiveSession, text: str) -> None:
+    """Post turn text; a failed Slack call is logged so the reader keeps draining the process."""
+    try:
+        session._on_text(text)
+    except Exception as e:
+        logger.warning(f"Failed to post to thread {session.thread_ts}: {e}")
+
+
+def _stop_unread_process(session: LiveSession) -> None:
+    if session.proc.poll() is not None:
+        return
+    logger.warning(f"Stopping unread Claude process pid={session.proc.pid}")
+    try:
+        session.proc.terminate()
+        session.proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        session.proc.kill()
+        try:
+            session.proc.wait(timeout=5)
+        except Exception as e:
+            logger.warning(f"pid={session.proc.pid} not reaped after SIGKILL: {e}")
+    except Exception as e:
+        logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
 
 
 def _reader_loop(session: LiveSession) -> None:
@@ -1023,6 +1058,7 @@ def _reader_loop(session: LiveSession) -> None:
 
     Runs in a dedicated thread for each live session.
     """
+    failed = False
     try:
         for line in session.proc.stdout:
             line = line.strip()
@@ -1031,6 +1067,8 @@ def _reader_loop(session: LiveSession) -> None:
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
                 continue
 
             msg_type = data.get("type")
@@ -1102,7 +1140,7 @@ def _reader_loop(session: LiveSession) -> None:
                         if (text.strip() == "SKIP" or is_claude_limit_notice(text)
                                 or _ATTACH_PATTERN.search(text)):
                             if session._on_text:
-                                session._on_text(text)
+                                _deliver_text(session, text)
                         else:
                             session.reporter.text(text)
                     if has_tool_use:
@@ -1110,7 +1148,7 @@ def _reader_loop(session: LiveSession) -> None:
                 else:
                     for text in text_blocks:
                         if session._on_text:
-                            session._on_text(text)
+                            _deliver_text(session, text)
 
             elif msg_type == "result":
                 for record in session.delegation_tracker.finish_turn():
@@ -1132,7 +1170,7 @@ def _reader_loop(session: LiveSession) -> None:
                             session.user_id, session.channel, session.thread_ts, str(exc),
                         )
                         if session._on_text:
-                            session._on_text(f"Worktree bundle mapping refused: {exc}")
+                            _deliver_text(session, f"Worktree bundle mapping refused: {exc}")
                     else:
                         if bundle:
                             audit_logger.info(
@@ -1151,7 +1189,7 @@ def _reader_loop(session: LiveSession) -> None:
                             session.user_id, session.channel, session.thread_ts, parking_refused,
                         )
                         if session._on_text and not session.private_escalation_pending:
-                            session._on_text(f"Parking record refused: {parking_refused}")
+                            _deliver_text(session, f"Parking record refused: {parking_refused}")
                     else:
                         if parking:
                             audit_logger.info(
@@ -1186,11 +1224,11 @@ def _reader_loop(session: LiveSession) -> None:
                         parking_refused=bool(parking_refused),
                     )
                     if session._on_text:
-                        session._on_text(status)
+                        _deliver_text(session, status)
                 else:
                     for text in session.pre_tool_text:
                         if session._on_text:
-                            session._on_text(text)
+                            _deliver_text(session, text)
                 if session.reporter:
                     session.reporter.finish(post_reply=not session.private_escalation_pending)
                 session.private_escalation_pending = False
@@ -1207,15 +1245,19 @@ def _reader_loop(session: LiveSession) -> None:
 
     except Exception as e:
         logger.error(f"Reader loop error for thread {session.thread_ts}: {e}")
+        failed = True
     finally:
+        with _live_sessions_lock:
+            if _live_sessions.get(session.thread_ts) is session:
+                _live_sessions.pop(session.thread_ts, None)
+        if failed:
+            # Nothing reads this process any more; stop it so a resume does not run beside it.
+            _stop_unread_process(session)
         # Process ended — unblock any thread waiting on a response
         session._turn_done.set()
         logger.info(f"Reader loop ended for thread {session.thread_ts} (pid={session.proc.pid})")
         if session.reporter:
             session.reporter.finish(state="stopped")
-        with _live_sessions_lock:
-            if _live_sessions.get(session.thread_ts) is session:
-                _live_sessions.pop(session.thread_ts, None)
 
 
 def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "") -> LiveSession:
