@@ -323,12 +323,37 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
 
     def test_index_runs_once_the_other_run_releases(self):
         fd = self._hold_lock()
-        threading.Timer(0.5, os.close, args=(fd,)).start()
-        with mock.patch.object(search, "load_config", return_value=self.cfg), \
-             mock.patch.object(search, "index_all") as index_all, \
-             mock.patch.dict(os.environ, {search.INDEX_LOCK_TIMEOUT_ENV: "10"}):
-            search.main(["index"])
+        release = threading.Timer(0.5, os.close, args=(fd,))
+        release.start()
+        try:
+            with mock.patch.object(search, "load_config", return_value=self.cfg), \
+                 mock.patch.object(search, "index_all") as index_all, \
+                 mock.patch.dict(os.environ, {search.INDEX_LOCK_TIMEOUT_ENV: "10"}):
+                search.main(["index"])
+        finally:
+            release.join()
         index_all.assert_called_once_with(self.cfg, force=False)
+
+    def test_lock_timeout_must_be_a_finite_non_negative_number(self):
+        for raw in ("", "30m", "nan", "inf", "-1"):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {search.INDEX_LOCK_TIMEOUT_ENV: raw}):
+                with self.assertRaisesRegex(ValueError, search.INDEX_LOCK_TIMEOUT_ENV):
+                    with search.index_lock(self.cfg):
+                        pass
+        self.assertFalse(self.runtime.exists())
+
+    def test_purge_of_a_missing_index_creates_nothing(self):
+        with mock.patch.object(search, "load_config", return_value=self.cfg):
+            search.main(["purge"])
+        self.assertFalse(self.runtime.exists())
+
+    def test_lock_tightens_the_directory_and_works_on_a_read_only_lock_file(self):
+        self.runtime.mkdir(mode=0o755)
+        lock_path = Path(f"{self.cfg['database']}.lock")
+        lock_path.write_text("")
+        lock_path.chmod(0o400)
+        with search.index_lock(self.cfg):
+            self.assertEqual(0o700, self.runtime.stat().st_mode & 0o777)
 
     def test_read_commands_do_not_wait_for_the_index_lock(self):
         fd = self._hold_lock()

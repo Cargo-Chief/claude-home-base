@@ -16,6 +16,7 @@ import fnmatch
 import gc
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -182,9 +183,11 @@ def get_db(cfg):
     db_path = cfg["database"]
     os.makedirs(os.path.dirname(db_path), mode=0o700, exist_ok=True)
     os.chmod(os.path.dirname(db_path), 0o700)
-    if not os.path.exists(db_path):
+    try:
         fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
+    except FileExistsError:
+        pass
     db = sqlite3.connect(db_path, timeout=30)
     os.chmod(db_path, 0o600)
     db.enable_load_extension(True)
@@ -916,13 +919,32 @@ INDEX_LOCK_TIMEOUT_ENV = "CARGO_CHIEF_INDEX_LOCK_TIMEOUT"
 WRITE_COMMANDS = ("index", "rebuild", "purge")
 
 
+def _lock_timeout():
+    raw = os.environ.get(INDEX_LOCK_TIMEOUT_ENV, "1800")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{INDEX_LOCK_TIMEOUT_ENV} must be a non-negative number of seconds, got {raw!r}")
+    return value
+
+
 @contextlib.contextmanager
-def index_lock(cfg):
-    """Hold the database's writer lock, waiting for a concurrent index run to finish first."""
+def index_lock(cfg, create=True):
+    """Hold the database's writer lock, waiting for a concurrent index run to finish first.
+
+    With create=False and no database directory there is nothing to protect, so nothing is created.
+    """
+    timeout = _lock_timeout()
     lock_path = Path(f"{cfg['database']}.lock")
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    timeout = float(os.environ.get(INDEX_LOCK_TIMEOUT_ENV, "1800"))
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    if not lock_path.parent.is_dir():
+        if not create:
+            yield
+            return
+        lock_path.parent.mkdir(mode=0o700, parents=True)
+    os.chmod(lock_path.parent, 0o700)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW, 0o600)
     try:
         deadline = time.monotonic() + timeout
         waiting = False
@@ -1012,7 +1034,10 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-    lock = index_lock(cfg) if args.command in WRITE_COMMANDS else contextlib.nullcontext()
+    if args.command in WRITE_COMMANDS:
+        lock = index_lock(cfg, create=args.command != "purge")
+    else:
+        lock = contextlib.nullcontext()
     try:
         with lock:
             _run(args, cfg)

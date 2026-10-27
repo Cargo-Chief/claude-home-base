@@ -102,7 +102,8 @@ sidecars. `status --json` exposes counts and paths without indexed content.
 
 `index`, `rebuild` and `purge` hold an exclusive lock (`<database>.lock`), so a second run waits for
 the first instead of failing with "database is locked"; a search that triggers a refresh waits the
-same way. `CARGO_CHIEF_INDEX_LOCK_TIMEOUT` (seconds, default 1800) bounds the wait.
+same way. `CARGO_CHIEF_INDEX_LOCK_TIMEOUT` (seconds, default 1800) bounds the wait. The lock file
+survives `purge` on purpose: removing a lock another run holds would let two writers in.
 
 Install the dedicated environment once, then use the wrapper. It pins the index, model, and cache
 under a private per-user state directory and supplies the canonical docs-only configuration:
