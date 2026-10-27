@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -712,6 +713,24 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("The supported unit is `%s`" % BUDGET_UNIT, codex_prompt)
         self.assertIn("wall-clock limit of 1200 seconds", codex_prompt)
         self.assertIn("/workspace/implementation-claim.txt", codex_prompt)
+
+    def test_codex_owner_rule_names_the_rooms_configured_fallback(self):
+        policy = dataclasses.replace(self.policy, fallback_model="gpt-6-luna", fallback_effort="medium")
+        prompt = build_codex_prompt(
+            policy,
+            inbound_prompt="authority envelope",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/escalation.txt"),
+            bundle_claim_file=Path("/workspace/bundle.txt"),
+            parking_claim_file=Path("/workspace/parking.txt"),
+            delegation_request_file=Path("/workspace/delegation-request.json"),
+            implementation_claim_file=Path("/workspace/implementation-claim.txt"),
+            delegate_timeout=1_200,
+            identity_prompt="agent identity",
+        )
+        self.assertIn("in this owning gpt-6-luna/medium thread", prompt)
+        self.assertNotIn("gpt-6-sol/high", prompt)
 
     def test_claude_session_gets_root_permissions_and_one_memory_directory(self):
         settings_dir = self.root / ".claude"

@@ -1130,7 +1130,8 @@ def build_codex_prompt(
             owner_rule=(
                 "Delegate only through the governed launcher described below; raw Codex collaboration "
                 "is disabled. Keep decisions, production-touching work, credentials, and final "
-                "verification in this owning gpt-6-sol/high thread. Verify every load-bearing delegate "
+                f"verification in this owning {policy.fallback_model}/{policy.fallback_effort} thread. "
+                "Verify every load-bearing delegate "
                 "return before acting on it."
             ),
         ),
