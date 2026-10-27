@@ -43,7 +43,7 @@ def _events(total, *, output=None, status="completed", text="evidence"):
     return [
         {"jsonrpc": "2.0", "id": 1, "result": {}},
         {"jsonrpc": "2.0", "id": 2,
-         "result": {"model": "gpt-5.6-sol", "thread": {"id": "thread-1"}}},
+         "result": {"model": "gpt-6-sol", "thread": {"id": "thread-1"}}},
         {"jsonrpc": "2.0", "id": 3, "result": {"turn": {"id": "turn-1"}}},
         {"jsonrpc": "2.0", "method": "item/completed",
          "params": {"item": {"type": "agentMessage", "text": text}}},
@@ -65,7 +65,7 @@ class CodexDelegationTest(unittest.TestCase):
 
         result = run_codex_delegate(
             ["codex", "app-server", "--stdio"], "private prompt", cwd="/work",
-            env={}, model="gpt-5.6-sol", effort="medium", read_only=True,
+            env={}, model="gpt-6-sol", effort="medium", read_only=True,
             token_limit=50, timeout=10, on_process=lambda value: seen.append(value),
         )
 
@@ -88,7 +88,7 @@ class CodexDelegationTest(unittest.TestCase):
 
         result = run_codex_delegate(
             ["codex", "app-server", "--stdio"], "work", cwd="/work", env={},
-            model="gpt-5.6-sol", effort="medium", read_only=False,
+            model="gpt-6-sol", effort="medium", read_only=False,
             token_limit=50, timeout=10, on_process=lambda _value: None,
         )
 
@@ -112,7 +112,7 @@ class CodexDelegationTest(unittest.TestCase):
 
         result = run_codex_delegate(
             ["codex", "app-server", "--stdio"], "work", cwd="/work", env={},
-            model="gpt-5.6-sol", effort="medium", read_only=True,
+            model="gpt-6-sol", effort="medium", read_only=True,
             token_limit=50, timeout=10, on_process=lambda _value: None,
         )
 
@@ -127,7 +127,7 @@ class CodexDelegationTest(unittest.TestCase):
 
         result = run_codex_delegate(
             ["codex", "app-server", "--stdio"], "work", cwd="/work", env={},
-            model="gpt-5.6-sol", effort="medium", read_only=True,
+            model="gpt-6-sol", effort="medium", read_only=True,
             # A per-call limit, not the thread ceiling: the property only holds
             # while it sits between the 31,203 generated and 1,125,414 raw
             # tokens below, so it must not track a constant that can pass either.

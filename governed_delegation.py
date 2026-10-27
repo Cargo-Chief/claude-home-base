@@ -71,20 +71,20 @@ IMPLEMENTATION_SECTIONS = (
 
 ROUTES = {
     "implementation": {
-        "claude": ("claude-opus-5[1m]", "medium"),
-        "openai": ("gpt-5.6-sol", "medium"),
+        "claude": ("claude-opus-5-5", "medium"),
+        "openai": ("gpt-6-sol", "medium"),
     },
     "bounded": {
-        "claude": ("claude-opus-5[1m]", "medium"),
-        "openai": ("gpt-5.6-sol", "medium"),
+        "claude": ("claude-opus-5-5", "medium"),
+        "openai": ("gpt-6-sol", "medium"),
     },
     "mechanical": {
-        "claude": ("claude-sonnet-5", "high"),
+        "claude": ("claude-sonnet-5-5", "high"),
         "openai": ("gpt-5.6-terra", "high"),
     },
     "explore": {
-        "claude": ("claude-haiku-4-5-20251001", "medium"),
-        "openai": ("gpt-5.6-luna", "medium"),
+        "claude": ("claude-haiku-5-5", "medium"),
+        "openai": ("gpt-6-luna", "medium"),
     },
 }
 

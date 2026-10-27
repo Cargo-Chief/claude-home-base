@@ -101,7 +101,7 @@ class AuthorityPolicyTest(unittest.TestCase):
 
 
 class RoomPolicyTest(unittest.TestCase):
-    models = ["claude-opus-4-8[1m]", "claude-sonnet-5"]
+    models = ["claude-opus-4-8[1m]", "claude-sonnet-5-5"]
 
     def config(self, channel, **extra):
         value = {"models": self.models, "channels": {"C1": channel}}
@@ -118,7 +118,7 @@ class RoomPolicyTest(unittest.TestCase):
             "model": "claude-opus-4-8[1m]",
             "effort": "high",
             "fallback": {
-                "backend": "codex", "model": "gpt-5.6-sol", "effort": "high",
+                "backend": "codex", "model": "gpt-6-sol", "effort": "high",
             },
         }
         value.update(overrides)
@@ -164,7 +164,7 @@ class RoomPolicyTest(unittest.TestCase):
     def test_dm_override_is_resolved_for_current_sender(self):
         config = {
             "models": self.models,
-            "channels": {"D1": self.entry(model="claude-sonnet-5")},
+            "channels": {"D1": self.entry(model="claude-sonnet-5-5")},
             "dm_users": {"U1": {"model": "claude-opus-4-8[1m]"}},
         }
         self.assertEqual(resolve_room_policy(config, "D1", "U1").model, "claude-opus-4-8[1m]")
@@ -599,7 +599,7 @@ class PreflightTest(unittest.TestCase):
             root=self.root, permission_mode="auto", overlay=self.overlay,
             escalation_channel="D1", backend="claude", model="claude-opus-4-8[1m]",
             effort="high", role="eng", fallback_backend="codex",
-            fallback_model="gpt-5.6-sol", fallback_effort="high",
+            fallback_model="gpt-6-sol", fallback_effort="high",
         )
 
     def tearDown(self):
@@ -785,7 +785,7 @@ class PreflightTest(unittest.TestCase):
         command = build_codex_command(self.policy, cwd=Path("/workspace/work/thread"))
         self.assertEqual("codex", command[0])
         self.assertEqual("cargo-chief", command[command.index("--profile") + 1])
-        self.assertEqual("gpt-5.6-sol", command[command.index("--model") + 1])
+        self.assertEqual("gpt-6-sol", command[command.index("--model") + 1])
         self.assertIn('model_reasoning_effort="high"', command)
         self.assertIn("features.multi_agent=false", command)
         self.assertIn("/workspace/work/thread", command)

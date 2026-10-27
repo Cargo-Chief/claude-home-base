@@ -18,7 +18,7 @@ class DelegationTrackerTest(unittest.TestCase):
             "type": "assistant",
             "parent_tool_use_id": "tool-1",
             "message": {
-                "model": "claude-haiku-4-5-20251001",
+                "model": "claude-haiku-5-5",
                 "content": [{"type": "text", "text": "sensitive child return"}],
             },
         })
@@ -41,7 +41,7 @@ class DelegationTrackerTest(unittest.TestCase):
         self.assertEqual(1, len(records))
         record = records[0]
         self.assertEqual("cargo-chief-explore", record.agent)
-        self.assertEqual("claude-haiku-4-5-20251001", record.expected_model)
+        self.assertEqual("claude-haiku-5-5", record.expected_model)
         self.assertEqual("medium", record.effort)
         self.assertEqual(1, record.owner_verification_tools)
         audit = format_delegation_audit(
@@ -104,7 +104,7 @@ class DelegationTrackerTest(unittest.TestCase):
 
         tracker.observe({
             "type": "assistant", "parent_tool_use_id": "tool-bg",
-            "message": {"model": "claude-sonnet-5", "content": []},
+            "message": {"model": "claude-sonnet-5-5", "content": []},
         })
         tracker.observe({
             "type": "system", "subtype": "task_notification",
@@ -121,7 +121,7 @@ class DelegationTrackerTest(unittest.TestCase):
         records = tracker.finish_turn()
         self.assertEqual(1, len(records))
         self.assertEqual("completed", records[0].status)
-        self.assertEqual("claude-sonnet-5", records[0].served_model)
+        self.assertEqual("claude-sonnet-5-5", records[0].served_model)
         self.assertEqual(1, records[0].owner_verification_tools)
         self.assertEqual({}, tracker.records)
 

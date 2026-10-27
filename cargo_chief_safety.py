@@ -28,7 +28,7 @@ ALLOWED_PERMISSION_MODES = {"auto"}
 ALLOWED_BACKENDS = {"claude"}
 ALLOWED_FALLBACK_BACKENDS = {"codex"}
 ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
-ALLOWED_CODEX_MODELS = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+ALLOWED_CODEX_MODELS = {"gpt-6-sol", "gpt-5.6-terra", "gpt-6-luna"}
 
 # Subagents do not receive the owner's appended system prompt, so the authority rules travel here.
 DELEGATE_BOUNDARY = (
@@ -46,7 +46,7 @@ APPROVED_DELEGATES = {
             "the owner can independently verify. Report unexpected state; do not improvise scope. "
             + DELEGATE_BOUNDARY
         ),
-        "model": "claude-opus-5[1m]",
+        "model": "claude-opus-5-5",
         "effort": "medium",
     },
     "cargo-chief-mechanical": {
@@ -56,7 +56,7 @@ APPROVED_DELEGATES = {
             "boundaries and return only the requested evidence. Report; do not improvise. "
             + DELEGATE_BOUNDARY
         ),
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-5-5",
         "effort": "high",
     },
     "cargo-chief-explore": {
@@ -67,7 +67,7 @@ APPROVED_DELEGATES = {
             + DELEGATE_BOUNDARY
         ),
         "tools": ["Read", "Grep", "Glob"],
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-5-5",
         "effort": "medium",
     },
 }
@@ -1130,7 +1130,7 @@ def build_codex_prompt(
             owner_rule=(
                 "Delegate only through the governed launcher described below; raw Codex collaboration "
                 "is disabled. Keep decisions, production-touching work, credentials, and final "
-                "verification in this owning gpt-5.6-sol/high thread. Verify every load-bearing delegate "
+                "verification in this owning gpt-6-sol/high thread. Verify every load-bearing delegate "
                 "return before acting on it."
             ),
         ),
