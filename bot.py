@@ -52,6 +52,7 @@ from cargo_chief_safety import (
     build_claude_command,
     build_codex_command,
     build_codex_prompt,
+    channel_message_action,
     claude_owner_env,
     cleanup_thread_workspaces,
     consume_bundle_claim,
@@ -60,6 +61,7 @@ from cargo_chief_safety import (
     format_audit_metadata,
     preflight_room,
     resolve_room_policy,
+    room_channel_ids,
     prepare_thread_workspace,
     private_escalation_status,
     resolve_thread_bundle,
@@ -2846,19 +2848,21 @@ def handle_message(event, say):
     if subtype and subtype != "file_share":
         return
 
-    # Skip @mentions in channels — those are handled by handle_mention() via
-    # the app_mention event.  Without this guard, Slack fires BOTH a "message"
-    # event and an "app_mention" event for the same message, causing duplicate
-    # responses.
-    if BOT_USER_ID:
-        text = event.get("text", "")
-        if event.get("channel_type") != "im" and f"<@{BOT_USER_ID}>" in text:
-            return
-
-    user_id = event.get("user", "")
-    if not is_authorized(user_id):
+    # Channel @mentions arrive again as app_mention; unconfigured channels stay silent.
+    action = channel_message_action(
+        channel_id=event.get("channel", ""),
+        channel_type=event.get("channel_type", ""),
+        text=event.get("text", ""),
+        bot_user_id=BOT_USER_ID,
+        configured_channels=room_channel_ids(_load_model_config()),
+        sender_authorized=is_authorized(event.get("user", "")),
+    )
+    if action == "ignore":
+        return
+    if action != "process":
         log_unauthorized(event)
-        say(text="I only respond to authorized users.", thread_ts=event.get("ts"))
+        if action == "refuse":
+            say(text="I only respond to authorized users.", thread_ts=event.get("ts"))
         return
 
     # In-thread Esc: bare "stop" while a turn is running interrupts it
