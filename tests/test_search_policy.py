@@ -1,8 +1,11 @@
+import fcntl
 import importlib.util
+import os
 import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -289,7 +292,7 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
 
     def test_main_releases_embedding_model_after_command_failure(self):
         search._model = object()
-        with mock.patch.object(search, "load_config", return_value={}), \
+        with mock.patch.object(search, "load_config", return_value=self.cfg), \
              mock.patch.object(search, "index_all", side_effect=RuntimeError("index failed")), \
              mock.patch.object(search.gc, "collect") as collect:
             with self.assertRaisesRegex(RuntimeError, "index failed"):
@@ -297,6 +300,55 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
         self.assertIsNone(search._model)
         collect.assert_called_once_with()
 
+
+    def _hold_lock(self):
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        fd = os.open(f"{self.cfg['database']}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def test_index_waits_out_a_concurrent_run_then_gives_up(self):
+        fd = self._hold_lock()
+        try:
+            with mock.patch.object(search, "load_config", return_value=self.cfg), \
+                 mock.patch.object(search, "index_all") as index_all, \
+                 mock.patch.dict(os.environ, {search.INDEX_LOCK_TIMEOUT_ENV: "0"}):
+                for command in (["index"], ["rebuild"], ["purge"]):
+                    with self.subTest(command=command):
+                        with self.assertRaisesRegex(RuntimeError, "another index run"):
+                            search.main(command)
+                index_all.assert_not_called()
+        finally:
+            os.close(fd)
+
+    def test_index_runs_once_the_other_run_releases(self):
+        fd = self._hold_lock()
+        threading.Timer(0.5, os.close, args=(fd,)).start()
+        with mock.patch.object(search, "load_config", return_value=self.cfg), \
+             mock.patch.object(search, "index_all") as index_all, \
+             mock.patch.dict(os.environ, {search.INDEX_LOCK_TIMEOUT_ENV: "10"}):
+            search.main(["index"])
+        index_all.assert_called_once_with(self.cfg, force=False)
+
+    def test_read_commands_do_not_wait_for_the_index_lock(self):
+        fd = self._hold_lock()
+        try:
+            with mock.patch.object(search, "load_config", return_value=self.cfg), \
+                 mock.patch.object(search, "show_status") as show_status, \
+                 mock.patch.dict(os.environ, {search.INDEX_LOCK_TIMEOUT_ENV: "0"}):
+                search.main(["status"])
+            show_status.assert_called_once()
+        finally:
+            os.close(fd)
+
+    def test_index_lock_refuses_a_symlinked_lock_file(self):
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        target = self.base / "elsewhere"
+        target.write_text("")
+        os.symlink(target, f"{self.cfg['database']}.lock")
+        with self.assertRaises(OSError):
+            with search.index_lock(self.cfg):
+                pass
 
 if __name__ == "__main__":
     unittest.main()

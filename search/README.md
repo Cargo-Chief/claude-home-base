@@ -100,6 +100,10 @@ their chunks, deleted or newly excluded files are removed, and removed source de
 purged. Use `rebuild` for a clean regeneration and `purge` to delete the database and its SQLite
 sidecars. `status --json` exposes counts and paths without indexed content.
 
+`index`, `rebuild` and `purge` hold an exclusive lock (`<database>.lock`), so a second run waits for
+the first instead of failing with "database is locked"; a search that triggers a refresh waits the
+same way. `CARGO_CHIEF_INDEX_LOCK_TIMEOUT` (seconds, default 1800) bounds the wait.
+
 Install the dedicated environment once, then use the wrapper. It pins the index, model, and cache
 under a private per-user state directory and supplies the canonical docs-only configuration:
 

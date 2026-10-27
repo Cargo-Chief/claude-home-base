@@ -10,6 +10,8 @@ Usage:
 """
 
 import argparse
+import contextlib
+import fcntl
 import fnmatch
 import gc
 import hashlib
@@ -183,7 +185,7 @@ def get_db(cfg):
     if not os.path.exists(db_path):
         fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
-    db = sqlite3.connect(db_path)
+    db = sqlite3.connect(db_path, timeout=30)
     os.chmod(db_path, 0o600)
     db.enable_load_extension(True)
     sqlite_vec.load(db)
@@ -910,6 +912,36 @@ def show_status(cfg, as_json=False):
         print(f"  {source:20s} {values['chunks']:5d} chunks from {values['files']} files")
 
 
+INDEX_LOCK_TIMEOUT_ENV = "CARGO_CHIEF_INDEX_LOCK_TIMEOUT"
+WRITE_COMMANDS = ("index", "rebuild", "purge")
+
+
+@contextlib.contextmanager
+def index_lock(cfg):
+    """Hold the database's writer lock, waiting for a concurrent index run to finish first."""
+    lock_path = Path(f"{cfg['database']}.lock")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    timeout = float(os.environ.get(INDEX_LOCK_TIMEOUT_ENV, "1800"))
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"another index run still holds {lock_path} after {timeout:.0f}s")
+                if not waiting:
+                    print("Waiting for another index run to finish...", file=sys.stderr)
+                    waiting = True
+                time.sleep(1)
+        yield
+    finally:
+        os.close(fd)
+
+
 def purge_index(cfg):
     """Remove the configured database and SQLite sidecars without following symlinks."""
     database = Path(cfg["database"])
@@ -980,29 +1012,35 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
+    lock = index_lock(cfg) if args.command in WRITE_COMMANDS else contextlib.nullcontext()
     try:
-        if args.command == "index":
-            index_all(cfg, force=args.force)
-        elif args.command == "rebuild":
-            purge_index(cfg)
-            index_all(cfg, force=True)
-        elif args.command == "search":
-            results = search(cfg, args.query, source=args.source, limit=args.limit)
-            if args.json:
-                print(json.dumps(results, indent=2))
-            else:
-                format_results(results)
-        elif args.command == "status":
-            show_status(cfg, as_json=args.json)
-        elif args.command == "purge":
-            removed = purge_index(cfg)
-            print(json.dumps({"removed": removed}))
-        elif args.command == "doctor":
-            result = check_runtime()
-            result.update({"mode": cfg.get("mode", "standard"), "config": str(args.config)})
-            print(json.dumps(result, indent=2))
+        with lock:
+            _run(args, cfg)
     finally:
         release_model()
+
+
+def _run(args, cfg):
+    if args.command == "index":
+        index_all(cfg, force=args.force)
+    elif args.command == "rebuild":
+        purge_index(cfg)
+        index_all(cfg, force=True)
+    elif args.command == "search":
+        results = search(cfg, args.query, source=args.source, limit=args.limit)
+        if args.json:
+            print(json.dumps(results, indent=2))
+        else:
+            format_results(results)
+    elif args.command == "status":
+        show_status(cfg, as_json=args.json)
+    elif args.command == "purge":
+        removed = purge_index(cfg)
+        print(json.dumps({"removed": removed}))
+    elif args.command == "doctor":
+        result = check_runtime()
+        result.update({"mode": cfg.get("mode", "standard"), "config": str(args.config)})
+        print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
