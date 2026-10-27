@@ -686,6 +686,31 @@ def load_model_config(path: Path) -> dict:
     return value
 
 
+def channel_message_action(
+    *,
+    channel_id: str,
+    channel_type: str,
+    text: str,
+    bot_user_id: str,
+    configured_channels: Mapping,
+    sender_authorized: bool,
+) -> str:
+    """Decide a plain `message` event: "process", "refuse" (log and reply), "log", or "ignore".
+
+    Outside DMs the bot acts only in its configured rooms, and never answers a sender it won't
+    serve, so a broad event subscription can't make it talk over people in shared channels.
+    Mentions are left to the app_mention handler.
+    """
+    direct = channel_type in ("im", "mpim")
+    if channel_type != "im" and bot_user_id and f"<@{bot_user_id}>" in text:
+        return "ignore"
+    if not direct and channel_id not in configured_channels:
+        return "ignore"
+    if sender_authorized:
+        return "process"
+    return "refuse" if direct else "log"
+
+
 def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPolicy:
     entry = dict(config.get("channels", {}).get(channel_id, {}))
     if channel_id.startswith("D"):

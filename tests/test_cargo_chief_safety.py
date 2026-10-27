@@ -23,6 +23,7 @@ from cargo_chief_safety import (
     resolve_thread_bundle,
     thread_workspace_key,
     build_authority_envelope,
+    channel_message_action,
     LAUNCHER_ENV_KEYS,
     SLACK_REPORTING_PROMPT,
     auto_memory_directory,
@@ -98,6 +99,37 @@ class AuthorityPolicyTest(unittest.TestCase):
                 permission_mode="auto",
                 message="claim",
             )
+
+
+class ChannelMessageActionTest(unittest.TestCase):
+    def action(self, channel_type, *, channel="C1", text="hello", authorized=True):
+        return channel_message_action(
+            channel_id=channel,
+            channel_type=channel_type,
+            text=text,
+            bot_user_id="UBOT",
+            configured_channels={"C1": {}},
+            sender_authorized=authorized,
+        )
+
+    def test_unconfigured_channel_stays_silent_for_everyone(self):
+        self.assertEqual("ignore", self.action("channel", channel="CSHARED"))
+        self.assertEqual("ignore", self.action("channel", channel="CSHARED", authorized=False))
+
+    def test_configured_room_serves_authorized_sender(self):
+        self.assertEqual("process", self.action("channel"))
+        self.assertEqual("process", self.action("group"))
+
+    def test_configured_room_logs_without_replying_to_others(self):
+        self.assertEqual("log", self.action("channel", authorized=False))
+
+    def test_channel_mention_is_left_to_app_mention(self):
+        self.assertEqual("ignore", self.action("channel", text="<@UBOT> review"))
+        self.assertEqual("ignore", self.action("mpim", channel="G9", text="<@UBOT> hi"))
+
+    def test_direct_message_refuses_unauthorized_sender_aloud(self):
+        self.assertEqual("process", self.action("im", channel="D9", text="<@UBOT> hi"))
+        self.assertEqual("refuse", self.action("im", channel="D9", authorized=False))
 
 
 class RoomPolicyTest(unittest.TestCase):
