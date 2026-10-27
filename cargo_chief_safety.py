@@ -17,7 +17,7 @@ import shlex
 import shutil
 import subprocess
 import time
-from typing import Mapping
+from typing import Container, Mapping
 
 
 GENERATED_MARKER = (
@@ -686,13 +686,31 @@ def load_model_config(path: Path) -> dict:
     return value
 
 
+def room_channel_ids(config: object) -> set[str]:
+    """Channels served without a mention: configured rooms and every room's escalation channel."""
+    if not isinstance(config, Mapping):
+        return set()
+    ids: set[str] = set()
+    for section in ("channels", "dm_users"):
+        entries = config.get(section)
+        if not isinstance(entries, Mapping):
+            continue
+        if section == "channels":
+            ids.update(str(key) for key in entries)
+        for entry in entries.values():
+            escalation = entry.get("private_escalation_channel") if isinstance(entry, Mapping) else None
+            if isinstance(escalation, str) and escalation:
+                ids.add(escalation)
+    return ids
+
+
 def channel_message_action(
     *,
     channel_id: str,
     channel_type: str,
     text: str,
     bot_user_id: str,
-    configured_channels: Mapping,
+    configured_channels: Container[str],
     sender_authorized: bool,
 ) -> str:
     """Decide a plain `message` event: "process", "refuse" (log and reply), "log", or "ignore".

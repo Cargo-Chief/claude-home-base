@@ -61,6 +61,7 @@ from cargo_chief_safety import (
     format_audit_metadata,
     preflight_room,
     resolve_room_policy,
+    room_channel_ids,
     prepare_thread_workspace,
     private_escalation_status,
     resolve_thread_bundle,
@@ -2853,7 +2854,7 @@ def handle_message(event, say):
         channel_type=event.get("channel_type", ""),
         text=event.get("text", ""),
         bot_user_id=BOT_USER_ID,
-        configured_channels=_load_model_config().get("channels", {}),
+        configured_channels=room_channel_ids(_load_model_config()),
         sender_authorized=is_authorized(event.get("user", "")),
     )
     if action == "ignore":
