@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -158,7 +159,7 @@ class RoomChannelIdsTest(unittest.TestCase):
 
 
 class RoomPolicyTest(unittest.TestCase):
-    models = ["claude-opus-4-8[1m]", "claude-sonnet-5"]
+    models = ["claude-opus-4-8[1m]", "claude-sonnet-5-5"]
 
     def config(self, channel, **extra):
         value = {"models": self.models, "channels": {"C1": channel}}
@@ -175,7 +176,7 @@ class RoomPolicyTest(unittest.TestCase):
             "model": "claude-opus-4-8[1m]",
             "effort": "high",
             "fallback": {
-                "backend": "codex", "model": "gpt-5.6-sol", "effort": "high",
+                "backend": "codex", "model": "gpt-6-sol", "effort": "high",
             },
         }
         value.update(overrides)
@@ -221,7 +222,7 @@ class RoomPolicyTest(unittest.TestCase):
     def test_dm_override_is_resolved_for_current_sender(self):
         config = {
             "models": self.models,
-            "channels": {"D1": self.entry(model="claude-sonnet-5")},
+            "channels": {"D1": self.entry(model="claude-sonnet-5-5")},
             "dm_users": {"U1": {"model": "claude-opus-4-8[1m]"}},
         }
         self.assertEqual(resolve_room_policy(config, "D1", "U1").model, "claude-opus-4-8[1m]")
@@ -656,7 +657,7 @@ class PreflightTest(unittest.TestCase):
             root=self.root, permission_mode="auto", overlay=self.overlay,
             escalation_channel="D1", backend="claude", model="claude-opus-4-8[1m]",
             effort="high", role="eng", fallback_backend="codex",
-            fallback_model="gpt-5.6-sol", fallback_effort="high",
+            fallback_model="gpt-6-sol", fallback_effort="high",
         )
 
     def tearDown(self):
@@ -770,6 +771,24 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("wall-clock limit of 1200 seconds", codex_prompt)
         self.assertIn("/workspace/implementation-claim.txt", codex_prompt)
 
+    def test_codex_owner_rule_names_the_rooms_configured_fallback(self):
+        policy = dataclasses.replace(self.policy, fallback_model="gpt-6-luna", fallback_effort="medium")
+        prompt = build_codex_prompt(
+            policy,
+            inbound_prompt="authority envelope",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/escalation.txt"),
+            bundle_claim_file=Path("/workspace/bundle.txt"),
+            parking_claim_file=Path("/workspace/parking.txt"),
+            delegation_request_file=Path("/workspace/delegation-request.json"),
+            implementation_claim_file=Path("/workspace/implementation-claim.txt"),
+            delegate_timeout=1_200,
+            identity_prompt="agent identity",
+        )
+        self.assertIn("in this owning gpt-6-luna/medium thread", prompt)
+        self.assertNotIn("gpt-6-sol/high", prompt)
+
     def test_claude_session_gets_root_permissions_and_one_memory_directory(self):
         settings_dir = self.root / ".claude"
         settings_dir.mkdir(exist_ok=True)
@@ -842,7 +861,7 @@ class PreflightTest(unittest.TestCase):
         command = build_codex_command(self.policy, cwd=Path("/workspace/work/thread"))
         self.assertEqual("codex", command[0])
         self.assertEqual("cargo-chief", command[command.index("--profile") + 1])
-        self.assertEqual("gpt-5.6-sol", command[command.index("--model") + 1])
+        self.assertEqual("gpt-6-sol", command[command.index("--model") + 1])
         self.assertIn('model_reasoning_effort="high"', command)
         self.assertIn("features.multi_agent=false", command)
         self.assertIn("/workspace/work/thread", command)

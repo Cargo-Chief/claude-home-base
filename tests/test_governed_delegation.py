@@ -441,12 +441,12 @@ class GovernedDelegationTest(unittest.TestCase):
             self.assertEqual(status, json.loads(marker.read_text())["status"])
 
     def test_exact_provider_routes(self):
-        self.assertEqual(("claude-opus-5[1m]", "medium"), ROUTES["implementation"]["claude"])
-        self.assertEqual(("gpt-5.6-sol", "medium"), ROUTES["implementation"]["openai"])
-        self.assertEqual(("claude-sonnet-5", "high"), ROUTES["mechanical"]["claude"])
+        self.assertEqual(("claude-opus-5-5", "medium"), ROUTES["implementation"]["claude"])
+        self.assertEqual(("gpt-6-sol", "medium"), ROUTES["implementation"]["openai"])
+        self.assertEqual(("claude-sonnet-5-5", "high"), ROUTES["mechanical"]["claude"])
         self.assertEqual(("gpt-5.6-terra", "high"), ROUTES["mechanical"]["openai"])
-        self.assertEqual(("claude-haiku-4-5-20251001", "medium"), ROUTES["explore"]["claude"])
-        self.assertEqual(("gpt-5.6-luna", "medium"), ROUTES["explore"]["openai"])
+        self.assertEqual(("claude-haiku-5-5", "medium"), ROUTES["explore"]["claude"])
+        self.assertEqual(("gpt-6-luna", "medium"), ROUTES["explore"]["openai"])
 
     def test_delegate_timeout_is_independent_and_bounded(self):
         self.assertEqual(1_800, delegate_timeout_from_env({}))
@@ -474,7 +474,7 @@ class GovernedDelegationTest(unittest.TestCase):
             "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
             "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
             "CARGO_CHIEF_OWNER_PROVIDER": "openai",
-            "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
+            "CARGO_CHIEF_OWNER_MODEL": "gpt-6-sol",
             "CARGO_CHIEF_OWNER_EFFORT": "high",
             "CARGO_CHIEF_DELEGATE_TIMEOUT": "invalid",
             "CLAUDE_THREAD_TS": "T1",
@@ -975,7 +975,7 @@ class GovernedDelegationTest(unittest.TestCase):
             "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
             "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
             "CARGO_CHIEF_OWNER_PROVIDER": "openai",
-            "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
+            "CARGO_CHIEF_OWNER_MODEL": "gpt-6-sol",
             "CARGO_CHIEF_OWNER_EFFORT": "high",
             "CARGO_CHIEF_DELEGATE_TIMEOUT": "1200",
             "CLAUDE_THREAD_TS": "T1",
@@ -988,7 +988,7 @@ class GovernedDelegationTest(unittest.TestCase):
         self.assertEqual("delegate evidence\n", output.getvalue())
         self.assertEqual(54, budget_status(budget)["used"])
         audit = (self.work / "audit.log").read_text()
-        self.assertIn("MODEL:gpt-5.6-sol", audit)
+        self.assertIn("MODEL:gpt-6-sol", audit)
         self.assertIn("BUDGET_UNIT:generation_tokens_v2", audit)
         self.assertIn("BUDGET_TOKENS:14", audit)
         self.assertIn("PROVIDER_TOKENS:35", audit)
@@ -1034,7 +1034,7 @@ class GovernedDelegationTest(unittest.TestCase):
             "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
             "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
             "CARGO_CHIEF_OWNER_PROVIDER": "openai",
-            "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
+            "CARGO_CHIEF_OWNER_MODEL": "gpt-6-sol",
             "CARGO_CHIEF_OWNER_EFFORT": "high",
             "CLAUDE_THREAD_TS": "T1", "CLAUDE_CHANNEL_ID": "C1",
             "CARGO_CHIEF_CURRENT_USER": "U1",
@@ -1086,7 +1086,7 @@ class GovernedDelegationTest(unittest.TestCase):
     def _unverifiable_marker(self, unit):
         marker = self.work / "verification.json"
         metadata = {
-            "status": "pending", "tier": "bounded", "model": "gpt-5.6-sol",
+            "status": "pending", "tier": "bounded", "model": "gpt-6-sol",
             "tokens": 40_000, "provider_tokens": 100_000, "raw_tokens": 1_125_414,
             "generation_factor": CODEX_GENERATION_FACTOR, "request_id": "a" * 64,
         }
@@ -1247,7 +1247,7 @@ class GovernedDelegationTest(unittest.TestCase):
             "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
             "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
             "CARGO_CHIEF_OWNER_PROVIDER": "openai",
-            "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
+            "CARGO_CHIEF_OWNER_MODEL": "gpt-6-sol",
             "CARGO_CHIEF_OWNER_EFFORT": "high",
             "CLAUDE_THREAD_TS": "T1", "CLAUDE_CHANNEL_ID": "C1",
             "CARGO_CHIEF_CURRENT_USER": "U1",
@@ -1288,7 +1288,7 @@ class GovernedDelegationTest(unittest.TestCase):
             "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(self.work / "verification.json"),
             "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
             "CARGO_CHIEF_OWNER_PROVIDER": "openai",
-            "CARGO_CHIEF_OWNER_MODEL": "gpt-5.6-sol",
+            "CARGO_CHIEF_OWNER_MODEL": "gpt-6-sol",
             "CARGO_CHIEF_OWNER_EFFORT": "high",
             "CLAUDE_THREAD_TS": "T1", "CLAUDE_CHANNEL_ID": "C1",
             "CARGO_CHIEF_CURRENT_USER": "U1",
@@ -1315,7 +1315,7 @@ class GovernedDelegationTest(unittest.TestCase):
             "CARGO_CHIEF_AUDIT_LOG": str(self.work / "audit.log"),
             "CARGO_CHIEF_OWNER_PROVIDER": provider,
             "CARGO_CHIEF_OWNER_MODEL": (
-                "gpt-5.6-sol" if provider == "openai" else "claude-opus-5[1m]"
+                "gpt-6-sol" if provider == "openai" else "claude-opus-5-5"
             ),
             "CARGO_CHIEF_OWNER_EFFORT": "high",
             "CLAUDE_THREAD_TS": "T1", "CLAUDE_CHANNEL_ID": "C1",

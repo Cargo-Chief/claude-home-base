@@ -36,11 +36,11 @@ class OpenAIFallbackTest(unittest.TestCase):
         self.assertIsNone(model_notice_text("<synthetic>"))
 
     def test_model_notice_attributes_and_deduplicates_fallback(self):
-        self.assertEqual("model: gpt-5.6-sol", model_notice_text("gpt-5.6-sol"))
-        self.assertIsNone(model_notice_text("gpt-5.6-sol", "gpt-5.6-sol"))
+        self.assertEqual("model: gpt-6-sol", model_notice_text("gpt-6-sol"))
+        self.assertIsNone(model_notice_text("gpt-6-sol", "gpt-6-sol"))
         self.assertEqual(
-            "model changed: gpt-5.6-sol → gpt-5.6-terra",
-            model_notice_text("gpt-5.6-terra", "gpt-5.6-sol"),
+            "model changed: gpt-6-sol → gpt-5.6-terra",
+            model_notice_text("gpt-5.6-terra", "gpt-6-sol"),
         )
 
     def test_parser_keeps_only_session_text_and_usage(self):
