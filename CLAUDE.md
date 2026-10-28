@@ -37,5 +37,8 @@ preflight. Keep broadly useful transport improvements separable so they can be p
 - This repo uses `bot.py`, not `luoji_bot.py` (that's the cc-home-base variant)
 - The `CLAUDE.md.example` here is a template with placeholders — don't fill them in, they're for end users
 - Plugin changes need version bumps or the auto-updater won't pick them up
+- A `channels` entry with `"review_only": true` is mention-only and runs review turns for any member
+  or listed peer bot (`review_requests.py`); it needs a valid top-level `peer_review` block
+  (`self_github_login`, `peer_bot_user_ids`, `max_reviews_per_pr`). See README's safety gate
 
 Keep this CLAUDE.md up-to-date with the latest changes / decisions made in the project.

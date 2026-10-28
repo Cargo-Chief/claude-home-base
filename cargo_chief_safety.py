@@ -146,20 +146,29 @@ def build_authority_envelope(
     message: str,
     thread_context: str | None = None,
     forwarded_from: str | None = None,
+    review_requester: bool = False,
 ) -> str:
-    """Wrap untrusted Slack content in harness-authenticated sender metadata."""
-    if not authority.allows(sender_id):
+    """Wrap untrusted Slack content in harness-authenticated sender metadata.
+
+    A review requester in a review-only room never carries operator or approver authority.
+    """
+    if review_requester:
+        if not sender_id:
+            raise SafetyError("cannot build an authority envelope without a sender")
+        sender_authority = "review_requester"
+        named_approver = False
+    elif not authority.allows(sender_id):
         raise SafetyError("cannot build an authority envelope for an unauthorized sender")
-    sender_authority = (
-        "named_approver" if authority.can_approve(sender_id) else "authorized_operator"
-    )
+    else:
+        named_approver = authority.can_approve(sender_id)
+        sender_authority = "named_approver" if named_approver else "authorized_operator"
     payload = {
         "version": 1,
         "current_sender": {
             "slack_user_id": sender_id,
             "display_name": sender_name,
             "authority": sender_authority,
-            "named_approver": authority.can_approve(sender_id),
+            "named_approver": named_approver,
         },
         "room": {
             "slack_channel_id": channel_id,
@@ -189,6 +198,54 @@ class RoomPolicy:
     fallback_backend: str
     fallback_model: str
     fallback_effort: str
+    review_only: bool = False
+
+
+DEFAULT_MAX_REVIEWS_PER_PR = 3
+MAX_REVIEWS_PER_PR_BOUNDS = (1, 10)
+_GITHUB_LOGIN_RE = re.compile(r"(?:app/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?")
+_SLACK_USER_RE = re.compile(r"[UBW][A-Z0-9]+")
+
+
+@dataclass(frozen=True)
+class PeerReviewConfig:
+    self_github_login: str
+    peer_bot_user_ids: frozenset[str]
+    max_reviews_per_pr: int = DEFAULT_MAX_REVIEWS_PER_PR
+
+
+def peer_review_config(config: object) -> PeerReviewConfig:
+    """The validated top-level ``peer_review`` block; raises SafetyError when absent or malformed."""
+    raw = config.get("peer_review") if isinstance(config, Mapping) else None
+    if not isinstance(raw, Mapping):
+        raise SafetyError("peer_review must be an object")
+    login = raw.get("self_github_login")
+    if not isinstance(login, str) or not _GITHUB_LOGIN_RE.fullmatch(login):
+        raise SafetyError("peer_review.self_github_login must be a GitHub login")
+    peers = raw.get("peer_bot_user_ids", [])
+    if not isinstance(peers, list) or not all(
+        isinstance(peer, str) and _SLACK_USER_RE.fullmatch(peer) for peer in peers
+    ):
+        raise SafetyError("peer_review.peer_bot_user_ids must be a list of Slack user IDs")
+    cap = raw.get("max_reviews_per_pr", DEFAULT_MAX_REVIEWS_PER_PR)
+    low, high = MAX_REVIEWS_PER_PR_BOUNDS
+    if isinstance(cap, bool) or not isinstance(cap, int) or not low <= cap <= high:
+        raise SafetyError(f"peer_review.max_reviews_per_pr must be an integer from {low} to {high}")
+    return PeerReviewConfig(
+        self_github_login=login, peer_bot_user_ids=frozenset(peers), max_reviews_per_pr=cap,
+    )
+
+
+def _flags_review_only(entry: object) -> bool:
+    # Any value other than an explicit false counts, so a malformed flag fails closed.
+    return isinstance(entry, Mapping) and entry.get("review_only", False) is not False
+
+
+def is_review_only_room(config: object, channel_id: str) -> bool:
+    if not isinstance(config, Mapping):
+        return False
+    channels = config.get("channels")
+    return isinstance(channels, Mapping) and _flags_review_only(channels.get(channel_id))
 
 
 def _env_bool(env: Mapping[str, str], key: str, default: bool = False) -> bool:
@@ -687,7 +744,10 @@ def load_model_config(path: Path) -> dict:
 
 
 def room_channel_ids(config: object) -> set[str]:
-    """Channels served without a mention: configured rooms and every room's escalation channel."""
+    """Channels served without a mention: configured rooms and every room's escalation channel.
+
+    Review-only rooms act on mentions alone, so neither they nor their escalation channel appear.
+    """
     if not isinstance(config, Mapping):
         return set()
     ids: set[str] = set()
@@ -696,8 +756,10 @@ def room_channel_ids(config: object) -> set[str]:
         if not isinstance(entries, Mapping):
             continue
         if section == "channels":
-            ids.update(str(key) for key in entries)
+            ids.update(str(key) for key, entry in entries.items() if not _flags_review_only(entry))
         for entry in entries.values():
+            if _flags_review_only(entry):
+                continue
             escalation = entry.get("private_escalation_channel") if isinstance(entry, Mapping) else None
             if isinstance(escalation, str) and escalation:
                 ids.add(escalation)
@@ -753,6 +815,14 @@ def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPoli
     model = str(entry["model"])
     role = str(entry.get("role", "eng"))
     fallback = entry.get("fallback")
+    review_only = entry.get("review_only", False)
+    if not isinstance(review_only, bool):
+        raise SafetyError(f"room {channel_id!r} review_only must be true or false")
+    if review_only:
+        try:
+            peer_review_config(config)
+        except SafetyError as exc:
+            raise SafetyError(f"review-only room {channel_id!r} refused: {exc}") from exc
 
     if permission_mode not in ALLOWED_PERMISSION_MODES:
         raise SafetyError(f"room {channel_id!r} permission_mode must be 'auto'")
@@ -796,6 +866,7 @@ def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPoli
         fallback_backend=fallback_backend,
         fallback_model=fallback_model,
         fallback_effort=fallback_effort,
+        review_only=review_only,
     )
 
 
@@ -965,6 +1036,32 @@ def claude_owner_env(base: Mapping[str, str]) -> dict[str, str]:
     return {key: value for key, value in base.items() if key not in LAUNCHER_ENV_KEYS}
 
 
+REVIEW_TOKEN_PERMISSIONS = {"contents": "read", "pull_requests": "write"}
+REVIEW_STRIPPED_ENV_KEYS = ("CC_AWS_PROFILE",)
+REVIEW_ONLY_DENY_RULES = (
+    "Bash(*git push*)",
+    "Bash(*gh pr merge*)",
+    "Bash(*gh pr ready*)",
+    "Bash(*deploy*.sh*)",
+    "Bash(aws *)",
+    "Bash(* aws *)",
+    "Bash(*jira_service.py*)",
+)
+
+
+def review_turn_env(base: Mapping[str, str]) -> dict[str, str]:
+    """A review-only environment: a downscoped GitHub token request and no AWS identity."""
+    result = {
+        key: value for key, value in base.items()
+        if not key.startswith("AWS_") and key not in REVIEW_STRIPPED_ENV_KEYS
+    }
+    result["CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS"] = json.dumps(
+        REVIEW_TOKEN_PERMISSIONS, separators=(",", ":")
+    )
+    result["CARGO_CHIEF_REVIEW_ONLY"] = "1"
+    return result
+
+
 def auto_memory_directory(root: Path, home: Path | None = None) -> Path:
     """The auto-memory directory an interactive session launched at ``root`` uses."""
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(root))
@@ -990,7 +1087,7 @@ def read_root_permissions(root: Path) -> dict:
     }
 
 
-def owner_settings(root: Path, home: Path | None = None) -> dict:
+def owner_settings(root: Path, home: Path | None = None, *, review_only: bool = False) -> dict:
     """Settings a thread session would get if it were launched at the workspace root.
 
     Shared project settings load only from the launch directory, and auto memory is keyed by
@@ -998,12 +1095,15 @@ def owner_settings(root: Path, home: Path | None = None) -> dict:
     permission rules and start every thread with an empty memory. Only the permission rule
     lists are forwarded: other keys would apply at --settings precedence, above what project
     scope honours. An unreadable file drops the rules (preflight warns) rather than the spawn.
+    A review-only room always adds its deny rules.
     """
     settings: dict = {"autoMemoryDirectory": str(auto_memory_directory(root, home))}
     try:
         permissions = read_root_permissions(root)
     except SafetyError:
         permissions = {}
+    if review_only:
+        permissions["deny"] = [*permissions.get("deny", []), *REVIEW_ONLY_DENY_RULES]
     if permissions:
         settings["permissions"] = permissions
     return settings
@@ -1051,10 +1151,14 @@ def build_claude_command(
         "--model", policy.model,
         "--permission-mode", policy.permission_mode,
         "--agents", json.dumps(APPROVED_DELEGATES, separators=(",", ":")),
-        "--settings", json.dumps(owner_settings(policy.root, home), separators=(",", ":")),
+        "--settings", json.dumps(
+            owner_settings(policy.root, home, review_only=policy.review_only),
+            separators=(",", ":"),
+        ),
         "--append-system-prompt", appended,
     ]
-    if session_id:
+    # Every review-only request starts a fresh session.
+    if session_id and not policy.review_only:
         command.extend(["--resume", session_id])
     return command
 

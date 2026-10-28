@@ -59,8 +59,10 @@ from cargo_chief_safety import (
     consume_parking_claim,
     find_workspace_root,
     format_audit_metadata,
+    is_review_only_room,
     preflight_room,
     resolve_room_policy,
+    review_turn_env,
     room_channel_ids,
     prepare_thread_workspace,
     private_escalation_status,
@@ -100,6 +102,15 @@ from provider_control import (
     use_openai_provider,
 )
 from reply_routing import ReplyRouteStore
+from review_requests import (
+    BUSY_REPLY,
+    PROVIDER_REPLY,
+    ReviewCapStore,
+    ReviewRequestHandler,
+    ThreadClaims,
+    build_review_task,
+    lookup_pr,
+)
 from session_lifecycle import (
     PendingTools,
     TurnAdmission,
@@ -816,6 +827,8 @@ def _spawn_claude_process(
     battery_context = _get_trust_battery_context()
     _model, _effort, model_prompt = resolve_model_settings(channel, user_id)
     policy = resolve_room_policy(_load_model_config(), channel, user_id)
+    if policy.review_only:
+        session_id = None
     for warning in preflight_room(policy):
         logger.warning(f"Cargo Chief preflight: {warning}")
     workspace = prepare_thread_workspace(
@@ -849,6 +862,8 @@ def _spawn_claude_process(
     )
 
     proc_env = claude_owner_env(os.environ)
+    if policy.review_only:
+        proc_env = review_turn_env(proc_env)
     if thread_ts:
         proc_env["CLAUDE_THREAD_TS"] = thread_ts
     if channel:
@@ -867,7 +882,7 @@ def _spawn_claude_process(
     proc_env["CARGO_CHIEF_OWNER_MODEL"] = policy.model
     proc_env["CARGO_CHIEF_OWNER_EFFORT"] = policy.effort
     proc_env["CARGO_CHIEF_CURRENT_USER"] = user_id
-    bundle = resolve_thread_bundle(workspace)
+    bundle = None if policy.review_only else resolve_thread_bundle(workspace)
     if bundle:
         proc_env["CARGO_CHIEF_THREAD_BUNDLE_DIR"] = str(bundle)
 
@@ -1282,13 +1297,21 @@ def _reader_loop(session: LiveSession) -> None:
             session.reporter.finish(state="stopped")
 
 
-def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "") -> LiveSession:
-    """Get an existing live session or create a new one for a thread."""
+def _get_or_create_live_session(
+    thread_ts: str, channel: str, user_id: str = "", fresh: bool = False
+) -> LiveSession:
+    """Get an existing live session or create a new one; ``fresh`` replaces an idle one unresumed."""
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
         if session and session.proc.poll() is None and not session.stop_done:
-            session.last_activity = time.time()
-            return session
+            if not fresh:
+                session.last_activity = time.time()
+                return session
+            _live_sessions.pop(thread_ts, None)
+            try:
+                close_process_tree(session.proc, session.proc.stdin.close, wait=10)
+            except Exception as e:
+                logger.warning(f"Could not stop replaced pid={session.proc.pid}: {e}")
 
         # Evict oldest idle session if at capacity
         if len(_live_sessions) >= MAX_LIVE_SESSIONS:
@@ -1304,7 +1327,7 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
             except Exception as e:
                 logger.warning(f"Could not stop evicted pid={oldest.proc.pid}: {e}")
 
-        saved_session_id = _get_session(thread_ts)
+        saved_session_id = None if fresh else _get_session(thread_ts)
         proc, workspace = _spawn_claude_process(
             session_id=saved_session_id,
             user_id=user_id,
@@ -1325,6 +1348,18 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
 
         threading.Thread(target=_reader_loop, args=(session,), daemon=True).start()
         return session
+
+
+def _close_review_session(session: LiveSession) -> None:
+    """End a review turn's process, so the next request starts fresh and the slot frees."""
+    with _live_sessions_lock:
+        if _live_sessions.get(session.thread_ts) is session:
+            _live_sessions.pop(session.thread_ts, None)
+    if session.proc.poll() is None:
+        try:
+            close_process_tree(session.proc, session.proc.stdin.close, wait=10)
+        except Exception as e:
+            logger.warning(f"Could not stop review pid={session.proc.pid}: {e}")
 
 
 def _send_to_claude(session: LiveSession, text: str) -> None:
@@ -2168,7 +2203,7 @@ def _run_openai_fallback(
     return session_id
 
 
-def process_message_async(event: dict) -> None:
+def process_message_async(event: dict, review_pr: str | None = None) -> None:
     """Process a message in a background thread.
 
     Uses long-lived Claude processes with stream-json I/O and a profile-governed
@@ -2176,6 +2211,9 @@ def process_message_async(event: dict) -> None:
     already running for this thread, the message is piped to its stdin and
     queued automatically by the CLI. Otherwise a new process is spawned
     (resuming any prior session for the thread).
+
+    ``review_pr`` marks an admitted review request: the sender is a review requester, valid
+    only in a review-only room, and the turn is a fresh harness-built review of that PR.
     """
     user_id = event.get("user", "")
     text = event.get("text", "").strip()
@@ -2184,6 +2222,7 @@ def process_message_async(event: dict) -> None:
     msg_ts = event.get("ts")
     reaction_channel = channel
     reaction_msg_ts = msg_ts
+    review = review_pr is not None
 
     # Defense in depth: every ingress path (including forwarded replies and
     # mid-turn steering) must pass the current Slack sender, before downloads
@@ -2193,7 +2232,12 @@ def process_message_async(event: dict) -> None:
     except SafetyError:
         log_unauthorized(event)
         return
-    if not authority.allows(user_id):
+    if review:
+        # Review requesters are checked by the room's intake; the room itself is checked below.
+        if not user_id or user_id == BOT_USER_ID:
+            log_unauthorized(event)
+            return
+    elif not authority.allows(user_id):
         log_unauthorized(event)
         return
 
@@ -2201,35 +2245,37 @@ def process_message_async(event: dict) -> None:
     # current sender; execution policy belongs to the destination room.
     # Escalation routes are approver-only and terminal: unauthorized replies
     # do not consume them, while duplicate/stale replies never fall through
-    # into a new DM session.
-    route_result = _reply_routes.claim(
-        from_channel=channel,
-        from_thread=thread_ts,
-        user_id=user_id,
-        is_approver=authority.can_approve(user_id),
-    )
-    if route_result.status == "approver_required":
-        audit_logger.warning(
-            "ESCALATION_REPLY_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:approver_required",
-            user_id, channel, thread_ts,
-        )
-        slack_client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text="This private decision requires a named approver.",
-        )
-        return
-    if route_result.status in {"consumed", "expired", "invalid"}:
-        audit_logger.info(
-            "ESCALATION_REPLY_IGNORED | USER:%s | CHANNEL:%s | THREAD:%s | STATUS:%s",
-            user_id, channel, thread_ts, route_result.status,
-        )
-        slack_client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text="This private decision is already closed.",
-        )
-        return
-    forward = route_result.route if route_result.status == "routed" else None
+    # into a new DM session. A review turn never consumes or creates a route.
+    forward = None
     original_thread = None
+    if not review:
+        route_result = _reply_routes.claim(
+            from_channel=channel,
+            from_thread=thread_ts,
+            user_id=user_id,
+            is_approver=authority.can_approve(user_id),
+        )
+        if route_result.status == "approver_required":
+            audit_logger.warning(
+                "ESCALATION_REPLY_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:approver_required",
+                user_id, channel, thread_ts,
+            )
+            slack_client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text="This private decision requires a named approver.",
+            )
+            return
+        if route_result.status in {"consumed", "expired", "invalid"}:
+            audit_logger.info(
+                "ESCALATION_REPLY_IGNORED | USER:%s | CHANNEL:%s | THREAD:%s | STATUS:%s",
+                user_id, channel, thread_ts, route_result.status,
+            )
+            slack_client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text="This private decision is already closed.",
+            )
+            return
+        forward = route_result.route if route_result.status == "routed" else None
     if forward:
         original_thread = thread_ts
         thread_ts = forward["thread"]
@@ -2245,12 +2291,19 @@ def process_message_async(event: dict) -> None:
             text=f"I could not start this Cargo Chief room safely: {exc}",
         )
         return
+    if review != room_policy.review_only:
+        # Every turn in a review-only room is a review, and a review runs nowhere else.
+        log_unauthorized(event)
+        return
 
     use_openai = use_openai_provider(
         _get_provider_override(thread_ts),
         limit_paused=_limit_paused(),
         has_openai_session=_get_openai_session(thread_ts) is not None,
     )
+    if review and use_openai:
+        slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=PROVIDER_REPLY)
+        return
 
     # Replace user mentions with readable names
     text = re.sub(
@@ -2260,7 +2313,7 @@ def process_message_async(event: dict) -> None:
     ).strip()
 
     # Download attachments
-    attached_files = download_slack_files(event)
+    attached_files = [] if review else download_slack_files(event)
 
     if not text and not attached_files:
         return
@@ -2298,11 +2351,11 @@ def process_message_async(event: dict) -> None:
     # fetch the full thread history so Claude has context on what was said before.
     is_thread_reply = thread_ts != msg_ts
     thread_context = None
-    if not has_existing_session and not has_live_process and is_thread_reply:
+    if not review and not has_existing_session and not has_live_process and is_thread_reply:
         thread_context = _fetch_thread_context(channel, thread_ts, msg_ts)
 
     channel_type = event.get("channel_type", "")
-    if not _channel_allowed(channel, channel_type):
+    if not review and not _channel_allowed(channel, channel_type):
         logger.info(f"Ignoring message in non-allowed channel {channel} ({_get_channel_name(channel)})")
         return
 
@@ -2326,7 +2379,7 @@ def process_message_async(event: dict) -> None:
             show_reminder = True
 
     prefix = ""
-    if needs_relevance_prefix(
+    if not review and needs_relevance_prefix(
         event_type=event.get("type", ""),
         is_dm=is_dm,
         has_existing_session=has_existing_session,
@@ -2340,7 +2393,7 @@ def process_message_async(event: dict) -> None:
             reminder=show_reminder,
         )
 
-    text = prefix + build_authority_envelope(
+    envelope = build_authority_envelope(
         authority,
         sender_id=user_id,
         sender_name=sender_name,
@@ -2349,7 +2402,13 @@ def process_message_async(event: dict) -> None:
         message=text,
         thread_context=thread_context,
         forwarded_from=original_thread,
+        review_requester=review,
     )
+    text = f"{build_review_task(review_pr)}\n\n{envelope}" if review else prefix + envelope
+
+    if review and _review_turn_running(thread_ts):
+        slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=BUSY_REPLY)
+        return
 
     # Add eyes reaction as thinking indicator
     try:
@@ -2393,6 +2452,7 @@ def process_message_async(event: dict) -> None:
     start = time.time()
     audit_session_id = _get_openai_session(thread_ts) if use_openai else None
     turn_admitted = False
+    session = None
 
     try:
         if use_openai:
@@ -2420,13 +2480,17 @@ def process_message_async(event: dict) -> None:
                 session = None
             if session and session.proc.poll() is not None:
                 session = None
+            if review and session and session.turn_lock.locked():
+                # A review is never steered into a running process, and that process is not ours.
+                session = None
+                raise SafetyError(BUSY_REPLY)
             if not (session and session.turn_lock.locked()):
                 _turn_admission.acquire(
                     lambda: _post_queue_notice(channel, thread_ts)
                 )
                 turn_admitted = True
                 session = _get_or_create_live_session(
-                    thread_ts, channel, user_id=user_id
+                    thread_ts, channel, user_id=user_id, fresh=review
                 )
 
         # Real-time steering: a Claude turn is already running in this thread — don't
@@ -2511,7 +2575,11 @@ def process_message_async(event: dict) -> None:
                     return
 
                 audit_session_id = session.session_id
-                if fallback_requested:
+                if fallback_requested and review:
+                    # The Codex fallback carries none of the review-only controls.
+                    all_texts.append(PROVIDER_REPLY)
+                    post_response(channel, PROVIDER_REPLY, thread_ts=thread_ts)
+                elif fallback_requested:
                     fallback_context = _fetch_thread_context(channel, thread_ts, msg_ts)
                     fallback_prompt = text
                     if fallback_context:
@@ -2552,6 +2620,8 @@ def process_message_async(event: dict) -> None:
         )
         return
     finally:
+        if review and session is not None:
+            _close_review_session(session)
         if turn_admitted:
             _turn_admission.release()
 
@@ -2891,6 +2961,63 @@ def _maybe_provider_command(event: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Review requests in review-only rooms
+# ---------------------------------------------------------------------------
+
+
+def _review_turn_running(thread_ts: str) -> bool:
+    with _live_sessions_lock:
+        session = _live_sessions.get(thread_ts)
+    return bool(session and session.proc.poll() is None and session.turn_lock.locked())
+
+
+def _review_room_root(channel: str, user_id: str) -> Path:
+    policy = resolve_room_policy(_load_model_config(), channel, user_id)
+    if not policy.review_only:
+        raise SafetyError(f"room {channel!r} is not review-only")
+    return policy.root
+
+
+def _lookup_review_pr(pr_url: str, root: Path):
+    return lookup_pr(
+        pr_url, root=root, child_env=review_turn_env(claude_owner_env(os.environ)),
+        python=sys.executable,
+    )
+
+
+def _spawn_review_admission(target, *args) -> None:
+    threading.Thread(target=target, args=args, daemon=True).start()
+
+
+_review_requests = ReviewRequestHandler(
+    bot_user_id=BOT_USER_ID,
+    caps=ReviewCapStore(STATE_DIR / "review-requests.json"),
+    claims=ThreadClaims(),
+    load_config=_load_model_config,
+    post=lambda channel, thread_ts, text: slack_client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts, text=text,
+    ),
+    audit=audit_logger.info,
+    is_authorized=is_authorized,
+    run_control_command=lambda event: (
+        _maybe_stop_from_message(event)
+        or _maybe_delegation_budget_command(event)
+        or _maybe_provider_command(event)
+    ),
+    turn_running=_review_turn_running,
+    provider_unavailable=lambda thread_ts: use_openai_provider(
+        _get_provider_override(thread_ts),
+        limit_paused=_limit_paused(),
+        has_openai_session=_get_openai_session(thread_ts) is not None,
+    ),
+    room_root=_review_room_root,
+    lookup=_lookup_review_pr,
+    start_turn=lambda event, pr_url: process_message_async(event, review_pr=pr_url),
+    spawn=_spawn_review_admission,
+)
+
+
+# ---------------------------------------------------------------------------
 # Slack event handlers
 # ---------------------------------------------------------------------------
 
@@ -2936,6 +3063,11 @@ def handle_mention(event, say):
     """Handle @bot mentions in channels."""
     user_id = event.get("user", "")
     channel = event.get("channel", "")
+
+    # A review-only room admits review requests from any member or listed peer bot, and nothing else.
+    if is_review_only_room(_load_model_config(), channel):
+        _review_requests.intake(event)
+        return
 
     if not _channel_allowed(channel, event.get("channel_type", "")):
         logger.info(f"Ignoring mention in non-allowed channel {channel} ({_get_channel_name(channel)})")

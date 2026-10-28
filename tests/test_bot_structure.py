@@ -203,6 +203,35 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("tick_all(", heartbeat)
         self.assertIn("except Exception", heartbeat)
 
+    def test_review_only_rooms_divert_mentions_before_authorization(self):
+        mention = ast.unparse(self._function("handle_mention"))
+        self.assertLess(mention.index("is_review_only_room("), mention.index("_channel_allowed("))
+        self.assertLess(mention.index("_review_requests.intake(event)"), mention.index("is_authorized(user_id)"))
+
+    def test_review_sender_is_accepted_only_in_review_only_rooms(self):
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("elif not authority.allows(user_id):", process)
+        self.assertIn("if review != room_policy.review_only:", process)
+        self.assertIn("review_requester=review", process)
+        # A review never consumes or creates an escalation route.
+        self.assertLess(process.index("if not review:"), process.index("_reply_routes.claim("))
+        self.assertNotIn("_reply_routes.add", process)
+
+    def test_review_turns_are_fresh_and_never_steered(self):
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("fresh=review", process)
+        self.assertLess(process.index("raise SafetyError(BUSY_REPLY)"), process.index("_send_to_claude(session, text)"))
+        self.assertIn("_close_review_session(session)", process)
+        creation = ast.unparse(self._function("_get_or_create_live_session"))
+        self.assertIn("None if fresh else _get_session(thread_ts)", creation)
+
+    def test_review_spawn_downscopes_and_never_resumes(self):
+        spawn = ast.unparse(self._function("_spawn_claude_process"))
+        self.assertIn("if policy.review_only:\n        session_id = None", spawn)
+        self.assertIn("proc_env = review_turn_env(proc_env)", spawn)
+        lookup = ast.unparse(self._function("_lookup_review_pr"))
+        self.assertIn("review_turn_env(claude_owner_env(os.environ))", lookup)
+
 
 if __name__ == "__main__":
     unittest.main()
