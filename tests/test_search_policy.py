@@ -1,4 +1,6 @@
+import contextlib
 import fcntl
+import io
 import importlib.util
 import os
 import json
@@ -289,6 +291,20 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
             search.main(["status"])
         self.assertIsNone(search._model)
         collect.assert_called_once_with()
+
+    def test_model_loading_progress_stays_off_stdout(self):
+        fastembed = types.ModuleType("fastembed")
+        fastembed.TextEmbedding = lambda name: object()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        search._model = None
+        try:
+            with mock.patch.dict(sys.modules, {"fastembed": fastembed}), \
+                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                search.get_model()
+        finally:
+            search._model = None
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("Loading embedding model", stderr.getvalue())
 
     def test_main_releases_embedding_model_after_command_failure(self):
         search._model = object()

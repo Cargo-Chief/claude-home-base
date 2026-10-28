@@ -485,7 +485,7 @@ def get_model():
     global _model
     if _model is None:
         from fastembed import TextEmbedding
-        print("Loading embedding model...")
+        print("Loading embedding model...", file=sys.stderr)
         _model = TextEmbedding("BAAI/bge-small-en-v1.5")
     return _model
 
@@ -765,7 +765,7 @@ def search(cfg, query, source=None, limit=10):
                 "metadata": row[7],
             }
     except Exception as e:
-        print(f"FTS search error: {e}")
+        print(f"FTS search error: {e}", file=sys.stderr)
         search_errors.append(("FTS", e))
 
     # --- Vector search ---
@@ -800,7 +800,7 @@ def search(cfg, query, source=None, limit=10):
                 "metadata": row[7],
             }
     except Exception as e:
-        print(f"Vector search error: {e}")
+        print(f"Vector search error: {e}", file=sys.stderr)
         search_errors.append(("vector", e))
 
     if search_errors and cfg.get("mode") == "cargo-chief-docs":
