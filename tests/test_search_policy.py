@@ -336,6 +336,23 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
             search.pending_files(self.cfg),
         )
 
+    def test_pending_ignores_files_with_no_indexable_body(self):
+        (self.docs / "stub.md").write_text("---\ntitle: Stub\n---\n")
+
+        self.assertEqual(0, search.pending_files(self.cfg)["to_embed"])
+
+    def test_pending_prints_the_single_line_the_wrapper_parses(self):
+        (self.docs / "a.md").write_text("a\n")
+        stdout = io.StringIO()
+        with mock.patch.object(search, "load_config", return_value=self.cfg), \
+             contextlib.redirect_stdout(stdout):
+            search.main(["pending"])
+
+        line = stdout.getvalue()
+        self.assertEqual(1, line.count("\n"))
+        self.assertRegex(line, r'"to_embed": 1')
+        self.assertRegex(line, r'"indexed_files": 0')
+
     def test_main_releases_embedding_model_after_success(self):
         model = object()
         search._model = model

@@ -724,7 +724,9 @@ def pending_files(cfg):
         elif dir_cfg["type"] == "jsonl":
             files.extend(os.path.join(dir_cfg["path"], f) for f in os.listdir(dir_cfg["path"])
                          if f.endswith(".jsonl"))
-    to_embed = sum(1 for f in files if indexed.get(f) != file_hash(f))
+    changed = [f for f in files if indexed.get(f) != file_hash(f)]
+    # index_all stores nothing for an empty Markdown body, so such a file is never pending work.
+    to_embed = sum(1 for f in changed if not f.endswith(".md") or extract_markdown(f)[1].strip())
     return {"files": len(files), "indexed_files": len(indexed), "to_embed": to_embed}
 
 
@@ -847,7 +849,8 @@ def search(cfg, query, source=None, limit=10):
         fts = fts_results.get(doc_id, {})
         vec = vec_results.get(doc_id, {})
         # A stale index can still hold chunks of deleted files; never serve them.
-        if not os.path.isfile(fts.get("file_path") or vec.get("file_path")):
+        path = fts.get("file_path") or vec.get("file_path")
+        if os.path.isabs(path) and not os.path.isfile(path):
             continue
 
         fts_norm = fts.get("fts_score", 0) / max_fts
