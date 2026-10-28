@@ -96,6 +96,49 @@ def owner_stream_event_is_activity(event: Mapping[str, Any]) -> bool:
     )
 
 
+class PendingTools:
+    """The owner's tool calls issued and not yet answered; a quiet long-running tool is still progress.
+
+    A subagent's own calls are left out: its Agent call is pending on the owner's side until it
+    returns. A call stops counting once it has been outstanding for max_age, so a hung or orphaned
+    call cannot hold the inactivity limit off for the rest of the turn.
+    """
+
+    MAX_AGE_SECONDS = 1800.0
+
+    def __init__(self, max_age: float = MAX_AGE_SECONDS, clock: Callable[[], float] = time.monotonic) -> None:
+        self._issued: dict[str, float] = {}
+        self._max_age = max_age
+        self._clock = clock
+        self._lock = threading.Lock()
+
+    def observe(self, event: Mapping[str, Any]) -> None:
+        if event.get("parent_tool_use_id"):
+            return
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, list):
+            return
+        with self._lock:
+            for block in content:
+                if not isinstance(block, Mapping):
+                    continue
+                if event.get("type") == "assistant" and block.get("type") == "tool_use" and block.get("id"):
+                    self._issued[str(block["id"])] = self._clock()
+                elif event.get("type") == "user" and block.get("type") == "tool_result":
+                    self._issued.pop(str(block.get("tool_use_id", "")), None)
+
+    def active(self) -> bool:
+        now = self._clock()
+        with self._lock:
+            return any(now - issued < self._max_age for issued in self._issued.values())
+
+    def clear(self) -> None:
+        """A finished or interrupted turn leaves no call outstanding."""
+        with self._lock:
+            self._issued.clear()
+
+
 def stop_timed_out_session(session: Any, interrupt) -> str:
     """Silence a timed-out turn before interrupting it.
 

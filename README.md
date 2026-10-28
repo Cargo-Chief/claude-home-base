@@ -24,7 +24,9 @@ that Claude owners delegate natively; for them it reads `CLAUDE_CODE_OAUTH_TOKEN
 owner session's shell does not reliably carry it.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
 `CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live sessions and stops a turn after at most 15
-minutes without owner output; a native subagent's streamed events count as output. On the OpenAI
+minutes without owner output; a native subagent's streamed events count as output, and so does an
+owner tool call that is still running (for up to 30 minutes per call), so a quiet test run is not
+cut off. `TURN_TIMEOUT` logs `LIMIT:inactivity` or `LIMIT:hard`. On the OpenAI
 fallback a governed delegate retains its own bounded call timeout and generation-token allocation;
 its held launcher lock keeps the owner alive long enough for the launcher to meter the return, and
 the owner receives a fresh inactivity window when the delegate exits. A hard limit, `MAX_TURN_RUNTIME` (default three hours, 600–21600 seconds), still

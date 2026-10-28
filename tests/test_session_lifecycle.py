@@ -2,6 +2,7 @@ import threading
 import unittest
 
 from session_lifecycle import (
+    PendingTools,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -160,6 +161,59 @@ class SessionLifecycleTests(unittest.TestCase):
             delegate_active=lambda: False,
             clock=clock,
             poll_interval=1,
+        ))
+
+    def test_pending_tools_track_calls_until_their_results(self):
+        tools = PendingTools()
+        tools.observe({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "running the suite"},
+            {"type": "tool_use", "id": "t1", "name": "Bash"},
+            {"type": "tool_use", "id": "t2", "name": "Read"},
+        ]}})
+        tools.observe({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": "ok"},
+        ]}})
+        self.assertTrue(tools.active())
+        tools.observe({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]}})
+        self.assertFalse(tools.active())
+
+    def test_pending_tools_ignore_echoes_subagent_calls_and_clear_per_turn(self):
+        tools = PendingTools()
+        tools.observe({"type": "user", "message": {"content": "plain inbound text"}})
+        tools.observe({"type": "system", "subtype": "init"})
+        tools.observe({"type": "assistant", "parent_tool_use_id": "agent-1",
+                       "message": {"content": [{"type": "tool_use", "id": "inner"}]}})
+        self.assertFalse(tools.active())
+        tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t3"}]}})
+        self.assertTrue(tools.active())
+        tools.clear()
+        self.assertFalse(tools.active())
+
+    def test_a_call_stops_counting_after_its_max_age(self):
+        clock = FakeClock()
+        tools = PendingTools(max_age=30, clock=clock)
+        tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "hung"}]}})
+        clock.now = 29
+        self.assertTrue(tools.active())
+        clock.now = 30
+        self.assertFalse(tools.active(), "a hung or orphaned call must not hold the limit off for the whole turn")
+
+    def test_a_quiet_tool_call_outlasts_the_inactivity_limit(self):
+        clock = FakeClock()
+        done = FakeDoneEvent(clock, complete_on_wait=12)
+        tools = PendingTools()
+        tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}})
+
+        self.assertTrue(wait_for_turn_completion(
+            done,
+            inactivity_timeout=3,
+            activity_at=lambda: 0,
+            delegate_active=tools.active,
+            clock=clock,
+            poll_interval=1,
+            max_duration=60,
         ))
 
     def test_live_delegate_suspends_owner_inactivity_timeout(self):
