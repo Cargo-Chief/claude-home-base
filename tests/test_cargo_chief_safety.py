@@ -1038,6 +1038,7 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "CC_AWS_PROFILE": "kirk", "SLACK_BOT_TOKEN": "x", "SLACK_SIGNING_SECRET": "x",
             "SLACK_APP_TOKEN": "x", "CLAUDE_CODE_OAUTH_TOKEN": "keep",
             "OPENAI_API_KEY": "x", "GEMINI_API_KEY": "x", "DD_API_KEY": "x", "GH_TOKEN": "x",
+            "DD_APP_KEY": "x", "SERVICE_PRIVATE_KEY": "x", "VENDOR_CREDENTIALS": "x",
             "GITHUB_TOKEN": "x", "SOME_SERVICE_SECRET": "x", "DB_PASSWORD": "x",
             "ANTHROPIC_API_KEY": "keep-anthropic",
         }
@@ -1092,6 +1093,8 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             wrap + "gh pr view https://github.com/Cargo-Chief/c4/pull/4250 --json files,headRefOid",
             wrap + "gh pr diff 4250 --repo Cargo-Chief/c4",
             "git -C /root/repos/c4 fetch origin pull/4250/head",
+            "git -C /root/repos/c4 diff base head -- scripts/merge_release.py",
+            "grep -n 'unset ' /root/repos/c4/scripts/build.sh",
         ):
             with self.subTest(allowed=allowed):
                 self.assertEqual([], denied(allowed))
@@ -1110,6 +1113,9 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "aws s3 ls",
             "./dev_deploy.sh",
             "python3 docs/scripts/ops/jira_service.py get CN-1",
+            wrap + "gh api repos/Cargo-Chief/c4/pulls/4250 --method=PATCH -f state=open",
+            wrap + "gh api -XPATCH repos/Cargo-Chief/c4/pulls/4250 --input /root/work/run/p.json",
+            wrap + "gh api graphql --input /root/work/run/q.json",
         ):
             with self.subTest(blocked=blocked):
                 self.assertNotEqual([], denied(blocked))

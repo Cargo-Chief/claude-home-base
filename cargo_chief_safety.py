@@ -1065,17 +1065,20 @@ REVIEW_ONLY_DENY_RULES = (
     "Bash(*.pem*)",
     "Bash(*env -i*)",
     "Bash(env *)",
-    "Bash(*unset *)",
     "Bash(*pulls/*/reviews*)",
-    "Bash(*/merge*)",
+    "Bash(*pulls/*/merge*)",
     "Bash(*state=closed*)",
     "Bash(*-X PATCH*)",
+    "Bash(*-XPATCH*)",
+    "Bash(*-X=PATCH*)",
     "Bash(*--method PATCH*)",
+    "Bash(*--method=PATCH*)",
+    "Bash(*graphql*)",
 )
 
 
 REVIEW_KEPT_SECRET_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN",)
-_SECRET_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_SECRET_KEY", "_PASSWORD")
+_SECRET_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
 
 
 def _review_strips(key: str) -> bool:

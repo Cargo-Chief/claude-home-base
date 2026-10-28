@@ -562,6 +562,7 @@ def request_peer_review(
     lookup: Callable[[str, Path], PullRequestInfo],
     post: Callable[[str, str], None],
     audit: Callable[[str], None],
+    sent: "ReviewCapStore | None" = None,
 ) -> str:
     """Ask the configured peer to review this agent's own open PR in the review-only room.
 
@@ -602,7 +603,19 @@ def request_peer_review(
             raise PeerRequestError("refused_not_own_pr", "request reviews only of your own PRs")
         if info.state != "OPEN":
             raise PeerRequestError("refused_state", "the PR is not open")
-        post(room, f"<@{peer_id}> please review {pr}")
+        # The sender honours the same per-PR budget the peer enforces, so a retry loop can't flood the room.
+        if sent is not None:
+            try:
+                if sent.exhausted(pr, peer.max_reviews_per_pr):
+                    raise PeerRequestError("refused_sent_cap", "this PR has used its review requests for today")
+            except CapStoreError as exc:
+                raise PeerRequestError("refused_cap_store", "the sent-request record is unreadable") from exc
+        try:
+            post(room, f"<@{peer_id}> please review {pr}")
+        except Exception as exc:
+            raise PeerRequestError("refused_post", f"Slack refused the post: {type(exc).__name__}") from exc
+        if sent is not None:
+            sent.admit(pr, peer.max_reviews_per_pr)
     except PeerRequestError as exc:
         audit(format_sent_audit(pr=pr, outcome=exc.outcome))
         raise

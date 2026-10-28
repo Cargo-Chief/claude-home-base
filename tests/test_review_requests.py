@@ -599,3 +599,30 @@ class PeerRequestTest(unittest.TestCase):
     def test_invalid_peer_config_is_refused(self):
         del self.config["peer_review"]["self_github_login"]
         self.refused("refused_config")
+
+    def test_sender_honours_the_per_pr_budget(self):
+        from review_requests import ReviewCapStore
+        with tempfile.TemporaryDirectory() as temp:
+            sent = ReviewCapStore(Path(temp) / "sent.json")
+            def send():
+                return request_peer_review(
+                    PR, config=self.config, env={"CLAUDE_CHANNEL_ID": "CWORK"}, lookup=self.lookup,
+                    post=lambda channel, message: self.posts.append((channel, message)),
+                    audit=self.audits.append, sent=sent,
+                )
+            for _ in range(3):
+                send()
+            with self.assertRaisesRegex(PeerRequestError, "used its review requests"):
+                send()
+        self.assertEqual(3, len(self.posts))
+        self.assertIn("OUTCOME:refused_sent_cap", self.audits[-1])
+
+    def test_a_failed_post_is_audited_and_refused(self):
+        def boom(channel, message):
+            raise RuntimeError("not_in_channel")
+        with self.assertRaisesRegex(PeerRequestError, "Slack refused"):
+            request_peer_review(
+                PR, config=self.config, env={"CLAUDE_CHANNEL_ID": "CWORK"}, lookup=self.lookup,
+                post=boom, audit=self.audits.append,
+            )
+        self.assertIn("OUTCOME:refused_post", self.audits[-1])

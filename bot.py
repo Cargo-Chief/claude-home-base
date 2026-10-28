@@ -3458,6 +3458,7 @@ def main():
                 lookup=_lookup_review_pr,
                 post=lambda channel, text: slack_client.chat_postMessage(channel=channel, text=text),
                 audit=audit_logger.info,
+                sent=ReviewCapStore(STATE_DIR / "review-requests-sent.json"),
             )
         except PeerRequestError as exc:
             raise SystemExit(f"review request refused: {exc}") from exc

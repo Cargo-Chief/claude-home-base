@@ -30,7 +30,7 @@ review-only room without a valid `peer_review.self_github_login` is refused.
 The sending side is `bot.py --request-review <PR URL>`, which normal turns are told about. It
 takes only the URL, checks that the PR is open and authored by this agent's own App, and posts
 `<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
-A review turn cannot run it. Each call writes a `REVIEW_REQUEST_SENT` audit line.
+A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (`max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
 
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
