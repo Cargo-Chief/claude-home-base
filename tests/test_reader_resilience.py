@@ -45,6 +45,12 @@ def _globals_used(functions):
     return used
 
 
+def _fake_stop_process_tree(proc):
+    proc.calls.append("stop_tree")
+    proc.alive = False
+    return True
+
+
 def load_functions(**overrides):
     """Compile the named bot.py functions against stub globals; bot itself needs Slack to import."""
     tree = _bot_tree()
@@ -82,6 +88,7 @@ def load_functions(**overrides):
         "_live_sessions_lock": threading.Lock(),
         "_live_sessions": {},
         "slack_client": None,
+        "stop_process_tree": _fake_stop_process_tree,
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=constants + wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -99,6 +106,7 @@ class FakeTracker:
 class FakeReporter:
     def __init__(self, active=False):
         self.active = active
+        self.answered = False
         self.notes = []
         self.finished = []
 
@@ -108,17 +116,19 @@ class FakeReporter:
     def finish(self, **kwargs):
         self.finished.append(kwargs)
 
+    def delivered(self):
+        self.answered = True
+
     def activity(self):
         pass
 
 
 class FakeProc:
-    def __init__(self, events, *, alive=False, ignores_term=False, events_raise=None):
+    def __init__(self, events, *, alive=False, events_raise=None):
         self.lines = [json.dumps(event) + "\n" for event in events]
         self.events_raise = events_raise
         self.pid = 4242
         self.alive = alive
-        self.ignores_term = ignores_term
         self.calls = []
 
     @property
@@ -130,20 +140,6 @@ class FakeProc:
     def poll(self):
         return None if self.alive else 0
 
-    def terminate(self):
-        self.calls.append("terminate")
-        if not self.ignores_term:
-            self.alive = False
-
-    def wait(self, timeout=None):
-        self.calls.append("wait")
-        if self.alive:
-            raise subprocess.TimeoutExpired("claude", timeout)
-        return 0
-
-    def kill(self):
-        self.calls.append("kill")
-        self.alive = False
 
 
 class FakeSession:
@@ -233,28 +229,37 @@ class ReaderResilienceTest(unittest.TestCase):
         session.first_tool_seen = True
         load_functions(contains_private_escalation_action=broken)["_reader_loop"](session)
         self.assertEqual([], posted)
-        self.assertEqual(["terminate", "wait"], session.proc.calls)
+        self.assertEqual(["stop_tree"], session.proc.calls)
 
     def test_a_failed_reader_drops_the_session_before_stopping_its_process(self):
         sessions = {}
         order = []
         session = FakeSession([], alive=True, events_raise=UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
         sessions[session.thread_ts] = session
-        original = session.proc.terminate
 
-        def terminate():
+        def stop(proc):
             order.append(("registered", session.thread_ts in sessions, "done", session._turn_done.is_set()))
-            original()
+            return _fake_stop_process_tree(proc)
 
-        session.proc.terminate = terminate
-        load_functions(_live_sessions=sessions)["_reader_loop"](session)
+        load_functions(_live_sessions=sessions, stop_process_tree=stop)["_reader_loop"](session)
         self.assertEqual([("registered", False, "done", False)], order)
         self.assertTrue(session._turn_done.is_set())
 
-    def test_a_process_that_ignores_sigterm_is_killed(self):
-        session = FakeSession([], alive=True, ignores_term=True, events_raise=OSError("pipe"))
+    def test_a_tool_free_reply_counts_as_delivered(self):
+        posted = []
+        reporter = FakeReporter(active=True)
+        session = FakeSession([assistant_text("Plain answer"), result()], on_text=posted.append, reporter=reporter)
         load_functions()["_reader_loop"](session)
-        self.assertEqual(["terminate", "wait", "kill", "wait"], session.proc.calls)
+        self.assertEqual(["Plain answer"], posted)
+        self.assertTrue(reporter.answered, "finish() would post the no-reply notice under a real reply")
+
+    def test_a_stop_that_raises_still_ends_the_reader(self):
+        def broken(proc):
+            raise OSError("ps unavailable")
+
+        session = FakeSession([], alive=True, events_raise=OSError("pipe"))
+        load_functions(stop_process_tree=broken)["_reader_loop"](session)
+        self.assertTrue(session._turn_done.is_set())
 
     def test_a_normal_end_of_output_leaves_the_process_alone(self):
         session = FakeSession([result()], alive=True)
