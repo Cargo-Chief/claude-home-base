@@ -45,6 +45,12 @@ def _globals_used(functions):
     return used
 
 
+def _fake_stop_process_tree(proc):
+    proc.calls.append("stop_tree")
+    proc.alive = False
+    return True
+
+
 def load_functions(**overrides):
     """Compile the named bot.py functions against stub globals; bot itself needs Slack to import."""
     tree = _bot_tree()
@@ -82,6 +88,7 @@ def load_functions(**overrides):
         "_live_sessions_lock": threading.Lock(),
         "_live_sessions": {},
         "slack_client": None,
+        "stop_process_tree": _fake_stop_process_tree,
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=constants + wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -233,28 +240,35 @@ class ReaderResilienceTest(unittest.TestCase):
         session.first_tool_seen = True
         load_functions(contains_private_escalation_action=broken)["_reader_loop"](session)
         self.assertEqual([], posted)
-        self.assertEqual(["terminate", "wait"], session.proc.calls)
+        self.assertEqual(["stop_tree"], session.proc.calls)
 
     def test_a_failed_reader_drops_the_session_before_stopping_its_process(self):
         sessions = {}
         order = []
         session = FakeSession([], alive=True, events_raise=UnicodeDecodeError("utf-8", b"", 0, 1, "bad"))
         sessions[session.thread_ts] = session
-        original = session.proc.terminate
 
-        def terminate():
+        def stop(proc):
             order.append(("registered", session.thread_ts in sessions, "done", session._turn_done.is_set()))
-            original()
+            return _fake_stop_process_tree(proc)
 
-        session.proc.terminate = terminate
-        load_functions(_live_sessions=sessions)["_reader_loop"](session)
+        load_functions(_live_sessions=sessions, stop_process_tree=stop)["_reader_loop"](session)
         self.assertEqual([("registered", False, "done", False)], order)
         self.assertTrue(session._turn_done.is_set())
 
-    def test_a_process_that_ignores_sigterm_is_killed(self):
+    def test_a_failed_reader_stops_the_whole_process_tree(self):
+        # Escalation to SIGKILL is process_control's job; see test_process_control.
         session = FakeSession([], alive=True, ignores_term=True, events_raise=OSError("pipe"))
         load_functions()["_reader_loop"](session)
-        self.assertEqual(["terminate", "wait", "kill", "wait"], session.proc.calls)
+        self.assertEqual(["stop_tree"], session.proc.calls)
+
+    def test_a_stop_that_raises_still_ends_the_reader(self):
+        def broken(proc):
+            raise OSError("ps unavailable")
+
+        session = FakeSession([], alive=True, events_raise=OSError("pipe"))
+        load_functions(stop_process_tree=broken)["_reader_loop"](session)
+        self.assertTrue(session._turn_done.is_set())
 
     def test_a_normal_end_of_output_leaves_the_process_alone(self):
         session = FakeSession([result()], alive=True)

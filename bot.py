@@ -40,7 +40,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from slack_bolt import App
+from slack_bolt import App, BoltResponse
 from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_sdk import WebClient
 
@@ -86,6 +86,8 @@ from agent_status import (
 )
 from delegation_observability import DelegationTracker, format_delegation_audit
 from turn_reporter import TurnReporter, format_elapsed, tick_all
+from process_control import stop_process_tree
+from slack_transport import NoUnfurlMixin, RecentEvents
 from openai_fallback import (
     fallback_error_kind,
     is_claude_limit_notice,
@@ -333,7 +335,23 @@ app = App(
     token=SLACK_BOT_TOKEN,
     signing_secret=SLACK_SIGNING_SECRET,
 )
-slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
+
+class QuietWebClient(NoUnfurlMixin, WebClient):
+    pass
+
+
+slack_client = QuietWebClient(token=SLACK_BOT_TOKEN)
+_recent_events = RecentEvents()
+
+
+@app.middleware
+def _drop_redelivered_events(body, next, logger):
+    """Slack retries an event whose ack was slow; the first delivery is already being handled."""
+    if _recent_events.first_delivery(body.get("event_id", "")):
+        return next()
+    logger.info(f"Dropping redelivered event {body.get('event_id')}")
+    return BoltResponse(status=200, body="")
 
 # Cache for Slack user display names (user_id → display name)
 _user_name_cache: dict[str, str] = {}
@@ -1043,14 +1061,7 @@ def _stop_unread_process(session: LiveSession) -> None:
         return
     logger.warning(f"Stopping unread Claude process pid={session.proc.pid}")
     try:
-        session.proc.terminate()
-        session.proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        session.proc.kill()
-        try:
-            session.proc.wait(timeout=5)
-        except Exception as e:
-            logger.warning(f"pid={session.proc.pid} not reaped after SIGKILL: {e}")
+        stop_process_tree(session.proc)
     except Exception as e:
         logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
 
@@ -1141,6 +1152,7 @@ def _reader_loop(session: LiveSession) -> None:
                     for text in text_blocks:
                         if (text.strip() == "SKIP" or is_claude_limit_notice(text)
                                 or _ATTACH_PATTERN.search(text)):
+                            session.reporter.delivered()
                             if session._on_text:
                                 _deliver_text(session, text)
                         else:
@@ -1283,7 +1295,7 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
                 oldest.proc.stdin.close()
                 oldest.proc.wait(timeout=10)
             except Exception:
-                oldest.proc.kill()
+                stop_process_tree(oldest.proc)
 
         saved_session_id = _get_session(thread_ts)
         proc, workspace = _spawn_claude_process(
@@ -1348,7 +1360,7 @@ def _cleanup_idle_sessions() -> None:
                 session.proc.stdin.close()
                 session.proc.wait(timeout=15)
             except Exception:
-                session.proc.kill()
+                stop_process_tree(session.proc)
             if session.session_id:
                 _save_session(ts, session.session_id)
             with _live_sessions_lock:
@@ -2465,7 +2477,7 @@ def process_message_async(event: dict) -> None:
                             pass
                     if session.reporter:
                         session.reporter.finish(state="stopped")
-                    stopped_cleanly = stop_timed_out_session(session, _interrupt_session)
+                    stop_outcome = stop_timed_out_session(session, _interrupt_session)
                     minutes = CLAUDE_TIMEOUT // 60
                     slack_client.chat_postMessage(
                         channel=channel, thread_ts=thread_ts,
@@ -2474,13 +2486,15 @@ def process_message_async(event: dict) -> None:
                             f"{format_elapsed(MAX_TURN_RUNTIME)} hard limit; stopped. "
                             "Working files and thread continuity were preserved; "
                             "tell me to resume when ready."
+                            + ("" if stop_outcome != "still running"
+                               else f" But I {_STILL_RUNNING_NOTE.format(pid=session.proc.pid)}.")
                         ),
                     )
                     logger.warning(
                         "TURN_TIMEOUT | USER:%s | CHANNEL:%s | THREAD:%s | "
                         "STOP:%s | SESSION:%s",
                         user_id, channel, thread_ts,
-                        "clean" if stopped_cleanly else "terminated",
+                        stop_outcome,
                         session.session_id or "none",
                     )
                     return
@@ -2553,8 +2567,12 @@ def process_message_async(event: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _interrupt_session(session: LiveSession) -> bool:
-    """Send the CLI an interrupt (the programmatic Esc). True if the turn ended cleanly."""
+def _interrupt_session(session: LiveSession) -> str:
+    """Send the CLI an interrupt (the programmatic Esc).
+
+    Returns "interrupted" when the turn ended cleanly, "killed" when the process tree had to be
+    killed and is gone, and "still running" when the kill could not be confirmed.
+    """
     try:
         payload = json.dumps({"type": "control_request",
                               "request_id": f"interrupt-{int(time.time() * 1000)}",
@@ -2565,27 +2583,34 @@ def _interrupt_session(session: LiveSession) -> bool:
     except Exception as e:
         logger.warning(f"Interrupt write failed for {session.thread_ts}: {e}")
     if session._turn_done.wait(timeout=5):
-        return True
-    # Interrupt didn't land — hard-kill; the thread resumes via --resume next message
+        return "interrupted"
+    # Interrupt didn't land — kill the tree; the thread resumes via --resume next message
     try:
-        session.proc.terminate()
-    except Exception:
-        pass
+        gone = stop_process_tree(session.proc)
+    except Exception as e:
+        logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
+        gone = False
     session._turn_done.set()
-    return False
+    return "killed" if gone else "still running"
+
+
+_STILL_RUNNING_NOTE = (
+    "tried to stop the process but could not confirm it exited (pid {pid}); "
+    "check the host before resuming this thread"
+)
 
 
 def _stop_background_delegates(session) -> None:
     """End a process whose owner turn is over but whose background subagents still run."""
     if session.reporter:
         session.reporter.mark_stopped()
-    session.proc.terminate()
     try:
-        session.proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        session.proc.kill()
-        session.proc.wait(timeout=5)
-    note = "stopped the background subagents; the thread resumes with full context on your next message"
+        gone = stop_process_tree(session.proc)
+    except Exception as e:
+        logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
+        gone = False
+    note = ("stopped the background subagents; the thread resumes with full context on your next message"
+            if gone else _STILL_RUNNING_NOTE.format(pid=session.proc.pid))
     try:
         slack_client.chat_postMessage(
             channel=session.channel, thread_ts=session.thread_ts,
@@ -2692,9 +2717,13 @@ def _maybe_stop_from_message(event: dict) -> bool:
     def _do_stop():
         if session.reporter:
             session.reporter.mark_stopped()
-        clean = _interrupt_session(session)
-        note = ("stopped mid-run — tell me where to go instead" if clean
-                else "had to hard-kill the process; the thread resumes with full context on your next message")
+        outcome = _interrupt_session(session)
+        if outcome == "interrupted":
+            note = "stopped mid-run — tell me where to go instead"
+        elif outcome == "killed":
+            note = "had to hard-kill the process; the thread resumes with full context on your next message"
+        else:
+            note = _STILL_RUNNING_NOTE.format(pid=session.proc.pid)
         try:
             slack_client.chat_postMessage(
                 channel=session.channel, thread_ts=session.thread_ts,
@@ -3293,7 +3322,7 @@ def main():
         except ValueError as exc:
             raise SystemExit(f"agent status configuration is invalid: {exc}") from exc
         status_reporter = AgentStatusReporter(
-            WebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
+            QuietWebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
             status_channel,
             logger=logger,
         )
@@ -3317,7 +3346,7 @@ def main():
         logger.error("Agent status configuration refused startup: %s", exc)
         raise SystemExit(1) from exc
     status_reporter = AgentStatusReporter(
-        WebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
+        QuietWebClient(token=SLACK_BOT_TOKEN, timeout=3, retry_handlers=[]),
         status_channel,
         logger=logger,
     )

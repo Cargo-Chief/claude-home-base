@@ -26,6 +26,7 @@ STATUS_EDIT_INTERVAL = 5.0
 STATUS_FIRST_AFTER = 60.0
 STATUS_RETRY_AFTER = 30.0
 PROGRESS_POST_INTERVAL = 20 * 60.0
+NO_REPLY_NOTICE = "finished without a reply; ask for a summary if you need one"
 STEP_MAX_CHARS = 200
 
 Action = Callable[[], None]
@@ -92,6 +93,7 @@ class TurnReporter:
         self.active = False
         self.stopped = False
         self.seen_work = False
+        self.answered = False
         self.status_ts: str | None = None
         self.status_creating = False
         self.status_retry_at = 0.0
@@ -106,6 +108,7 @@ class TurnReporter:
             self.active = True
             self.stopped = False
             self.seen_work = False
+            self.answered = False
             self.status_ts = None
             self.status_creating = False
             self.status_retry_at = 0.0
@@ -127,6 +130,7 @@ class TurnReporter:
             if is_for_human(text):
                 actions.append(lambda: self._post(text))
                 self.last_post = now
+                self.answered = text.lstrip().startswith(QUESTION_MARKER)
             else:
                 self.tail.append(text)
                 line = step_line(text)
@@ -134,6 +138,11 @@ class TurnReporter:
                     self.step = line
                 actions += self._render(now, force=self.status_ts is None)
         _run(actions)
+
+    def delivered(self) -> None:
+        """The harness posted something for this turn itself, so a silent end is not a missing reply."""
+        with self._lock:
+            self.answered = True
 
     def tool_used(self) -> None:
         """Text before a tool call is narration, not the reply."""
@@ -188,6 +197,8 @@ class TurnReporter:
             if post_reply:
                 for block in self.tail:
                     actions.append(lambda block=block: self._post(block))
+                if not self.tail and not self.answered and state == "done":
+                    actions.append(lambda: self._post_notice(NO_REPLY_NOTICE))
             self.tail = []
             if self.status_ts:
                 status_ts = self.status_ts

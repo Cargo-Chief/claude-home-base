@@ -96,7 +96,7 @@ def owner_stream_event_is_activity(event: Mapping[str, Any]) -> bool:
     )
 
 
-def stop_timed_out_session(session: Any, interrupt) -> bool:
+def stop_timed_out_session(session: Any, interrupt) -> str:
     """Silence a timed-out turn before interrupting it.
 
     The Slack request handler may stop waiting before the long-lived provider

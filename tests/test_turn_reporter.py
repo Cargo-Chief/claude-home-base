@@ -5,6 +5,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from turn_reporter import (
+    NO_REPLY_NOTICE,
     PROGRESS_POST_INTERVAL,
     STATUS_FIRST_AFTER,
     STATUS_RETRY_AFTER,
@@ -97,6 +98,36 @@ class TurnReporterTest(unittest.TestCase):
         turn.finish()
 
         self.assertEqual([], slack.posts)
+        self.assertEqual([NO_REPLY_NOTICE], slack.notices)
+
+    def test_no_notice_when_the_turn_asked_a_question_or_the_harness_posted(self):
+        turn, slack, _ = reporter()
+        turn.text("❓ Merge now or wait for your review?")
+        turn.tool_used()
+        turn.finish()
+        self.assertEqual([], slack.notices)
+
+        turn.begin()
+        turn.delivered()
+        turn.finish()
+        self.assertEqual([], slack.notices)
+
+    def test_a_comment_alone_is_not_a_reply(self):
+        turn, slack, _ = reporter()
+        turn.text("💬 Switching to CN-1234 while CI runs")
+        turn.tool_used()
+        turn.finish()
+        self.assertEqual([NO_REPLY_NOTICE], slack.notices)
+
+    def test_no_notice_when_stopped_or_escalated(self):
+        turn, slack, _ = reporter()
+        turn.finish(state="stopped")
+        turn.begin()
+        turn.finish(post_reply=False)
+        turn.begin()
+        turn.mark_stopped()
+        turn.finish()
+        self.assertEqual([], slack.notices)
 
     def test_finish_without_reply_for_escalation_or_stop(self):
         turn, slack, _ = reporter()
