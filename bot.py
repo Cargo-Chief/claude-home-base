@@ -59,8 +59,12 @@ from cargo_chief_safety import (
     consume_parking_claim,
     find_workspace_root,
     format_audit_metadata,
+    review_route_refusal,
+    forward_refusal,
+    github_wrapper_downscopes,
     is_review_only_room,
     preflight_room,
+    RoomPolicy,
     resolve_room_policy,
     review_turn_env,
     room_channel_ids,
@@ -104,7 +108,13 @@ from provider_control import (
 from reply_routing import ReplyRouteStore
 from review_requests import (
     BUSY_REPLY,
+    CONFIG_REPLY,
+    ERROR_REPLY,
     PROVIDER_REPLY,
+    WRAPPER_REPLY,
+    RecentMentions,
+    RequestThrottle,
+    ReviewAdmission,
     ReviewCapStore,
     ReviewRequestHandler,
     ThreadClaims,
@@ -817,18 +827,30 @@ def _spawn_claude_process(
     user_id: str = "",
     thread_ts: str = "",
     channel: str = "",
+    review_policy: RoomPolicy | None = None,
 ) -> tuple[subprocess.Popen, ThreadWorkspace]:
     """Spawn a long-lived Claude CLI process with stream-json I/O.
 
     Injects CLAUDE_THREAD_TS / CLAUDE_CHANNEL_ID / CLAUDE_SESSION_ID env vars
     so the spawned Claude can read its own routing context (mainly for the
     cross-thread DM pattern — passing `--forward-to $CLAUDE_THREAD_TS`).
+    A review turn spawns with the policy pinned at admission; a review-only room
+    refuses any other spawn.
     """
     battery_context = _get_trust_battery_context()
     _model, _effort, model_prompt = resolve_model_settings(channel, user_id)
-    policy = resolve_room_policy(_load_model_config(), channel, user_id)
+    if review_policy is not None:
+        if not review_policy.review_only:
+            raise SafetyError("a review turn needs a review-only room policy")
+        policy = review_policy
+    else:
+        policy = resolve_room_policy(_load_model_config(), channel, user_id)
+        if policy.review_only:
+            raise SafetyError("a review-only room runs admitted review turns only")
     if policy.review_only:
         session_id = None
+        if not github_wrapper_downscopes(policy.root):
+            raise SafetyError(WRAPPER_REPLY)
     for warning in preflight_room(policy):
         logger.warning(f"Cargo Chief preflight: {warning}")
     workspace = prepare_thread_workspace(
@@ -870,13 +892,15 @@ def _spawn_claude_process(
         proc_env["CLAUDE_CHANNEL_ID"] = channel
     if session_id:
         proc_env["CLAUDE_SESSION_ID"] = session_id
-    proc_env["CARGO_CHIEF_ESCALATION_CHANNEL"] = policy.escalation_channel
-    proc_env["CARGO_CHIEF_ESCALATION_MESSAGE_FILE"] = str(escalation_message_file)
-    proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
-    proc_env["CARGO_CHIEF_ESCALATION_ATTEMPT_FILE"] = str(workspace.escalation_attempt_file)
+    if not policy.review_only:
+        # Review turns get no escalation route, parking claim or bundle binding.
+        proc_env["CARGO_CHIEF_ESCALATION_CHANNEL"] = policy.escalation_channel
+        proc_env["CARGO_CHIEF_ESCALATION_MESSAGE_FILE"] = str(escalation_message_file)
+        proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
+        proc_env["CARGO_CHIEF_ESCALATION_ATTEMPT_FILE"] = str(workspace.escalation_attempt_file)
+        proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
+        proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
     proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
-    proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
-    proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
     proc_env["CARGO_CHIEF_ROOT"] = str(policy.root)
     proc_env["CARGO_CHIEF_OWNER_PROVIDER"] = "claude"
     proc_env["CARGO_CHIEF_OWNER_MODEL"] = policy.model
@@ -1298,20 +1322,30 @@ def _reader_loop(session: LiveSession) -> None:
 
 
 def _get_or_create_live_session(
-    thread_ts: str, channel: str, user_id: str = "", fresh: bool = False
+    thread_ts: str, channel: str, user_id: str = "", review_policy: RoomPolicy | None = None
 ) -> LiveSession:
-    """Get an existing live session or create a new one; ``fresh`` replaces an idle one unresumed."""
+    """Get an existing live session or create a new one.
+
+    A review (``review_policy`` set) always gets a fresh, unresumed process under that pinned policy.
+    """
+    fresh = review_policy is not None
+    if fresh:
+        with _live_sessions_lock:
+            replaced = _live_sessions.get(thread_ts)
+            if replaced and replaced.proc.poll() is None and not replaced.stop_done:
+                _live_sessions.pop(thread_ts, None)
+            else:
+                replaced = None
+        if replaced:
+            try:
+                close_process_tree(replaced.proc, replaced.proc.stdin.close, wait=10)
+            except Exception as e:
+                logger.warning(f"Could not stop replaced pid={replaced.proc.pid}: {e}")
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
-        if session and session.proc.poll() is None and not session.stop_done:
-            if not fresh:
-                session.last_activity = time.time()
-                return session
-            _live_sessions.pop(thread_ts, None)
-            try:
-                close_process_tree(session.proc, session.proc.stdin.close, wait=10)
-            except Exception as e:
-                logger.warning(f"Could not stop replaced pid={session.proc.pid}: {e}")
+        if not fresh and session and session.proc.poll() is None and not session.stop_done:
+            session.last_activity = time.time()
+            return session
 
         # Evict oldest idle session if at capacity
         if len(_live_sessions) >= MAX_LIVE_SESSIONS:
@@ -1333,6 +1367,7 @@ def _get_or_create_live_session(
             user_id=user_id,
             thread_ts=thread_ts,
             channel=channel,
+            review_policy=review_policy,
         )
         session = LiveSession(
             proc=proc,
@@ -1340,8 +1375,8 @@ def _get_or_create_live_session(
             channel=channel,
             thread_ts=thread_ts,
             user_id=user_id,
-            escalation_message_file=workspace.escalation_message_file,
-            escalation_receipt_file=workspace.escalation_receipt_file,
+            escalation_message_file=None if fresh else workspace.escalation_message_file,
+            escalation_receipt_file=None if fresh else workspace.escalation_receipt_file,
             workspace=workspace,
         )
         _live_sessions[thread_ts] = session
@@ -2203,7 +2238,18 @@ def _run_openai_fallback(
     return session_id
 
 
-def process_message_async(event: dict, review_pr: str | None = None) -> None:
+def _clear_eyes(channel: str, ts: str) -> None:
+    try:
+        slack_client.reactions_remove(channel=channel, name="eyes", timestamp=ts)
+    except Exception:
+        pass
+
+
+class _ReviewBusy(Exception):
+    """A review found a turn already running in its thread."""
+
+
+def process_message_async(event: dict, review_admission: ReviewAdmission | None = None) -> None:
     """Process a message in a background thread.
 
     Uses long-lived Claude processes with stream-json I/O and a profile-governed
@@ -2212,8 +2258,9 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
     queued automatically by the CLI. Otherwise a new process is spawned
     (resuming any prior session for the thread).
 
-    ``review_pr`` marks an admitted review request: the sender is a review requester, valid
-    only in a review-only room, and the turn is a fresh harness-built review of that PR.
+    ``review_admission`` marks an admitted review request: the sender is a review requester,
+    valid only in a review-only room, and the turn is a fresh harness-built review of that PR
+    under the policy pinned at admission. Every refusal on that path replies and is audited.
     """
     user_id = event.get("user", "")
     text = event.get("text", "").strip()
@@ -2222,7 +2269,7 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
     msg_ts = event.get("ts")
     reaction_channel = channel
     reaction_msg_ts = msg_ts
-    review = review_pr is not None
+    review = review_admission is not None
 
     # Defense in depth: every ingress path (including forwarded replies and
     # mid-turn steering) must pass the current Slack sender, before downloads
@@ -2231,11 +2278,14 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
         authority = AuthorityPolicy.from_env()
     except SafetyError:
         log_unauthorized(event)
+        if review:
+            review_admission.refuse("refused_authority_config", ERROR_REPLY)
         return
     if review:
         # Review requesters are checked by the room's intake; the room itself is checked below.
         if not user_id or user_id == BOT_USER_ID:
             log_unauthorized(event)
+            review_admission.refuse("refused_sender", ERROR_REPLY)
             return
     elif not authority.allows(user_id):
         log_unauthorized(event)
@@ -2285,14 +2335,24 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
         room_policy = resolve_room_policy(_load_model_config(), channel, user_id)
     except SafetyError as exc:
         logger.error(f"Refusing unsafe room {channel}: {exc}")
+        if review:
+            review_admission.refuse("refused_room", CONFIG_REPLY)
+            return
         slack_client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
             text=f"I could not start this Cargo Chief room safely: {exc}",
         )
         return
-    if review != room_policy.review_only:
-        # Every turn in a review-only room is a review, and a review runs nowhere else.
+    if review:
+        # Run under the policy pinned at admission, and only while the room is still review-only.
+        if not room_policy.review_only or room_policy.root != review_admission.policy.root:
+            log_unauthorized(event)
+            review_admission.refuse("refused_room", CONFIG_REPLY)
+            return
+        room_policy = review_admission.policy
+    elif room_policy.review_only:
+        # Every turn in a review-only room is an admitted review.
         log_unauthorized(event)
         return
 
@@ -2302,7 +2362,7 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
         has_openai_session=_get_openai_session(thread_ts) is not None,
     )
     if review and use_openai:
-        slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=PROVIDER_REPLY)
+        review_admission.refuse("refused_provider", PROVIDER_REPLY)
         return
 
     # Replace user mentions with readable names
@@ -2315,7 +2375,7 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
     # Download attachments
     attached_files = [] if review else download_slack_files(event)
 
-    if not text and not attached_files:
+    if not review and not text and not attached_files:
         return
 
     if attached_files:
@@ -2404,10 +2464,10 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
         forwarded_from=original_thread,
         review_requester=review,
     )
-    text = f"{build_review_task(review_pr)}\n\n{envelope}" if review else prefix + envelope
+    text = f"{build_review_task(review_admission.pr)}\n\n{envelope}" if review else prefix + envelope
 
     if review and _review_turn_running(thread_ts):
-        slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=BUSY_REPLY)
+        review_admission.refuse("refused_busy", BUSY_REPLY)
         return
 
     # Add eyes reaction as thinking indicator
@@ -2483,15 +2543,20 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
             if review and session and session.turn_lock.locked():
                 # A review is never steered into a running process, and that process is not ours.
                 session = None
-                raise SafetyError(BUSY_REPLY)
+                raise _ReviewBusy()
             if not (session and session.turn_lock.locked()):
                 _turn_admission.acquire(
                     lambda: _post_queue_notice(channel, thread_ts)
                 )
                 turn_admitted = True
                 session = _get_or_create_live_session(
-                    thread_ts, channel, user_id=user_id, fresh=review
+                    thread_ts, channel, user_id=user_id,
+                    review_policy=room_policy if review else None,
                 )
+                # The cap is charged, and the request audited as accepted, only once its turn starts.
+                if review and not review_admission.start():
+                    _clear_eyes(reaction_channel, reaction_msg_ts)
+                    return
 
         # Real-time steering: a Claude turn is already running in this thread — don't
         # hold the message until it finishes. Write it to stdin now; the CLI
@@ -2610,10 +2675,17 @@ def process_message_async(event: dict, review_pr: str | None = None) -> None:
                     )
                     return
 
+    except _ReviewBusy:
+        _clear_eyes(reaction_channel, reaction_msg_ts)
+        review_admission.refuse("refused_busy", BUSY_REPLY)
+        return
     except Exception as e:
         try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
         except Exception: pass
         logger.error(f"Error processing message in thread {thread_ts}: {e}")
+        if review and not review_admission.started:
+            review_admission.refuse("refused_error", ERROR_REPLY)
+            return
         slack_client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
             text=f"Something went wrong: {e}",
@@ -2971,11 +3043,11 @@ def _review_turn_running(thread_ts: str) -> bool:
     return bool(session and session.proc.poll() is None and session.turn_lock.locked())
 
 
-def _review_room_root(channel: str, user_id: str) -> Path:
+def _review_room_policy(channel: str, user_id: str) -> RoomPolicy:
     policy = resolve_room_policy(_load_model_config(), channel, user_id)
     if not policy.review_only:
         raise SafetyError(f"room {channel!r} is not review-only")
-    return policy.root
+    return policy
 
 
 def _lookup_review_pr(pr_url: str, root: Path):
@@ -2993,6 +3065,8 @@ _review_requests = ReviewRequestHandler(
     bot_user_id=BOT_USER_ID,
     caps=ReviewCapStore(STATE_DIR / "review-requests.json"),
     claims=ThreadClaims(),
+    throttle=RequestThrottle(),
+    recent=RecentMentions(),
     load_config=_load_model_config,
     post=lambda channel, thread_ts, text: slack_client.chat_postMessage(
         channel=channel, thread_ts=thread_ts, text=text,
@@ -3010,9 +3084,9 @@ _review_requests = ReviewRequestHandler(
         limit_paused=_limit_paused(),
         has_openai_session=_get_openai_session(thread_ts) is not None,
     ),
-    room_root=_review_room_root,
+    room_policy=_review_room_policy,
     lookup=_lookup_review_pr,
-    start_turn=lambda event, pr_url: process_message_async(event, review_pr=pr_url),
+    start_turn=lambda admission: process_message_async(admission.event, review_admission=admission),
     spawn=_spawn_review_admission,
 )
 
@@ -3277,6 +3351,11 @@ def register_forward_endpoint():
         target_channel = requested_channel
         target_user_id = requested_user
         target_session_id = _get_session(to_thread) or _get_openai_session(to_thread)
+    refusal = forward_refusal(
+        _load_model_config(), from_channel=str(from_channel), to_channel=target_channel,
+    )
+    if refusal:
+        return jsonify({"error": "review_only_room", "detail": refusal}), 403
     _add_forward(
         from_channel=from_channel,
         from_thread=from_thread,
@@ -3358,6 +3437,10 @@ def main():
         parser.error("--request-reboot-status accepts no other argument")
 
     # CLI modes — send and exit
+    if args.forward_to:
+        refusal = review_route_refusal(_load_model_config(), os.environ)
+        if refusal:
+            raise SystemExit(refusal)
     if args.send:
         if args.with_votes:
             response = slack_client.conversations_open(users=[args.send[0]])
@@ -3400,6 +3483,9 @@ def main():
         return
 
     if args.escalate:
+        refusal = review_route_refusal(_load_model_config(), os.environ)
+        if refusal:
+            raise SystemExit(refusal)
         escalation_channel = os.environ.get("CARGO_CHIEF_ESCALATION_CHANNEL", "")
         if not re.fullmatch(r"[CDG][A-Z0-9]+", escalation_channel):
             raise SystemExit("private escalation route is unavailable")

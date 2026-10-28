@@ -7,10 +7,17 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from cargo_chief_safety import SafetyError
+from cargo_chief_safety import RoomPolicy, SafetyError
 from review_requests import (
     BUSY_REPLY,
     CAP_REPLY,
+    CAP_STORE_REPLY,
+    CapStoreError,
+    ERROR_REPLY,
+    RecentMentions,
+    RequestThrottle,
+    THROTTLE_REPLY,
+    WRAPPER_REPLY,
     CONFIG_REPLY,
     HUMAN,
     IGNORE,
@@ -47,6 +54,9 @@ class PrUrlTest(unittest.TestCase):
     def test_slack_label_wrapping_counts_once(self):
         self.assertEqual(PR, single_pr_url(f"review <{PR}|{PR}>"))
         self.assertEqual(PR, single_pr_url(f"review <{PR}|c4#123>"))
+
+    def test_repo_case_variants_share_one_key(self):
+        self.assertEqual(PR, single_pr_url("review https://github.com/cargo-chief/C4/pull/0123"))
 
     def test_trailing_path_and_punctuation_normalize(self):
         self.assertEqual(PR, single_pr_url(f"review {PR}/files."))
@@ -168,9 +178,15 @@ class CapStoreTest(unittest.TestCase):
         self.assertFalse(self.store.exhausted(PR, 3))
         self.assertEqual("accepted", self.store.admit(PR, 3))
 
-    def test_corrupt_file_starts_empty(self):
-        self.store.path.write_text("{not json")
-        self.assertEqual("accepted", self.store.admit(PR, 3))
+    def test_unreadable_record_fails_closed_instead_of_resetting(self):
+        for content in (b"{not json", b"[1, 2]", b"\xff\xfe"):
+            with self.subTest(content=content):
+                self.store.path.write_bytes(content)
+                with self.assertRaises(CapStoreError):
+                    self.store.exhausted(PR, 3)
+                with self.assertRaises(CapStoreError):
+                    self.store.admit(PR, 3)
+                self.assertEqual(content, self.store.path.read_bytes())
 
 
 class AuditAndTaskTest(unittest.TestCase):
@@ -187,6 +203,50 @@ class AuditAndTaskTest(unittest.TestCase):
         task = build_review_task(PR)
         self.assertIn(f"cc-code-review high --comment {PR}", task)
         self.assertIn("untrusted", task)
+
+
+
+
+def policy(review_only=True):
+    return RoomPolicy(
+        root=Path("/root"), permission_mode="auto", overlay=Path("/root/agent-kit/modes/review-only.md"),
+        escalation_channel="DAPPROVER", backend="claude", model="claude-opus-5-5", effort="high",
+        role="eng", fallback_backend="codex", fallback_model="gpt-6-sol", fallback_effort="high",
+        review_only=review_only,
+    )
+
+
+class ThrottleTest(unittest.TestCase):
+    def test_concurrent_admissions_are_bounded(self):
+        throttle = RequestThrottle(max_concurrent=2, clock=lambda: 0)
+        self.assertTrue(throttle.try_begin("U1"))
+        self.assertTrue(throttle.try_begin("U2"))
+        self.assertFalse(throttle.try_begin("U3"))
+        throttle.end()
+        self.assertTrue(throttle.try_begin("U3"))
+
+    def test_per_requester_rate_rolls(self):
+        now = [0.0]
+        throttle = RequestThrottle(per_requester=2, window=3600, clock=lambda: now[0])
+        for _ in range(2):
+            self.assertTrue(throttle.try_begin("U1"))
+            throttle.end()
+        self.assertFalse(throttle.try_begin("U1"))
+        self.assertTrue(throttle.try_begin("U2"))
+        throttle.end()
+        now[0] = 3601
+        self.assertTrue(throttle.try_begin("U1"))
+
+
+class RecentMentionsTest(unittest.TestCase):
+    def test_same_channel_and_ts_is_handled_once_per_window(self):
+        now = [0.0]
+        recent = RecentMentions(window=3600, clock=lambda: now[0])
+        self.assertTrue(recent.first_delivery("C1", "1.1"))
+        self.assertFalse(recent.first_delivery("C1", "1.1"))
+        self.assertTrue(recent.first_delivery("C2", "1.1"))
+        now[0] = 3601
+        self.assertTrue(recent.first_delivery("C1", "1.1"))
 
 
 class HandlerTest(unittest.TestCase):
@@ -206,13 +266,21 @@ class HandlerTest(unittest.TestCase):
         self.running = False
         self.provider_down = False
         self.room_error = None
+        self.policy = policy()
+        self.wrapper_ok = True
+        self.turn_starts = True
         self.authorized = {"UKIRK"}
         self.control_handled = False
         self.claims = ThreadClaims()
+        self.throttle = RequestThrottle(clock=lambda: 0)
+        self.caps = ReviewCapStore(Path(self.temp.name) / "caps.json")
+        self.ts = 0
         self.handler = ReviewRequestHandler(
             bot_user_id="ULISA",
-            caps=ReviewCapStore(Path(self.temp.name) / "caps.json"),
+            caps=self.caps,
             claims=self.claims,
+            throttle=self.throttle,
+            recent=RecentMentions(),
             load_config=lambda: self.config,
             post=lambda channel, thread, text: self.posts.append((channel, thread, text)),
             audit=self.audits.append,
@@ -220,10 +288,11 @@ class HandlerTest(unittest.TestCase):
             run_control_command=self.control,
             turn_running=lambda thread: self.running,
             provider_unavailable=lambda thread: self.provider_down,
-            room_root=self.room_root,
+            room_policy=self.room_policy,
             lookup=self.lookup,
-            start_turn=lambda event, pr: self.turns.append((event["user"], pr)),
+            start_turn=self.start_turn,
             spawn=lambda target, *args: target(*args),
+            wrapper_ready=lambda root: self.wrapper_ok,
         )
 
     def tearDown(self):
@@ -233,10 +302,10 @@ class HandlerTest(unittest.TestCase):
         self.controls.append(event["user"])
         return self.control_handled
 
-    def room_root(self, channel, user):
+    def room_policy(self, channel, user):
         if self.room_error:
             raise self.room_error
-        return Path("/root")
+        return self.policy
 
     def lookup(self, pr, root):
         self.lookups.append(pr)
@@ -244,13 +313,24 @@ class HandlerTest(unittest.TestCase):
             raise self.lookup_error
         return self.info
 
+    def start_turn(self, admission):
+        # Stands in for process_message_async: the turn starts (or does not) and returns.
+        self.assertIs(self.policy, admission.policy)
+        if self.turn_starts and admission.start():
+            self.turns.append((admission.event["user"], admission.pr))
+
     def mention(self, user="USTRANGER", text=f"<@ULISA> review {PR}", **extra):
-        event = {"user": user, "channel": "CREVIEWS", "ts": "1.1", "text": text}
+        self.ts += 1
+        event = {"user": user, "channel": "CREVIEWS", "ts": f"{self.ts}.1", "text": text}
         event.update(extra)
         self.handler.intake(event)
+        return event
 
     def outcomes(self):
         return [line.rsplit("OUTCOME:", 1)[1] for line in self.audits]
+
+    def replies(self):
+        return [post[2] for post in self.posts]
 
     def test_unauthorized_human_is_accepted(self):
         self.mention()
@@ -267,6 +347,12 @@ class HandlerTest(unittest.TestCase):
         self.mention(user="ULISA", bot_id="BLISA")
         self.assertEqual(([], [], []), (self.turns, self.posts, self.audits))
 
+    def test_redelivered_mention_is_handled_once(self):
+        event = self.mention()
+        self.handler.intake(dict(event))
+        self.assertEqual(1, len(self.turns))
+        self.assertEqual(["accepted"], self.outcomes())
+
     def test_control_commands_only_for_authorized_humans(self):
         self.control_handled = True
         self.mention(user="USTRANGER", text="<@ULISA> stop")
@@ -279,7 +365,7 @@ class HandlerTest(unittest.TestCase):
         self.mention(text="<@ULISA> review please")
         self.mention(user="UNED", bot_id="BNED", text="<@ULISA> review please")
         self.mention(text=f"<@ULISA> {PR} and https://github.com/Cargo-Chief/c4/pull/9")
-        self.assertEqual([USAGE_HINT, USAGE_HINT], [post[2] for post in self.posts])
+        self.assertEqual([USAGE_HINT, USAGE_HINT], self.replies())
         self.assertEqual(["refused_no_pr"] * 3, self.outcomes())
         self.assertEqual([], self.turns)
 
@@ -287,20 +373,30 @@ class HandlerTest(unittest.TestCase):
         self.config = {"peer_review": {"peer_bot_user_ids": []}}
         self.mention()
         self.mention(user="UNED", bot_id="BNED")
-        self.assertEqual([CONFIG_REPLY], [post[2] for post in self.posts])
+        self.assertEqual([CONFIG_REPLY], self.replies())
         self.assertEqual(["refused_config"], self.outcomes())
         self.assertEqual([], self.turns)
 
     def test_room_that_is_not_review_only_is_refused(self):
         self.room_error = SafetyError("not review-only")
         self.mention()
-        self.assertEqual(["refused_room"], self.outcomes())
+        self.policy = policy(review_only=False)
+        self.room_error = None
+        self.mention()
+        self.assertEqual(["refused_room"] * 2, self.outcomes())
         self.assertEqual([], self.turns)
+
+    def test_outdated_wrapper_is_refused_before_any_lookup(self):
+        self.wrapper_ok = False
+        self.mention()
+        self.assertEqual([WRAPPER_REPLY], self.replies())
+        self.assertEqual(["refused_wrapper"], self.outcomes())
+        self.assertEqual([], self.lookups)
 
     def test_own_pr_is_refused(self):
         self.info = PullRequestInfo("app/lisa-cargochief", "OPEN")
         self.mention(user="UNED", bot_id="BNED")
-        self.assertEqual([OWN_PR_REPLY], [post[2] for post in self.posts])
+        self.assertEqual([OWN_PR_REPLY], self.replies())
         self.assertEqual(["refused_own_pr"], self.outcomes())
         self.assertEqual([], self.turns)
 
@@ -308,13 +404,13 @@ class HandlerTest(unittest.TestCase):
         for state in ("CLOSED", "MERGED"):
             self.info = PullRequestInfo("kfranzenCC", state)
             self.mention()
-        self.assertEqual([NOT_OPEN_REPLY] * 2, [post[2] for post in self.posts])
+        self.assertEqual([NOT_OPEN_REPLY] * 2, self.replies())
         self.assertEqual(["refused_state"] * 2, self.outcomes())
 
     def test_lookup_failure_fails_closed(self):
         self.lookup_error = ReviewGuardError("PR lookup exited 1")
         self.mention()
-        self.assertEqual([LOOKUP_FAILED_REPLY], [post[2] for post in self.posts])
+        self.assertEqual([LOOKUP_FAILED_REPLY], self.replies())
         self.assertEqual(["refused_lookup"], self.outcomes())
         self.assertEqual([], self.turns)
 
@@ -322,10 +418,32 @@ class HandlerTest(unittest.TestCase):
         for _ in range(5):
             self.mention()
         self.assertEqual(2, len(self.turns))
-        self.assertEqual([CAP_REPLY], [post[2] for post in self.posts])
+        self.assertEqual([CAP_REPLY], self.replies())
         self.assertEqual(["accepted", "accepted", "refused_cap", "refused_cap", "refused_cap"],
                          self.outcomes())
         self.assertEqual(2, len(self.lookups))
+
+    def test_repo_case_variants_share_the_cap(self):
+        self.mention(text="review https://github.com/Cargo-Chief/C4/pull/123")
+        self.mention(text="review https://github.com/cargo-chief/c4/pull/123")
+        self.mention(text=f"review {PR}")
+        self.assertEqual(2, len(self.turns))
+        self.assertEqual(["accepted", "accepted", "refused_cap"], self.outcomes())
+
+    def test_cap_is_not_charged_when_the_turn_does_not_start(self):
+        self.turn_starts = False
+        for _ in range(3):
+            self.mention()
+        self.assertEqual(["refused_error"] * 3, self.outcomes())
+        self.assertEqual([ERROR_REPLY] * 3, self.replies())
+        self.assertFalse(self.caps.exhausted(PR, 2))
+
+    def test_unreadable_cap_record_refuses(self):
+        self.caps.path.write_text("{not json")
+        self.mention()
+        self.assertEqual([CAP_STORE_REPLY], self.replies())
+        self.assertEqual(["refused_cap_store"], self.outcomes())
+        self.assertEqual([], self.lookups)
 
     def test_busy_thread_is_refused_and_never_piped(self):
         self.running = True
@@ -343,10 +461,34 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(["refused_busy", "accepted"], self.outcomes())
         self.assertTrue(self.claims.claim("0.9"), "the admission released its claim")
 
+    def test_throttle_refuses_and_counts_failed_lookups(self):
+        self.lookup_error = ReviewGuardError("PR lookup exited 1")
+        for _ in range(10):
+            self.mention()
+        self.lookup_error = None
+        self.mention()
+        self.assertEqual(["refused_lookup"] * 10 + ["refused_throttle"], self.outcomes())
+        self.assertEqual(THROTTLE_REPLY, self.replies()[-1])
+        self.mention(user="UOTHERHUMAN")
+        self.assertEqual("accepted", self.outcomes()[-1])
+
+    def test_concurrent_admissions_are_limited(self):
+        self.assertTrue(self.throttle.try_begin("UA"))
+        self.assertTrue(self.throttle.try_begin("UB"))
+        self.mention()
+        self.assertEqual(["refused_throttle"], self.outcomes())
+        self.assertTrue(self.claims.claim("1.1"), "a throttled request releases its claim")
+
+    def test_admission_slot_is_released_after_the_guards(self):
+        self.mention()
+        self.mention(thread_ts="0.8")
+        self.mention(thread_ts="0.7")
+        self.assertEqual(["accepted", "accepted", "refused_cap"], self.outcomes())
+
     def test_provider_fallback_refuses_reviews(self):
         self.provider_down = True
         self.mention()
-        self.assertEqual([PROVIDER_REPLY], [post[2] for post in self.posts])
+        self.assertEqual([PROVIDER_REPLY], self.replies())
         self.assertEqual(["refused_provider"], self.outcomes())
 
 

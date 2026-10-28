@@ -17,15 +17,20 @@ A room entry may add `"review_only": true` (for example `#pr-reviews`, with
 a mention from any human member, or from a bot listed in `peer_review.peer_bot_user_ids`, carrying
 exactly one `https://github.com/Cargo-Chief/<repo>/pull/<n>` link starts a fresh, harness-built
 `cc-code-review high --comment` turn. The sender is marked `review_requester` with no approver
-authority, the turn gets a read/PR-write GitHub token request, no AWS variables and extra deny
-rules, and it never resumes, steers or escalates. Before the turn the harness refuses the agent's own
-PRs (`peer_review.self_github_login`), PRs that are not open, PRs it cannot look up, and PRs past
-`peer_review.max_reviews_per_pr` (default 3) turns in 24 hours. Each request writes one
-`REVIEW_REQUEST` audit line. A review-only room without a valid `peer_review` block is refused.
+authority, and the turn gets a read/PR-write GitHub token request, no AWS variables or Slack
+secrets, and extra deny rules. It never resumes, steers, escalates or registers a reply route, and
+`bot.py --escalate`, `--forward-to` and `/internal/forward` refuse review-only rooms server-side.
+Before the turn the harness refuses the agent's own PRs (`peer_review.self_github_login`), PRs that
+are not open, PRs it cannot look up, a GitHub wrapper too old to downscope its token, an unreadable
+cap record, and PRs past `peer_review.max_reviews_per_pr` (default 3, range 1–10) started turns in
+24 hours. At most two requests are admitted at once and each requester may make ten an hour; a
+redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line. A
+review-only room without a valid `peer_review.self_github_login` is refused.
 
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
-agent process. Claude remains primary; a room can move to its OpenAI fallback only after the
+agent process. The one exception is a mention in a review-only room, which any member or listed
+peer bot may send and which can only start the review turn above. Claude remains primary; a room can move to its OpenAI fallback only after the
 harness recognizes Claude's account credit-limit response.
 
 Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.

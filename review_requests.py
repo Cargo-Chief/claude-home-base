@@ -1,12 +1,13 @@
 """Review requests in review-only Slack rooms.
 
 No Slack or bot imports: the bot wires these pieces to its Slack client, audit log and turn
-runner, so intake, guards and the per-PR cap are testable without credentials.
+runner, so intake, guards, throttles and the per-PR cap are testable without credentials.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -18,7 +19,14 @@ import threading
 import time
 from typing import Callable, Iterable, Mapping
 
-from cargo_chief_safety import PeerReviewConfig, SafetyError, peer_review_config
+from cargo_chief_safety import (
+    PeerReviewConfig,
+    RoomPolicy,
+    SafetyError,
+    github_wrapper_downscopes,
+    github_wrapper_path,
+    peer_review_config,
+)
 
 
 logger = logging.getLogger("bot.review")
@@ -36,8 +44,12 @@ OWN_PR_REPLY = "I don't review my own PRs."
 NOT_OPEN_REPLY = "That PR is not open, so I won't review it."
 LOOKUP_FAILED_REPLY = "I could not check that PR, so I won't review it."
 CAP_REPLY = "Review pass limit reached for this PR; Kirk needs to look."
+CAP_STORE_REPLY = "Reviews are unavailable: the review pass record is unreadable."
 CONFIG_REPLY = "Review requests are not configured correctly here."
 PROVIDER_REPLY = "Reviews are paused while Claude is unavailable."
+WRAPPER_REPLY = "Reviews are unavailable: this agent's GitHub wrapper is out of date."
+THROTTLE_REPLY = "Too many review requests right now; try again later."
+ERROR_REPLY = "The review could not start."
 
 # The link must start a token, so a Cargo-Chief URL embedded in another URL never matches.
 _PR_URL_RE = re.compile(
@@ -48,17 +60,28 @@ _PR_URL_RE = re.compile(
 
 LOOKUP_TIMEOUT_SECONDS = 60
 CAP_WINDOW_SECONDS = 24 * 3600
+MAX_CONCURRENT_ADMISSIONS = 2
+MAX_REQUESTS_PER_REQUESTER = 10
+REQUESTER_WINDOW_SECONDS = 3600
+REDELIVERY_WINDOW_SECONDS = 3600
 
 
 class ReviewGuardError(RuntimeError):
     """The PR could not be checked, so the request is refused."""
 
 
+class CapStoreError(RuntimeError):
+    """The cap record cannot be read, so no review may be admitted."""
+
+
 def pr_urls(text: str) -> list[str]:
-    """Distinct canonical Cargo-Chief PR URLs in Slack text, including ``<url>`` and ``<url|label>``."""
+    """Distinct canonical Cargo-Chief PR URLs in Slack text, including ``<url>`` and ``<url|label>``.
+
+    GitHub repo names are case-insensitive, so the repo is lowercased and case variants share a cap.
+    """
     found: list[str] = []
     for repo, number in _PR_URL_RE.findall(text or ""):
-        url = f"https://github.com/Cargo-Chief/{repo}/pull/{int(number)}"
+        url = f"https://github.com/Cargo-Chief/{repo.lower()}/pull/{int(number)}"
         if url not in found:
             found.append(url)
     return found
@@ -105,9 +128,9 @@ def lookup_pr(
     runner: Callable = subprocess.run,
     timeout: int = LOOKUP_TIMEOUT_SECONDS,
 ) -> PullRequestInfo:
-    wrapper = root / "docs" / "scripts" / "ops" / "with_github_app_token.py"
     command = [
-        python, str(wrapper), "--", "gh", "pr", "view", pr_url, "--json", "author,state",
+        python, str(github_wrapper_path(root)), "--",
+        "gh", "pr", "view", pr_url, "--json", "author,state",
     ]
     try:
         result = runner(
@@ -130,7 +153,10 @@ def lookup_pr(
 
 
 class ReviewCapStore:
-    """Accepted review turns per PR in a rolling window, persisted with atomic writes."""
+    """Accepted review turns per PR in a rolling window, persisted with atomic writes.
+
+    A record that exists but cannot be read raises CapStoreError rather than resetting the cap.
+    """
 
     def __init__(self, path: Path, *, window: int = CAP_WINDOW_SECONDS, clock: Callable = time.time):
         self.path = path
@@ -140,10 +166,18 @@ class ReviewCapStore:
 
     def _load(self) -> dict:
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError, OSError):
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return {}
-        return value if isinstance(value, dict) else {}
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CapStoreError(f"review cap record is unreadable: {type(exc).__name__}") from exc
+        try:
+            value = json.loads(text)
+        except ValueError as exc:
+            raise CapStoreError("review cap record is corrupt") from exc
+        if not isinstance(value, dict):
+            raise CapStoreError("review cap record is corrupt")
+        return value
 
     def _save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,6 +249,64 @@ class ThreadClaims:
             self._threads.discard(thread)
 
 
+class RequestThrottle:
+    """Bounded concurrent admissions (guards and lookups) and a per-requester rolling rate."""
+
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = MAX_CONCURRENT_ADMISSIONS,
+        per_requester: int = MAX_REQUESTS_PER_REQUESTER,
+        window: int = REQUESTER_WINDOW_SECONDS,
+        clock: Callable = time.monotonic,
+    ):
+        self.max_concurrent = max_concurrent
+        self.per_requester = per_requester
+        self.window = window
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._active = 0
+        self._requests: dict[str, deque] = {}
+
+    def try_begin(self, requester: str) -> bool:
+        """Count the request and take an admission slot; False when either limit is reached."""
+        with self._lock:
+            now = self.clock()
+            history = self._requests.setdefault(requester, deque())
+            while history and history[0] <= now - self.window:
+                history.popleft()
+            if len(history) >= self.per_requester or self._active >= self.max_concurrent:
+                return False
+            history.append(now)
+            self._active += 1
+            return True
+
+    def end(self) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+
+
+class RecentMentions:
+    """Slack can deliver one mention more than once; a (channel, ts) pair is handled once."""
+
+    def __init__(self, *, window: int = REDELIVERY_WINDOW_SECONDS, clock: Callable = time.monotonic):
+        self.window = window
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._seen: dict[tuple[str, str], float] = {}
+
+    def first_delivery(self, channel: str, ts: str) -> bool:
+        with self._lock:
+            now = self.clock()
+            for key in [key for key, at in self._seen.items() if at <= now - self.window]:
+                del self._seen[key]
+            key = (channel, ts)
+            if not ts or key in self._seen:
+                return not ts
+            self._seen[key] = now
+            return True
+
+
 def format_review_audit(*, user: str, channel: str, thread: str, pr: str | None, outcome: str) -> str:
     return " | ".join((
         "REVIEW_REQUEST", f"USER:{user or 'unknown'}", f"CHANNEL:{channel or 'unknown'}",
@@ -234,6 +326,62 @@ def build_review_task(pr_url: str) -> str:
     )
 
 
+def _thread(event: Mapping) -> str:
+    return event.get("thread_ts") or event.get("ts") or ""
+
+
+@dataclass
+class ReviewAdmission:
+    """A request that passed every guard. It is audited exactly once: accepted when the turn
+    starts (which is also when the cap is charged), or refused."""
+
+    event: dict
+    pr: str
+    policy: RoomPolicy
+    limit: int
+    caps: ReviewCapStore
+    post: Callable[[str, str, str], None]
+    audit: Callable[[str], None]
+    started: bool = False
+    closed: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def _record(self, outcome: str) -> None:
+        self.audit(format_review_audit(
+            user=self.event.get("user", ""), channel=self.event.get("channel", ""),
+            thread=_thread(self.event), pr=self.pr, outcome=outcome,
+        ))
+
+    def refuse(self, outcome: str, reply: str | None) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+        self._record(outcome)
+        if reply:
+            self.post(self.event.get("channel", ""), _thread(self.event), reply)
+
+    def start(self) -> bool:
+        """Charge the cap and audit acceptance; False (already refused) when the turn may not run."""
+        with self._lock:
+            if self.closed:
+                return False
+        try:
+            outcome = self.caps.admit(self.pr, self.limit)
+        except CapStoreError as exc:
+            logger.error(f"Review refused: {exc}")
+            self.refuse("refused_cap_store", CAP_STORE_REPLY)
+            return False
+        if outcome != "accepted":
+            self.refuse("refused_cap", CAP_REPLY if outcome == "notice" else None)
+            return False
+        with self._lock:
+            self.closed = True
+            self.started = True
+        self._record("accepted")
+        return True
+
+
 @dataclass
 class ReviewRequestHandler:
     """Intake and guards for mentions in a review-only room; Slack and turn effects are injected."""
@@ -241,6 +389,8 @@ class ReviewRequestHandler:
     bot_user_id: str
     caps: ReviewCapStore
     claims: ThreadClaims
+    throttle: RequestThrottle
+    recent: RecentMentions
     load_config: Callable[[], dict]
     post: Callable[[str, str, str], None]
     audit: Callable[[str], None]
@@ -248,22 +398,30 @@ class ReviewRequestHandler:
     run_control_command: Callable[[dict], bool]
     turn_running: Callable[[str], bool]
     provider_unavailable: Callable[[str], bool]
-    room_root: Callable[[str, str], Path]
+    room_policy: Callable[[str, str], RoomPolicy]
     lookup: Callable[[str, Path], PullRequestInfo]
-    start_turn: Callable[[dict, str], None]
+    start_turn: Callable[[ReviewAdmission], None]
     spawn: Callable[..., None]
+    wrapper_ready: Callable[[Path], bool] = github_wrapper_downscopes
 
     def _audit(self, event: dict, pr: str | None, outcome: str) -> None:
         self.audit(format_review_audit(
             user=event.get("user", ""), channel=event.get("channel", ""),
-            thread=event.get("thread_ts") or event.get("ts") or "", pr=pr, outcome=outcome,
+            thread=_thread(event), pr=pr, outcome=outcome,
         ))
 
     def _reply(self, event: dict, text: str) -> None:
-        self.post(event.get("channel", ""), event.get("thread_ts") or event.get("ts") or "", text)
+        self.post(event.get("channel", ""), _thread(event), text)
+
+    def _refuse(self, event: dict, pr: str | None, outcome: str, reply: str | None) -> None:
+        self._audit(event, pr, outcome)
+        if reply:
+            self._reply(event, reply)
 
     def intake(self, event: dict) -> None:
         """The fast part, run inside Slack's acknowledgement window."""
+        if not self.recent.first_delivery(event.get("channel", ""), event.get("ts", "")):
+            return
         config = self.load_config()
         try:
             peer: PeerReviewConfig | None = peer_review_config(config)
@@ -278,71 +436,85 @@ class ReviewRequestHandler:
         if human and self.is_authorized(event.get("user", "")) and self.run_control_command(event):
             return
         if peer is None:
-            self._audit(event, None, "refused_config")
-            if human:
-                self._reply(event, CONFIG_REPLY)
+            self._refuse(event, None, "refused_config", CONFIG_REPLY if human else None)
             return
         pr = single_pr_url(event.get("text", ""))
         if pr is None:
-            self._audit(event, None, "refused_no_pr")
-            if human:
-                self._reply(event, USAGE_HINT)
+            self._refuse(event, None, "refused_no_pr", USAGE_HINT if human else None)
             return
-        thread = event.get("thread_ts") or event.get("ts") or ""
+        thread = _thread(event)
         if self.turn_running(thread) or not self.claims.claim(thread):
-            self._audit(event, pr, "refused_busy")
-            self._reply(event, BUSY_REPLY)
+            self._refuse(event, pr, "refused_busy", BUSY_REPLY)
+            return
+        if not self.throttle.try_begin(event.get("user", "")):
+            self.claims.release(thread)
+            self._refuse(event, pr, "refused_throttle", THROTTLE_REPLY)
             return
         try:
             self.spawn(self.admit, event, pr, peer)
         except BaseException:
+            self.throttle.end()
             self.claims.release(thread)
             raise
 
-    def _over_cap(self, event: dict, pr: str, outcome: str) -> None:
-        self._audit(event, pr, "refused_cap")
-        if outcome == "notice":
-            self._reply(event, CAP_REPLY)
+    def _guard(self, event: dict, pr: str, peer: PeerReviewConfig) -> RoomPolicy | None:
+        """Every check before the turn; refuses (audit and reply) and returns None on failure."""
+        try:
+            policy = self.room_policy(event.get("channel", ""), event.get("user", ""))
+        except SafetyError as exc:
+            logger.error(f"Review request refused: {exc}")
+            self._refuse(event, pr, "refused_room", CONFIG_REPLY)
+            return None
+        if not policy.review_only:
+            self._refuse(event, pr, "refused_room", CONFIG_REPLY)
+            return None
+        if not self.wrapper_ready(policy.root):
+            self._refuse(event, pr, "refused_wrapper", WRAPPER_REPLY)
+            return None
+        try:
+            if self.caps.exhausted(pr, peer.max_reviews_per_pr):
+                outcome = self.caps.admit(pr, peer.max_reviews_per_pr)
+                self._refuse(event, pr, "refused_cap", CAP_REPLY if outcome == "notice" else None)
+                return None
+        except CapStoreError as exc:
+            logger.error(f"Review request refused: {exc}")
+            self._refuse(event, pr, "refused_cap_store", CAP_STORE_REPLY)
+            return None
+        if self.provider_unavailable(_thread(event)):
+            self._refuse(event, pr, "refused_provider", PROVIDER_REPLY)
+            return None
+        try:
+            info = self.lookup(pr, policy.root)
+        except ReviewGuardError as exc:
+            logger.warning(f"Review request refused for {pr}: {exc}")
+            self._refuse(event, pr, "refused_lookup", LOOKUP_FAILED_REPLY)
+            return None
+        if normalize_login(info.author) == normalize_login(peer.self_github_login):
+            self._refuse(event, pr, "refused_own_pr", OWN_PR_REPLY)
+            return None
+        if info.state != "OPEN":
+            self._refuse(event, pr, "refused_state", NOT_OPEN_REPLY)
+            return None
+        return policy
 
     def admit(self, event: dict, pr: str, peer: PeerReviewConfig) -> None:
-        """The slow part: guards, the cap, then the turn. Releases the thread claim."""
-        thread = event.get("thread_ts") or event.get("ts") or ""
+        """The slow part: guards, then the turn. Releases the admission slot and thread claim."""
+        thread = _thread(event)
         try:
-            limit = peer.max_reviews_per_pr
             try:
-                root = self.room_root(event.get("channel", ""), event.get("user", ""))
-            except SafetyError as exc:
-                logger.error(f"Review request refused: {exc}")
-                self._audit(event, pr, "refused_room")
-                self._reply(event, CONFIG_REPLY)
+                policy = self._guard(event, pr, peer)
+            finally:
+                self.throttle.end()
+            if policy is None:
                 return
-            if self.caps.exhausted(pr, limit):
-                self._over_cap(event, pr, self.caps.admit(pr, limit))
-                return
-            if self.provider_unavailable(thread):
-                self._audit(event, pr, "refused_provider")
-                self._reply(event, PROVIDER_REPLY)
-                return
+            admission = ReviewAdmission(
+                event=event, pr=pr, policy=policy, limit=peer.max_reviews_per_pr,
+                caps=self.caps, post=self.post, audit=self.audit,
+            )
             try:
-                info = self.lookup(pr, root)
-            except ReviewGuardError as exc:
-                logger.warning(f"Review request refused for {pr}: {exc}")
-                self._audit(event, pr, "refused_lookup")
-                self._reply(event, LOOKUP_FAILED_REPLY)
-                return
-            if normalize_login(info.author) == normalize_login(peer.self_github_login):
-                self._audit(event, pr, "refused_own_pr")
-                self._reply(event, OWN_PR_REPLY)
-                return
-            if info.state != "OPEN":
-                self._audit(event, pr, "refused_state")
-                self._reply(event, NOT_OPEN_REPLY)
-                return
-            outcome = self.caps.admit(pr, limit)
-            if outcome != "accepted":
-                self._over_cap(event, pr, outcome)
-                return
-            self._audit(event, pr, "accepted")
-            self.start_turn(event, pr)
+                self.start_turn(admission)
+            finally:
+                # Every admitted request ends in exactly one audit line.
+                admission.refuse("refused_error", ERROR_REPLY)
         finally:
             self.claims.release(thread)
