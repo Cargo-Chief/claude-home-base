@@ -701,6 +701,33 @@ def _delete_file_entries(db, file_path):
     db.execute("DELETE FROM documents WHERE file_path = ?", (file_path,))
 
 
+def pending_files(cfg):
+    """Count the files an incremental index would embed, without loading the model or writing."""
+    database = Path(cfg["database"])
+    indexed = {}
+    if database.is_file():
+        db = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+        try:
+            indexed = dict(db.execute("SELECT DISTINCT file_path, file_hash FROM documents").fetchall())
+        except sqlite3.OperationalError:
+            indexed = {}
+        finally:
+            db.close()
+
+    files = []
+    for dir_cfg in cfg["directories"]:
+        if not os.path.exists(dir_cfg["path"]):
+            continue
+        if dir_cfg["type"] == "markdown":
+            markdown_only = cfg.get("mode") in ("cargo-chief-docs", "agent-identity")
+            files.extend(enumerate_markdown_files(dir_cfg, markdown_only=markdown_only))
+        elif dir_cfg["type"] == "jsonl":
+            files.extend(os.path.join(dir_cfg["path"], f) for f in os.listdir(dir_cfg["path"])
+                         if f.endswith(".jsonl"))
+    to_embed = sum(1 for f in files if indexed.get(f) != file_hash(f))
+    return {"files": len(files), "indexed_files": len(indexed), "to_embed": to_embed}
+
+
 def reconcile_sources(db, source_files):
     """Remove chunks whose source or file is no longer admitted by configuration."""
     configured = set(source_files)
@@ -819,6 +846,9 @@ def search(cfg, query, source=None, limit=10):
     for doc_id in all_ids:
         fts = fts_results.get(doc_id, {})
         vec = vec_results.get(doc_id, {})
+        # A stale index can still hold chunks of deleted files; never serve them.
+        if not os.path.isfile(fts.get("file_path") or vec.get("file_path")):
+            continue
 
         fts_norm = fts.get("fts_score", 0) / max_fts
         vec_norm = vec.get("vec_score", 0) / max_vec
@@ -1029,6 +1059,7 @@ def main(argv=None):
     # Status command
     status_parser = subparsers.add_parser("status", help="Show index stats")
     status_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    subparsers.add_parser("pending", help="Count files an incremental index would embed")
     subparsers.add_parser("purge", help="Delete the configured index and SQLite sidecars")
     subparsers.add_parser("doctor", help="Validate config and SQLite extension support")
 
@@ -1059,6 +1090,8 @@ def _run(args, cfg):
             format_results(results)
     elif args.command == "status":
         show_status(cfg, as_json=args.json)
+    elif args.command == "pending":
+        print(json.dumps(pending_files(cfg)))
     elif args.command == "purge":
         removed = purge_index(cfg)
         print(json.dumps({"removed": removed}))

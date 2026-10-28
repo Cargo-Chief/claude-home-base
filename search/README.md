@@ -118,14 +118,16 @@ bash search/cargo_chief_search.sh search "why did we choose this architecture?" 
 `CARGO_CHIEF_SEARCH_PYTHON`, `CARGO_CHIEF_SEARCH_VENV`, and `CARGO_CHIEF_SEARCH_DIR` override the
 defaults for testing or a nonstandard installation. Before each `search`, the wrapper compares the
 canonical docs Git revision and index configuration fingerprint with the last successfully indexed
-revision. A match goes straight to retrieval. A mismatch with at most `CARGO_CHIEF_SEARCH_INLINE_LIMIT`
-(default 25) changed Markdown files runs the incremental reconciler first, at `nice` 10, then advances
-the private marker only after a zero-error refresh. A larger or unknown gap is not refreshed inline: the
-query runs against the existing index and stderr warns that it is stale and names the `index` command.
-With no marker at all, `search` exits 3 without building anything. A first build embeds every doc and
-can run past an hour, so it is an explicit `index` run, never a side effect of a query. A successful
-`index` or `rebuild` records the marker, and `purge` removes it. The wrapper never enables transcript
-search.
+revision. A match goes straight to retrieval. On a mismatch, `agent_search.py pending` counts the files an
+incremental index would actually embed: new or changed files under the configured sources, compared by
+content hash, so churn outside the index does not count. With no indexed files at all, `search` exits 3
+without building anything. A first build embeds every doc and takes a long time, so it is an explicit
+`index` run, never a side effect of a query. At most `CARGO_CHIEF_SEARCH_INLINE_LIMIT` (default 25) files
+refresh inline at `nice` 10 without waiting for another run's lock, and the marker advances only when that
+refresh succeeds. A larger gap, an unmeasurable one, or a failed or blocked refresh still answers from the
+existing index, with a stderr warning that names the `index` command. Search never returns chunks of a
+file that no longer exists. A successful `index` or `rebuild` records the marker; `rebuild` and a
+successful `purge` remove it. The wrapper never enables transcript search.
 
 ```bash
 bash search/cargo_chief_search.sh index
@@ -191,9 +193,9 @@ Then: `lsearch "your query here"`
 
 Cargo Chief search checks the docs revision before every query and refreshes small changes inline, so a
 nightly scheduler is not required for day-to-day freshness. Run `cargo_chief_search.sh index` yourself
-after a fresh install or a large docs pull; changed files replace their prior chunks, removed files are
-purged, and the run records the revision marker. Each file commits as it finishes, so an interrupted
-build resumes where it stopped.
+after a fresh install or when a search warns that the index is stale; changed files replace their prior
+chunks, removed files are purged, and the run records the revision marker. Each file commits as it
+finishes, so an interrupted build resumes where it stopped.
 
 ## Performance
 

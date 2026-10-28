@@ -282,6 +282,60 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
             search.get_db = original_get_db
             search.embed_texts = original_embed
 
+    def test_search_never_serves_chunks_of_deleted_files(self):
+        live = self.docs / "live.md"
+        live.write_text("live\n")
+        gone = str(self.docs / "gone.md")
+
+        class StaleDatabase:
+            def execute(self, sql, *_args):
+                if "documents_vec" in sql:
+                    rows = [(1, 0.1, str(live), "docs", "Live", 0, "live", None),
+                            (2, 0.2, gone, "docs", "Gone", 0, "gone", None)]
+                else:
+                    rows = [(2, gone, "docs", "Gone", 0, "gone", -3.0, None)]
+                return mock.Mock(fetchall=lambda: rows)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(search, "get_db", return_value=StaleDatabase()), \
+             mock.patch.object(search, "embed_texts", return_value=[[0.0] * 384]), \
+             mock.patch.object(search, "serialize_vec", return_value=b""):
+            results = search.search({"mode": "cargo-chief-docs"}, "anything")
+
+        self.assertEqual([str(live)], [r["file_path"] for r in results])
+
+    def test_pending_counts_new_and_changed_files_without_a_database(self):
+        (self.docs / "a.md").write_text("a\n")
+        (self.docs / "b.md").write_text("b\n")
+
+        self.assertEqual(
+            {"files": 2, "indexed_files": 0, "to_embed": 2},
+            search.pending_files(self.cfg),
+        )
+
+    def test_pending_skips_files_whose_hash_is_indexed(self):
+        a = self.docs / "a.md"
+        b = self.docs / "b.md"
+        a.write_text("a\n")
+        b.write_text("b\n")
+        self.runtime.mkdir()
+        db = sqlite3.connect(self.cfg["database"])
+        db.execute("CREATE TABLE documents (file_path TEXT, file_hash TEXT)")
+        db.executemany("INSERT INTO documents VALUES (?, ?)", [
+            (str(a.resolve()), search.file_hash(str(a.resolve()))),
+            (str(b.resolve()), "outdated"),
+            (str(self.docs / "deleted.md"), "x"),
+        ])
+        db.commit()
+        db.close()
+
+        self.assertEqual(
+            {"files": 2, "indexed_files": 3, "to_embed": 1},
+            search.pending_files(self.cfg),
+        )
+
     def test_main_releases_embedding_model_after_success(self):
         model = object()
         search._model = model
