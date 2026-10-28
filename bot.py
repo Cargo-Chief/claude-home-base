@@ -2472,14 +2472,10 @@ def process_message_async(event: dict) -> None:
                     session._turn_done,
                     inactivity_timeout=CLAUDE_TIMEOUT,
                     activity_at=lambda: session.turn_activity,
-                    delegate_active=lambda: bool(
-                        session.pending_tools.active()
-                        or session.delegation_tracker.has_running()
-                        or (session.workspace
-                            and governed_delegate_active(session.workspace.delegate_pid_file))
-                    ),
+                    delegate_active=lambda: _owner_turn_busy(session),
                     max_duration=max(0.001, turn_deadline - time.monotonic()),
                 ):
+                    timeout_limit = "hard" if time.monotonic() >= turn_deadline else "inactivity"
                     try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                     except Exception: pass
                     while session.pending_reactions:
@@ -2490,15 +2486,15 @@ def process_message_async(event: dict) -> None:
                             pass
                     if session.reporter:
                         session.reporter.finish(state="stopped")
-                    timeout_limit = "hard" if time.monotonic() >= turn_deadline else "inactivity"
                     stop_outcome = stop_timed_out_session(session, _interrupt_session)
                     minutes = CLAUDE_TIMEOUT // 60
                     slack_client.chat_postMessage(
                         channel=channel, thread_ts=thread_ts,
                         text=(
-                            f"Turn reached its {minutes}-minute inactivity limit or "
-                            f"{format_elapsed(MAX_TURN_RUNTIME)} hard limit; stopped. "
-                            "Working files and thread continuity were preserved; "
+                            (f"Turn went {minutes} minutes with no output and no tool running; stopped. "
+                             if timeout_limit == "inactivity" else
+                             f"Turn reached its {format_elapsed(MAX_TURN_RUNTIME)} hard limit; stopped. ")
+                            + "Working files and thread continuity were preserved; "
                             "tell me to resume when ready."
                             + ("" if stop_outcome != "still running"
                                else f" But I {_STILL_RUNNING_NOTE.format(pid=session.proc.pid)}.")
@@ -2581,6 +2577,13 @@ def process_message_async(event: dict) -> None:
 # ---------------------------------------------------------------------------
 # In-thread stop (the Esc key for Slack)
 # ---------------------------------------------------------------------------
+
+
+def _owner_turn_busy(session: LiveSession) -> bool:
+    """Work the turn is waiting on that streams nothing: a pending tool call or a governed delegate."""
+    if session.pending_tools.active():
+        return True
+    return bool(session.workspace and governed_delegate_active(session.workspace.delegate_pid_file))
 
 
 def _interrupt_session(session: LiveSession) -> str:

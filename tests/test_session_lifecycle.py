@@ -179,15 +179,26 @@ class SessionLifecycleTests(unittest.TestCase):
         ]}})
         self.assertFalse(tools.active())
 
-    def test_pending_tools_ignore_echoes_and_clear_per_turn(self):
+    def test_pending_tools_ignore_echoes_subagent_calls_and_clear_per_turn(self):
         tools = PendingTools()
         tools.observe({"type": "user", "message": {"content": "plain inbound text"}})
         tools.observe({"type": "system", "subtype": "init"})
         tools.observe({"type": "assistant", "parent_tool_use_id": "agent-1",
-                       "message": {"content": [{"type": "tool_use", "id": "t3"}]}})
+                       "message": {"content": [{"type": "tool_use", "id": "inner"}]}})
+        self.assertFalse(tools.active())
+        tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t3"}]}})
         self.assertTrue(tools.active())
         tools.clear()
         self.assertFalse(tools.active())
+
+    def test_a_call_stops_counting_after_its_max_age(self):
+        clock = FakeClock()
+        tools = PendingTools(max_age=30, clock=clock)
+        tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "hung"}]}})
+        clock.now = 29
+        self.assertTrue(tools.active())
+        clock.now = 30
+        self.assertFalse(tools.active(), "a hung or orphaned call must not hold the limit off for the whole turn")
 
     def test_a_quiet_tool_call_outlasts_the_inactivity_limit(self):
         clock = FakeClock()

@@ -76,11 +76,12 @@ class BotTurnStructureTest(unittest.TestCase):
             self.assertIn("close_process_tree(", source, name)
             self.assertNotIn(".kill()", source, name)
 
-    def test_owner_inactivity_counts_pending_tools_and_subagents(self):
+    def test_owner_inactivity_waits_on_the_busy_check_and_logs_the_limit(self):
         source = ast.unparse(self._function("process_message_async"))
-        self.assertIn("session.pending_tools.active()", source)
-        self.assertIn("session.delegation_tracker.has_running()", source)
+        self.assertIn("delegate_active=lambda: _owner_turn_busy(session)", source)
         self.assertIn("LIMIT:%s", source)
+        self.assertLess(source.index("timeout_limit ="), source.index("reactions_remove"),
+                        "the limit is read before any Slack call delays it")
         reader = ast.unparse(self._function("_reader_loop"))
         self.assertIn("session.pending_tools.observe(data)", reader)
 

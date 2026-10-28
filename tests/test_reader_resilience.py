@@ -17,6 +17,7 @@ from session_lifecycle import PendingTools, owner_stream_event_is_activity
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "_reader_loop", "_deliver_text", "_stop_unread_process", "_post_context_notice", "_track_context",
+    "_owner_turn_busy",
 )
 
 
@@ -89,6 +90,7 @@ def load_functions(**overrides):
         "_live_sessions": {},
         "slack_client": None,
         "stop_process_tree": _fake_stop_process_tree,
+        "governed_delegate_active": lambda pid_file: False,
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=constants + wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -266,6 +268,23 @@ class ReaderResilienceTest(unittest.TestCase):
         session = FakeSession([result()], alive=True)
         load_functions()["_reader_loop"](session)
         self.assertEqual([], session.proc.calls)
+
+
+class OwnerTurnBusyTest(unittest.TestCase):
+    def test_a_pending_owner_tool_call_keeps_the_turn_busy(self):
+        busy = load_functions()["_owner_turn_busy"]
+        session = FakeSession([])
+        self.assertFalse(busy(session))
+        session.pending_tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}})
+        self.assertTrue(busy(session))
+        session.pending_tools.observe({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}})
+        self.assertFalse(busy(session))
+
+    def test_a_live_governed_delegate_keeps_the_turn_busy(self):
+        busy = load_functions(governed_delegate_active=lambda pid_file: True)["_owner_turn_busy"]
+        session = FakeSession([])
+        session.workspace = type("Workspace", (), {"delegate_pid_file": Path("delegate.pid")})()
+        self.assertTrue(busy(session))
 
 
 class FakeSlack:
