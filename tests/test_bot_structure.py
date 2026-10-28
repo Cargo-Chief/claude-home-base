@@ -76,6 +76,14 @@ class BotTurnStructureTest(unittest.TestCase):
             self.assertIn("close_process_tree(", source, name)
             self.assertNotIn(".kill()", source, name)
 
+    def test_owner_inactivity_counts_pending_tools_and_subagents(self):
+        source = ast.unparse(self._function("process_message_async"))
+        self.assertIn("session.pending_tools.active()", source)
+        self.assertIn("session.delegation_tracker.has_running()", source)
+        self.assertIn("LIMIT:%s", source)
+        reader = ast.unparse(self._function("_reader_loop"))
+        self.assertIn("session.pending_tools.observe(data)", reader)
+
     def test_slack_posts_skip_previews_and_redelivered_events(self):
         source = (Path(__file__).parents[1] / "bot.py").read_text(encoding="utf-8")
         self.assertIn("slack_client = QuietWebClient(", source)

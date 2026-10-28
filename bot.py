@@ -101,6 +101,7 @@ from provider_control import (
 )
 from reply_routing import ReplyRouteStore
 from session_lifecycle import (
+    PendingTools,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -678,6 +679,7 @@ class LiveSession:
     pre_tool_text: list[str] = field(default_factory=list)
     workspace: ThreadWorkspace | None = None
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
+    pending_tools: PendingTools = field(default_factory=PendingTools)
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
     # Set while a stop kills this process tree, and set again once that stop is finished.
@@ -1098,6 +1100,7 @@ def _reader_loop(session: LiveSession) -> None:
                 if session.reporter:
                     session.reporter.activity()
             session.delegation_tracker.observe(data)
+            session.pending_tools.observe(data)
 
             if msg_type == "system":
                 sid = data.get("session_id")
@@ -1169,6 +1172,7 @@ def _reader_loop(session: LiveSession) -> None:
                             _deliver_text(session, text)
 
             elif msg_type == "result":
+                session.pending_tools.clear()
                 for record in session.delegation_tracker.finish_turn():
                     audit_logger.info(format_delegation_audit(
                         record,
@@ -2457,6 +2461,7 @@ def process_message_async(event: dict) -> None:
                     update_status=lambda ts, line: _update_status_line(channel, ts, line),
                 )
                 session.reporter.begin()
+                session.pending_tools.clear()
                 session._turn_done.clear()
                 if session.workspace:
                     cleanup_stale_delegate_pid(session.workspace.delegate_pid_file)
@@ -2468,8 +2473,10 @@ def process_message_async(event: dict) -> None:
                     inactivity_timeout=CLAUDE_TIMEOUT,
                     activity_at=lambda: session.turn_activity,
                     delegate_active=lambda: bool(
-                        session.workspace
-                        and governed_delegate_active(session.workspace.delegate_pid_file)
+                        session.pending_tools.active()
+                        or session.delegation_tracker.has_running()
+                        or (session.workspace
+                            and governed_delegate_active(session.workspace.delegate_pid_file))
                     ),
                     max_duration=max(0.001, turn_deadline - time.monotonic()),
                 ):
@@ -2483,6 +2490,7 @@ def process_message_async(event: dict) -> None:
                             pass
                     if session.reporter:
                         session.reporter.finish(state="stopped")
+                    timeout_limit = "hard" if time.monotonic() >= turn_deadline else "inactivity"
                     stop_outcome = stop_timed_out_session(session, _interrupt_session)
                     minutes = CLAUDE_TIMEOUT // 60
                     slack_client.chat_postMessage(
@@ -2498,8 +2506,9 @@ def process_message_async(event: dict) -> None:
                     )
                     logger.warning(
                         "TURN_TIMEOUT | USER:%s | CHANNEL:%s | THREAD:%s | "
-                        "STOP:%s | SESSION:%s",
+                        "LIMIT:%s | STOP:%s | SESSION:%s",
                         user_id, channel, thread_ts,
+                        timeout_limit,
                         stop_outcome,
                         session.session_id or "none",
                     )

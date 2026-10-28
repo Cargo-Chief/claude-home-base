@@ -96,6 +96,36 @@ def owner_stream_event_is_activity(event: Mapping[str, Any]) -> bool:
     )
 
 
+class PendingTools:
+    """Tool calls issued and not yet answered; a quiet long-running tool is still progress."""
+
+    def __init__(self) -> None:
+        self._ids: set[str] = set()
+        self._lock = threading.Lock()
+
+    def observe(self, event: Mapping[str, Any]) -> None:
+        content = event.get("message", {}).get("content") if isinstance(event.get("message"), Mapping) else None
+        if not isinstance(content, list):
+            return
+        with self._lock:
+            for block in content:
+                if not isinstance(block, Mapping):
+                    continue
+                if event.get("type") == "assistant" and block.get("type") == "tool_use" and block.get("id"):
+                    self._ids.add(str(block["id"]))
+                elif event.get("type") == "user" and block.get("type") == "tool_result":
+                    self._ids.discard(str(block.get("tool_use_id", "")))
+
+    def active(self) -> bool:
+        with self._lock:
+            return bool(self._ids)
+
+    def clear(self) -> None:
+        """A finished or interrupted turn leaves no call outstanding."""
+        with self._lock:
+            self._ids.clear()
+
+
 def stop_timed_out_session(session: Any, interrupt) -> str:
     """Silence a timed-out turn before interrupting it.
 

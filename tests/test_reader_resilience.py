@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from session_lifecycle import owner_stream_event_is_activity
+from session_lifecycle import PendingTools, owner_stream_event_is_activity
 
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
@@ -152,6 +152,7 @@ class FakeSession:
         self.workspace = None
         self.reporter = reporter
         self.delegation_tracker = FakeTracker()
+        self.pending_tools = PendingTools()
         self.escalation_message_file = None
         self.escalation_receipt_file = None
         self.private_escalation_pending = False
