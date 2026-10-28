@@ -20,4 +20,5 @@ fi
 "$venv_dir/bin/python" -m pip install -r "$script_dir/requirements.txt"
 
 echo "Installed Cargo Chief knowledge search at $venv_dir"
-echo "Next: export CARGO_CHIEF_ROOT, then run search/cargo_chief_search.sh doctor"
+echo "Next: export CARGO_CHIEF_ROOT, run search/cargo_chief_search.sh doctor, then build the index once with"
+echo "search/cargo_chief_search.sh index (search exits 3 until it exists)"

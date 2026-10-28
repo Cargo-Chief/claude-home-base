@@ -1,4 +1,6 @@
+import contextlib
 import fcntl
+import io
 import importlib.util
 import os
 import json
@@ -280,6 +282,77 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
             search.get_db = original_get_db
             search.embed_texts = original_embed
 
+    def test_search_never_serves_chunks_of_deleted_files(self):
+        live = self.docs / "live.md"
+        live.write_text("live\n")
+        gone = str(self.docs / "gone.md")
+
+        class StaleDatabase:
+            def execute(self, sql, *_args):
+                if "documents_vec" in sql:
+                    rows = [(1, 0.1, str(live), "docs", "Live", 0, "live", None),
+                            (2, 0.2, gone, "docs", "Gone", 0, "gone", None)]
+                else:
+                    rows = [(2, gone, "docs", "Gone", 0, "gone", -3.0, None)]
+                return mock.Mock(fetchall=lambda: rows)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(search, "get_db", return_value=StaleDatabase()), \
+             mock.patch.object(search, "embed_texts", return_value=[[0.0] * 384]), \
+             mock.patch.object(search, "serialize_vec", return_value=b""):
+            results = search.search({"mode": "cargo-chief-docs"}, "anything")
+
+        self.assertEqual([str(live)], [r["file_path"] for r in results])
+
+    def test_pending_counts_new_and_changed_files_without_a_database(self):
+        (self.docs / "a.md").write_text("a\n")
+        (self.docs / "b.md").write_text("b\n")
+
+        self.assertEqual(
+            {"files": 2, "indexed_files": 0, "to_embed": 2},
+            search.pending_files(self.cfg),
+        )
+
+    def test_pending_skips_files_whose_hash_is_indexed(self):
+        a = self.docs / "a.md"
+        b = self.docs / "b.md"
+        a.write_text("a\n")
+        b.write_text("b\n")
+        self.runtime.mkdir()
+        db = sqlite3.connect(self.cfg["database"])
+        db.execute("CREATE TABLE documents (file_path TEXT, file_hash TEXT)")
+        db.executemany("INSERT INTO documents VALUES (?, ?)", [
+            (str(a.resolve()), search.file_hash(str(a.resolve()))),
+            (str(b.resolve()), "outdated"),
+            (str(self.docs / "deleted.md"), "x"),
+        ])
+        db.commit()
+        db.close()
+
+        self.assertEqual(
+            {"files": 2, "indexed_files": 3, "to_embed": 1},
+            search.pending_files(self.cfg),
+        )
+
+    def test_pending_ignores_files_with_no_indexable_body(self):
+        (self.docs / "stub.md").write_text("---\ntitle: Stub\n---\n")
+
+        self.assertEqual(0, search.pending_files(self.cfg)["to_embed"])
+
+    def test_pending_prints_the_single_line_the_wrapper_parses(self):
+        (self.docs / "a.md").write_text("a\n")
+        stdout = io.StringIO()
+        with mock.patch.object(search, "load_config", return_value=self.cfg), \
+             contextlib.redirect_stdout(stdout):
+            search.main(["pending"])
+
+        line = stdout.getvalue()
+        self.assertEqual(1, line.count("\n"))
+        self.assertRegex(line, r'"to_embed": 1')
+        self.assertRegex(line, r'"indexed_files": 0')
+
     def test_main_releases_embedding_model_after_success(self):
         model = object()
         search._model = model
@@ -289,6 +362,20 @@ class CargoChiefSearchPolicyTest(unittest.TestCase):
             search.main(["status"])
         self.assertIsNone(search._model)
         collect.assert_called_once_with()
+
+    def test_model_loading_progress_stays_off_stdout(self):
+        fastembed = types.ModuleType("fastembed")
+        fastembed.TextEmbedding = lambda name: object()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        search._model = None
+        try:
+            with mock.patch.dict(sys.modules, {"fastembed": fastembed}), \
+                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                search.get_model()
+        finally:
+            search._model = None
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("Loading embedding model", stderr.getvalue())
 
     def test_main_releases_embedding_model_after_command_failure(self):
         search._model = object()
