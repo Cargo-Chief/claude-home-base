@@ -12,9 +12,30 @@ generated `AGENTS.md`, and a `CLAUDE.md` symlink to it. Room entries must explic
 root, permission mode, overlay, private escalation channel, primary model/effort, explicit OpenAI
 fallback, and role.
 
+A room entry may add `"review_only": true` (for example `#pr-reviews`, with
+`autonomous_overlay` pointing at the kit's `modes/review-only.md`). Plain posts there are ignored;
+a mention from any human member, or from a bot listed in `peer_review.peer_bot_user_ids`, carrying
+exactly one `https://github.com/Cargo-Chief/<repo>/pull/<n>` link starts a fresh, harness-built
+`cc-code-review high --comment` turn. The sender is marked `review_requester` with no approver
+authority, and the turn gets a read/PR-write GitHub token request, no AWS variables or Slack
+secrets, and extra deny rules. It never resumes, steers, escalates or registers a reply route, and
+`bot.py --escalate`, `--forward-to` and `/internal/forward` refuse review-only rooms server-side.
+Before the turn the harness refuses the agent's own PRs (`peer_review.self_github_login`), PRs that
+are not open, PRs it cannot look up, a GitHub wrapper too old to downscope its token, an unreadable
+cap record, and PRs past `peer_review.max_reviews_per_pr` (default 3, range 1–10) started turns in
+24 hours. At most two requests are admitted at once and each requester may make ten an hour; a
+redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line. A
+review-only room without a valid `peer_review.self_github_login` is refused.
+
+The sending side is `bot.py --request-review <PR URL>`, which normal turns are told about. It
+takes only the URL, checks that the PR is open and authored by this agent's own App, and posts
+`<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
+A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (`max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
+
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
-agent process. Claude remains primary; a room can move to its OpenAI fallback only after the
+agent process. The one exception is a mention in a review-only room, which any member or listed
+peer bot may send and which can only start the review turn above. Claude remains primary; a room can move to its OpenAI fallback only after the
 harness recognizes Claude's account credit-limit response.
 
 Secrets load from `~/.config/cargo-chief/home-base.env` by default, never from the checkout.

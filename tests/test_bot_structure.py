@@ -203,6 +203,34 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("tick_all(", heartbeat)
         self.assertIn("except Exception", heartbeat)
 
+    def test_review_only_rooms_divert_mentions_before_authorization(self):
+        mention = ast.unparse(self._function("handle_mention"))
+        self.assertLess(mention.index("is_review_only_room("), mention.index("_channel_allowed("))
+        self.assertLess(mention.index("_review_requests.intake(event)"), mention.index("is_authorized(user_id)"))
+
+    def test_review_turns_never_touch_reply_routes(self):
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("elif not authority.allows(user_id):", process)
+        self.assertLess(process.index("if not review:"), process.index("_reply_routes.claim("))
+        self.assertNotIn("_reply_routes.add", process)
+        self.assertLess(process.index("raise _ReviewBusy()"), process.index("_send_to_claude(session, text)"))
+
+    def test_escalation_and_forwarding_refuse_review_only_rooms_server_side(self):
+        main = ast.unparse(self._function("main"))
+        escalate = main.index("if args.escalate:")
+        self.assertIn("review_route_refusal(_load_model_config(), os.environ)", main[escalate:escalate + 200])
+        self.assertLess(main.index("if args.forward_to:"), main.index("if args.send:"))
+        endpoint = ast.unparse(self._function("register_forward_endpoint"))
+        self.assertLess(endpoint.index("forward_refusal("), endpoint.index("_add_forward("))
+
+    def test_request_review_cli_takes_only_the_url(self):
+        main = ast.unparse(self._function("main"))
+        self.assertLess(main.index("if args.request_review is not None:"), main.index("if args.send:"))
+        self.assertIn("request_peer_review(args.request_review, config=_load_model_config(), env=os.environ", main)
+
+    def test_review_lookup_uses_the_downscoped_env(self):
+        lookup = ast.unparse(self._function("_lookup_review_pr"))
+        self.assertIn("review_turn_env(claude_owner_env(os.environ))", lookup)
 
 if __name__ == "__main__":
     unittest.main()
