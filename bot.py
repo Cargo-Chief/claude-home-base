@@ -86,7 +86,7 @@ from agent_status import (
 )
 from delegation_observability import DelegationTracker, format_delegation_audit
 from turn_reporter import TurnReporter, format_elapsed, tick_all
-from process_control import stop_process_tree
+from process_control import close_process_tree, stop_process_tree
 from slack_transport import NoUnfurlMixin, RecentEvents
 from openai_fallback import (
     fallback_error_kind,
@@ -634,6 +634,7 @@ def _gc_forwards() -> None:
 # ---------------------------------------------------------------------------
 
 IDLE_TIMEOUT = 10800  # 3 hours — kill process if no messages
+STOP_WAIT_SECONDS = 30  # a tree stop takes at most its grace plus kill wait
 MAX_LIVE_SESSIONS = RUNTIME_POLICY.max_live_sessions
 _turn_admission = TurnAdmission(MAX_LIVE_SESSIONS)
 
@@ -679,6 +680,8 @@ class LiveSession:
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
+    # Set while a stop kills this process tree, and set again once that stop is finished.
+    stop_done: threading.Event | None = None
     # Set once output arrives with no turn running; cleared when the next turn starts
     after_turn_noticed: bool = False
 
@@ -1050,6 +1053,8 @@ def _track_context(session: LiveSession, data: dict) -> None:
 
 def _deliver_text(session: LiveSession, text: str) -> None:
     """Post turn text; a failed Slack call is logged so the reader keeps draining the process."""
+    if session.reporter:
+        session.reporter.delivered()
     try:
         session._on_text(text)
     except Exception as e:
@@ -1152,7 +1157,6 @@ def _reader_loop(session: LiveSession) -> None:
                     for text in text_blocks:
                         if (text.strip() == "SKIP" or is_claude_limit_notice(text)
                                 or _ATTACH_PATTERN.search(text)):
-                            session.reporter.delivered()
                             if session._on_text:
                                 _deliver_text(session, text)
                         else:
@@ -1278,7 +1282,7 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
     """Get an existing live session or create a new one for a thread."""
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
-        if session and session.proc.poll() is None:
+        if session and session.proc.poll() is None and not session.stop_done:
             session.last_activity = time.time()
             return session
 
@@ -1292,10 +1296,9 @@ def _get_or_create_live_session(thread_ts: str, channel: str, user_id: str = "")
             oldest = _live_sessions.pop(oldest_ts)
             logger.info(f"Evicting idle session for thread {oldest_ts} (pid={oldest.proc.pid})")
             try:
-                oldest.proc.stdin.close()
-                oldest.proc.wait(timeout=10)
-            except Exception:
-                stop_process_tree(oldest.proc)
+                close_process_tree(oldest.proc, oldest.proc.stdin.close, wait=10)
+            except Exception as e:
+                logger.warning(f"Could not stop evicted pid={oldest.proc.pid}: {e}")
 
         saved_session_id = _get_session(thread_ts)
         proc, workspace = _spawn_claude_process(
@@ -1357,10 +1360,9 @@ def _cleanup_idle_sessions() -> None:
         for ts, session in to_remove:
             logger.info(f"Cleaning up idle session for thread {ts} (pid={session.proc.pid})")
             try:
-                session.proc.stdin.close()
-                session.proc.wait(timeout=15)
-            except Exception:
-                stop_process_tree(session.proc)
+                close_process_tree(session.proc, session.proc.stdin.close, wait=15)
+            except Exception as e:
+                logger.warning(f"Could not stop idle pid={session.proc.pid}: {e}")
             if session.session_id:
                 _save_session(ts, session.session_id)
             with _live_sessions_lock:
@@ -2408,8 +2410,12 @@ def process_message_async(event: dict) -> None:
             # discarded when every live session is busy.
             with _live_sessions_lock:
                 session = _live_sessions.get(thread_ts)
-                if session and session.proc.poll() is not None:
-                    session = None
+            if session and session.stop_done:
+                # Never steer into a process being killed; once the stop ends, start a fresh one.
+                session.stop_done.wait(timeout=STOP_WAIT_SECONDS)
+                session = None
+            if session and session.proc.poll() is not None:
+                session = None
             if not (session and session.turn_lock.locked()):
                 _turn_admission.acquire(
                     lambda: _post_queue_notice(channel, thread_ts)
@@ -2520,7 +2526,8 @@ def process_message_async(event: dict) -> None:
                         )
 
                 # Check if the process died without producing a response
-                if not all_texts and not skip_detected and session.proc.poll() is not None:
+                if (not all_texts and not skip_detected and session.proc.poll() is not None
+                        and not (session.reporter and session.reporter.noticed_no_reply)):
                     try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                     except Exception: pass
                     logger.error(f"Claude process died without responding in thread {thread_ts}")
@@ -2585,11 +2592,14 @@ def _interrupt_session(session: LiveSession) -> str:
     if session._turn_done.wait(timeout=5):
         return "interrupted"
     # Interrupt didn't land — kill the tree; the thread resumes via --resume next message
+    session.stop_done = threading.Event()
     try:
         gone = stop_process_tree(session.proc)
     except Exception as e:
         logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
         gone = False
+    finally:
+        session.stop_done.set()
     session._turn_done.set()
     return "killed" if gone else "still running"
 
@@ -2604,11 +2614,14 @@ def _stop_background_delegates(session) -> None:
     """End a process whose owner turn is over but whose background subagents still run."""
     if session.reporter:
         session.reporter.mark_stopped()
+    session.stop_done = threading.Event()
     try:
         gone = stop_process_tree(session.proc)
     except Exception as e:
         logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
         gone = False
+    finally:
+        session.stop_done.set()
     note = ("stopped the background subagents; the thread resumes with full context on your next message"
             if gone else _STILL_RUNNING_NOTE.format(pid=session.proc.pid))
     try:

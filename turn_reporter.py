@@ -94,6 +94,7 @@ class TurnReporter:
         self.stopped = False
         self.seen_work = False
         self.answered = False
+        self.noticed_no_reply = False
         self.status_ts: str | None = None
         self.status_creating = False
         self.status_retry_at = 0.0
@@ -109,6 +110,7 @@ class TurnReporter:
             self.stopped = False
             self.seen_work = False
             self.answered = False
+            self.noticed_no_reply = False
             self.status_ts = None
             self.status_creating = False
             self.status_retry_at = 0.0
@@ -130,7 +132,7 @@ class TurnReporter:
             if is_for_human(text):
                 actions.append(lambda: self._post(text))
                 self.last_post = now
-                self.answered = text.lstrip().startswith(QUESTION_MARKER)
+                self.answered = self.answered or text.lstrip().startswith(QUESTION_MARKER)
             else:
                 self.tail.append(text)
                 line = step_line(text)
@@ -198,6 +200,7 @@ class TurnReporter:
                 for block in self.tail:
                     actions.append(lambda block=block: self._post(block))
                 if not self.tail and not self.answered and state == "done":
+                    self.noticed_no_reply = True
                     actions.append(lambda: self._post_notice(NO_REPLY_NOTICE))
             self.tail = []
             if self.status_ts:

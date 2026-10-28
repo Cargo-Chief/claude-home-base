@@ -106,6 +106,7 @@ class FakeTracker:
 class FakeReporter:
     def __init__(self, active=False):
         self.active = active
+        self.answered = False
         self.notes = []
         self.finished = []
 
@@ -115,17 +116,19 @@ class FakeReporter:
     def finish(self, **kwargs):
         self.finished.append(kwargs)
 
+    def delivered(self):
+        self.answered = True
+
     def activity(self):
         pass
 
 
 class FakeProc:
-    def __init__(self, events, *, alive=False, ignores_term=False, events_raise=None):
+    def __init__(self, events, *, alive=False, events_raise=None):
         self.lines = [json.dumps(event) + "\n" for event in events]
         self.events_raise = events_raise
         self.pid = 4242
         self.alive = alive
-        self.ignores_term = ignores_term
         self.calls = []
 
     @property
@@ -137,20 +140,6 @@ class FakeProc:
     def poll(self):
         return None if self.alive else 0
 
-    def terminate(self):
-        self.calls.append("terminate")
-        if not self.ignores_term:
-            self.alive = False
-
-    def wait(self, timeout=None):
-        self.calls.append("wait")
-        if self.alive:
-            raise subprocess.TimeoutExpired("claude", timeout)
-        return 0
-
-    def kill(self):
-        self.calls.append("kill")
-        self.alive = False
 
 
 class FakeSession:
@@ -256,11 +245,13 @@ class ReaderResilienceTest(unittest.TestCase):
         self.assertEqual([("registered", False, "done", False)], order)
         self.assertTrue(session._turn_done.is_set())
 
-    def test_a_failed_reader_stops_the_whole_process_tree(self):
-        # Escalation to SIGKILL is process_control's job; see test_process_control.
-        session = FakeSession([], alive=True, ignores_term=True, events_raise=OSError("pipe"))
+    def test_a_tool_free_reply_counts_as_delivered(self):
+        posted = []
+        reporter = FakeReporter(active=True)
+        session = FakeSession([assistant_text("Plain answer"), result()], on_text=posted.append, reporter=reporter)
         load_functions()["_reader_loop"](session)
-        self.assertEqual(["stop_tree"], session.proc.calls)
+        self.assertEqual(["Plain answer"], posted)
+        self.assertTrue(reporter.answered, "finish() would post the no-reply notice under a real reply")
 
     def test_a_stop_that_raises_still_ends_the_reader(self):
         def broken(proc):

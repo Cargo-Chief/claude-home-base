@@ -99,6 +99,7 @@ class TurnReporterTest(unittest.TestCase):
 
         self.assertEqual([], slack.posts)
         self.assertEqual([NO_REPLY_NOTICE], slack.notices)
+        self.assertTrue(turn.noticed_no_reply)
 
     def test_no_notice_when_the_turn_asked_a_question_or_the_harness_posted(self):
         turn, slack, _ = reporter()
@@ -111,6 +112,15 @@ class TurnReporterTest(unittest.TestCase):
         turn.delivered()
         turn.finish()
         self.assertEqual([], slack.notices)
+
+    def test_a_later_comment_does_not_cancel_an_earlier_question(self):
+        turn, slack, _ = reporter()
+        turn.text("❓ Merge now or wait for your review?")
+        turn.text("💬 Meanwhile checking CI")
+        turn.tool_used()
+        turn.finish()
+        self.assertEqual([], slack.notices)
+        self.assertFalse(turn.noticed_no_reply)
 
     def test_a_comment_alone_is_not_a_reply(self):
         turn, slack, _ = reporter()
