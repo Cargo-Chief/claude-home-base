@@ -27,6 +27,11 @@ cap record, and PRs past `peer_review.max_reviews_per_pr` (default 3, range 1–
 redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line. A
 review-only room without a valid `peer_review.self_github_login` is refused.
 
+The sending side is `bot.py --request-review <PR URL>`, which normal turns are told about. It
+takes only the URL, checks that the PR is open and authored by this agent's own App, and posts
+`<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
+A review turn cannot run it. Each call writes a `REVIEW_REQUEST_SENT` audit line.
+
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
 agent process. The one exception is a mention in a review-only room, which any member or listed

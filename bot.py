@@ -116,8 +116,10 @@ from review_requests import (
     RequestThrottle,
     ReviewAdmission,
     ReviewCapStore,
+    PeerRequestError,
     ReviewRequestHandler,
     ThreadClaims,
+    request_peer_review,
     build_review_task,
     lookup_pr,
 )
@@ -2354,6 +2356,12 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
     elif room_policy.review_only:
         # Every turn in a review-only room is an admitted review.
         log_unauthorized(event)
+        if forward:
+            # A route saved before its room became review-only is closed, and says so.
+            slack_client.chat_postMessage(
+                channel=reaction_channel, thread_ts=original_thread,
+                text="This private decision is already closed.",
+            )
         return
 
     use_openai = use_openai_provider(
@@ -3428,6 +3436,10 @@ def main():
         help="When a reply lands in this new DM thread, route it into the live session for THREAD_TS instead of starting a new conversation. Requires the running bot server to have a live session for THREAD_TS.",
     )
     parser.add_argument(
+        "--request-review", metavar="PR_URL", dest="request_review",
+        help="Ask the configured peer agent to review this agent's own open Cargo-Chief PR",
+    )
+    parser.add_argument(
         "--session-id", metavar="SESSION_ID", dest="session_id",
         help="Register this Claude session_id as the resume target for replies in this DM thread. Use for cron jobs that DM someone, exit, and want to continue where they left off when the person replies.",
     )
@@ -3437,6 +3449,20 @@ def main():
         parser.error("--request-reboot-status accepts no other argument")
 
     # CLI modes — send and exit
+    if args.request_review is not None:
+        try:
+            room = request_peer_review(
+                args.request_review,
+                config=_load_model_config(),
+                env=os.environ,
+                lookup=_lookup_review_pr,
+                post=lambda channel, text: slack_client.chat_postMessage(channel=channel, text=text),
+                audit=audit_logger.info,
+            )
+        except PeerRequestError as exc:
+            raise SystemExit(f"review request refused: {exc}") from exc
+        print(f"review requested in {room}")
+        return
     if args.forward_to:
         refusal = review_route_refusal(_load_model_config(), os.environ)
         if refusal:

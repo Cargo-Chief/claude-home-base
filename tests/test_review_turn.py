@@ -122,9 +122,7 @@ class Room:
         overlay.write_text("review only\n")
         wrapper = self.root / "docs" / "scripts" / "ops" / "with_github_app_token.py"
         wrapper.parent.mkdir(parents=True)
-        wrapper.write_text(
-            f'PERMISSIONS_ENV = "{TOKEN_PERMISSIONS_ENV}"\n' if wrapper_downscopes else "print()\n"
-        )
+        wrapper.write_text('PERMISSIONS_ENV = "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS"\\ndef requested_permissions(env=None):\\n    pass\\nMESSAGE = "GitHub granted more than the requested permissions"\\n' if wrapper_downscopes else "print()\n")
         self.policy = RoomPolicy(
             root=self.root, permission_mode="auto", overlay=overlay, escalation_channel="DAPPROVER",
             backend="claude", model="claude-opus-5-5", effort="high", role="eng",
@@ -306,6 +304,20 @@ class ProcessReviewTest(unittest.TestCase):
         event = {"user": "UKIRK", "channel": "CREVIEWS", "ts": "1.1", "text": "do work"}
         self.run_turn(event=event)
         self.assertEqual([event], self.unauthorized)
+        self.assertEqual([], self.created)
+
+    def test_saved_route_into_a_review_only_room_is_closed_aloud(self):
+        posted = []
+        self.ns["_reply_routes"].claim.return_value = mock.MagicMock(
+            status="routed", route={"thread": "1.1", "channel": "CREVIEWS"},
+        )
+        self.ns["slack_client"].chat_postMessage.side_effect = lambda **kwargs: posted.append(kwargs)
+        event = {"user": "UKIRK", "channel": "DAPPROVER", "ts": "5.5", "thread_ts": "5.0", "text": "yes"}
+        self.run_turn(event=event)
+        self.assertEqual(
+            [{"channel": "DAPPROVER", "thread_ts": "5.0", "text": "This private decision is already closed."}],
+            posted,
+        )
         self.assertEqual([], self.created)
 
     def test_room_flipped_after_admission_refuses_with_a_reply(self):

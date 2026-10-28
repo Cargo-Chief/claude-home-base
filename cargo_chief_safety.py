@@ -1063,13 +1063,30 @@ REVIEW_ONLY_DENY_RULES = (
     "Bash(*CARGO_CHIEF_REVIEW_ONLY*)",
     "Bash(*github-app.env*)",
     "Bash(*.pem*)",
+    "Bash(*env -i*)",
+    "Bash(env *)",
+    "Bash(*unset *)",
+    "Bash(*pulls/*/reviews*)",
+    "Bash(*/merge*)",
+    "Bash(*state=closed*)",
+    "Bash(*-X PATCH*)",
+    "Bash(*--method PATCH*)",
 )
+
+
+REVIEW_KEPT_SECRET_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN",)
+_SECRET_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_SECRET_KEY", "_PASSWORD")
 
 
 def _review_strips(key: str) -> bool:
     if key.startswith("AWS_") or key in REVIEW_STRIPPED_ENV_KEYS:
         return True
-    # The harness posts the turn's replies; bot.py loads its own env file when the child runs it.
+    # Claude's own credentials stay; every other provider or service secret goes. The harness posts
+    # the turn's replies, and bot.py loads its own env file when the child runs it.
+    if key in REVIEW_KEPT_SECRET_KEYS or key.startswith("ANTHROPIC_"):
+        return False
+    if key.endswith(_SECRET_SUFFIXES):
+        return True
     return key.startswith("SLACK_") and any(part in key for part in ("TOKEN", "SECRET", "KEY"))
 
 
@@ -1085,12 +1102,24 @@ def github_wrapper_path(root: Path) -> Path:
     return root / "docs" / "scripts" / "ops" / "with_github_app_token.py"
 
 
+_WRAPPER_DOWNSCOPE_MARKERS = (
+    TOKEN_PERMISSIONS_ENV,
+    "def requested_permissions(",
+    "granted more than the requested permissions",
+)
+
+
 def github_wrapper_downscopes(root: Path) -> bool:
-    """Whether the room's App wrapper honours the token-permissions request; unreadable means no."""
+    """Whether the room's App wrapper honours the token-permissions request; unreadable means no.
+
+    Looks for the request reader and the grant check in code, so a comment mentioning them is not enough.
+    """
     try:
-        return TOKEN_PERMISSIONS_ENV in github_wrapper_path(root).read_text(encoding="utf-8")
+        source = github_wrapper_path(root).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
+    code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+    return all(marker in code for marker in _WRAPPER_DOWNSCOPE_MARKERS)
 
 
 def review_route_refusal(config: object, env: Mapping[str, str]) -> str | None:
@@ -1307,7 +1336,11 @@ def _build_harness_prompt(
         f"{delegation}\n"
         "- When a normal worktree_task.sh run creates a ticket bundle for this thread, write only "
         f"its bundle directory name (CN-####-lowercase-slug) to {bundle_claim_file}. The harness "
-        "validates ownership, safety, and the live-bundle cap before persisting the mapping."
+        "validates ownership, safety, and the live-bundle cap before persisting the mapping.\n"
+        "- To request a peer review of your own open PR, run exactly:\n"
+        f"  {shlex.quote(str(transport_python))} {shlex.quote(str(transport_script))} "
+        "--request-review <PR URL>\n"
+        "  The peer agent reviews it and posts its findings on the PR."
     )
 
 

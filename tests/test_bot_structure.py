@@ -223,6 +223,11 @@ class BotTurnStructureTest(unittest.TestCase):
         endpoint = ast.unparse(self._function("register_forward_endpoint"))
         self.assertLess(endpoint.index("forward_refusal("), endpoint.index("_add_forward("))
 
+    def test_request_review_cli_takes_only_the_url(self):
+        main = ast.unparse(self._function("main"))
+        self.assertLess(main.index("if args.request_review is not None:"), main.index("if args.send:"))
+        self.assertIn("request_peer_review(args.request_review, config=_load_model_config(), env=os.environ", main)
+
     def test_review_lookup_uses_the_downscoped_env(self):
         lookup = ast.unparse(self._function("_lookup_review_pr"))
         self.assertIn("review_turn_env(claude_owner_env(os.environ))", lookup)

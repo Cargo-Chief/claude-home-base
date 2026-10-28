@@ -24,6 +24,7 @@ from review_requests import (
     LOOKUP_FAILED_REPLY,
     NOT_OPEN_REPLY,
     OWN_PR_REPLY,
+    PeerRequestError,
     PEER_BOT,
     PROVIDER_REPLY,
     USAGE_HINT,
@@ -38,6 +39,7 @@ from review_requests import (
     lookup_pr,
     normalize_login,
     pr_urls,
+    request_peer_review,
     single_pr_url,
 )
 
@@ -222,18 +224,35 @@ class ThrottleTest(unittest.TestCase):
         self.assertTrue(throttle.try_begin("U1"))
         self.assertTrue(throttle.try_begin("U2"))
         self.assertFalse(throttle.try_begin("U3"))
-        throttle.end()
+        throttle.end("U1")
         self.assertTrue(throttle.try_begin("U3"))
+
+    def test_a_requester_holds_one_slot_at_a_time(self):
+        throttle = RequestThrottle(max_concurrent=2, clock=lambda: 0)
+        self.assertTrue(throttle.try_begin("U1"))
+        self.assertFalse(throttle.try_begin("U1"))
+        self.assertTrue(throttle.try_begin("U2"))
+        throttle.end("U1")
+        self.assertTrue(throttle.try_begin("U1"))
+
+    def test_expired_requesters_are_pruned(self):
+        now = [0.0]
+        throttle = RequestThrottle(window=10, clock=lambda: now[0])
+        self.assertTrue(throttle.try_begin("U1"))
+        throttle.end("U1")
+        now[0] = 11
+        self.assertTrue(throttle.try_begin("U2"))
+        self.assertEqual({"U2"}, set(throttle._requests))
 
     def test_per_requester_rate_rolls(self):
         now = [0.0]
         throttle = RequestThrottle(per_requester=2, window=3600, clock=lambda: now[0])
         for _ in range(2):
             self.assertTrue(throttle.try_begin("U1"))
-            throttle.end()
+            throttle.end("U1")
         self.assertFalse(throttle.try_begin("U1"))
         self.assertTrue(throttle.try_begin("U2"))
-        throttle.end()
+        throttle.end("U2")
         now[0] = 3601
         self.assertTrue(throttle.try_begin("U1"))
 
@@ -494,3 +513,89 @@ class HandlerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PeerRequestTest(unittest.TestCase):
+    def setUp(self):
+        self.posts = []
+        self.audits = []
+        self.lookups = []
+        self.info = PullRequestInfo("app/lisa-cargochief", "OPEN")
+        room = {
+            "root": "/workspace", "permission_mode": "auto",
+            "autonomous_overlay": "agent-kit/modes/review-only.md",
+            "private_escalation_channel": "DAPPROVER", "backend": "claude",
+            "model": "claude-opus-5-5", "effort": "high",
+            "fallback": {"backend": "codex", "model": "gpt-6-sol", "effort": "high"},
+            "review_only": True,
+        }
+        self.config = {
+            "models": ["claude-opus-5-5"],
+            "channels": {"CREVIEWS": room, "CWORK": {**room, "review_only": False}},
+            "peer_review": {"self_github_login": "lisa-cargochief[bot]", "peer_bot_user_ids": ["UNED"]},
+        }
+
+    def lookup(self, pr, root):
+        self.lookups.append((pr, root))
+        return self.info
+
+    def request(self, text=PR, env=None):
+        return request_peer_review(
+            text, config=self.config, env=env or {"CLAUDE_CHANNEL_ID": "CWORK"}, lookup=self.lookup,
+            post=lambda channel, message: self.posts.append((channel, message)),
+            audit=self.audits.append,
+        )
+
+    def refused(self, outcome, **kwargs):
+        with self.assertRaises(PeerRequestError) as caught:
+            self.request(**kwargs)
+        self.assertEqual(outcome, caught.exception.outcome)
+        self.assertEqual([], self.posts)
+        self.assertTrue(self.audits[-1].endswith(f"OUTCOME:{outcome}"), self.audits[-1])
+
+    def test_happy_path_posts_the_fixed_mention_in_the_review_room(self):
+        self.assertEqual("CREVIEWS", self.request(f"<{PR}|c4#123>"))
+        self.assertEqual([("CREVIEWS", f"<@UNED> please review {PR}")], self.posts)
+        self.assertEqual([(PR, Path("/workspace"))], self.lookups)
+        self.assertEqual([f"REVIEW_REQUEST_SENT | PR:{PR} | OUTCOME:sent"], self.audits)
+
+    def test_needs_exactly_one_pr_url(self):
+        self.refused("refused_no_pr", text="please review my PR")
+        self.refused("refused_no_pr", text=f"{PR} https://github.com/Cargo-Chief/c4/pull/9")
+        self.assertIn("PR:none", self.audits[0])
+
+    def test_a_review_turn_cannot_request_reviews(self):
+        self.refused("refused_review_turn", env={"CLAUDE_CHANNEL_ID": "CWORK", "CARGO_CHIEF_REVIEW_ONLY": "1"})
+        self.refused("refused_review_turn", env={"CLAUDE_CHANNEL_ID": "CREVIEWS"})
+        self.assertEqual([], self.lookups)
+
+    def test_only_this_agents_own_pr(self):
+        self.info = PullRequestInfo("kfranzenCC", "OPEN")
+        self.refused("refused_not_own_pr")
+
+    def test_closed_pr_and_failed_lookup_are_refused(self):
+        self.info = PullRequestInfo("lisa-cargochief[bot]", "MERGED")
+        self.refused("refused_state")
+
+        def failing(pr, root):
+            raise ReviewGuardError("PR lookup exited 1")
+
+        self.lookup = failing
+        self.refused("refused_lookup")
+
+    def test_needs_exactly_one_peer(self):
+        self.config["peer_review"]["peer_bot_user_ids"] = []
+        self.refused("refused_peer")
+        self.config["peer_review"]["peer_bot_user_ids"] = ["UNED", "UOTHER"]
+        self.refused("refused_peer")
+
+    def test_needs_exactly_one_review_room(self):
+        self.config["channels"]["CREVIEWS2"] = dict(self.config["channels"]["CREVIEWS"])
+        self.refused("refused_room")
+        del self.config["channels"]["CREVIEWS2"]
+        self.config["channels"]["CREVIEWS"]["review_only"] = False
+        self.refused("refused_room")
+
+    def test_invalid_peer_config_is_refused(self):
+        del self.config["peer_review"]["self_github_login"]
+        self.refused("refused_config")

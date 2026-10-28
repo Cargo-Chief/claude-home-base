@@ -25,7 +25,10 @@ from cargo_chief_safety import (
     SafetyError,
     github_wrapper_downscopes,
     github_wrapper_path,
+    is_review_only_room,
     peer_review_config,
+    resolve_room_policy,
+    review_route_refusal,
 )
 
 
@@ -250,7 +253,10 @@ class ThreadClaims:
 
 
 class RequestThrottle:
-    """Bounded concurrent admissions (guards and lookups) and a per-requester rolling rate."""
+    """Bounded concurrent admissions (guards and lookups) and a per-requester rolling rate.
+
+    A requester holds at most one admission slot at a time.
+    """
 
     def __init__(
         self,
@@ -265,25 +271,41 @@ class RequestThrottle:
         self.window = window
         self.clock = clock
         self._lock = threading.Lock()
-        self._active = 0
+        self._active: dict[str, int] = {}
         self._requests: dict[str, deque] = {}
 
-    def try_begin(self, requester: str) -> bool:
-        """Count the request and take an admission slot; False when either limit is reached."""
-        with self._lock:
-            now = self.clock()
-            history = self._requests.setdefault(requester, deque())
+    def _prune(self, now: float) -> None:
+        for requester in list(self._requests):
+            history = self._requests[requester]
             while history and history[0] <= now - self.window:
                 history.popleft()
-            if len(history) >= self.per_requester or self._active >= self.max_concurrent:
+            if not history:
+                del self._requests[requester]
+
+    def try_begin(self, requester: str) -> bool:
+        """Count the request and take an admission slot; False when any limit is reached."""
+        with self._lock:
+            now = self.clock()
+            self._prune(now)
+            history = self._requests.get(requester, deque())
+            if (
+                len(history) >= self.per_requester
+                or self._active.get(requester, 0) >= 1
+                or sum(self._active.values()) >= self.max_concurrent
+            ):
                 return False
             history.append(now)
-            self._active += 1
+            self._requests[requester] = history
+            self._active[requester] = self._active.get(requester, 0) + 1
             return True
 
-    def end(self) -> None:
+    def end(self, requester: str) -> None:
         with self._lock:
-            self._active = max(0, self._active - 1)
+            remaining = self._active.get(requester, 0) - 1
+            if remaining > 0:
+                self._active[requester] = remaining
+            else:
+                self._active.pop(requester, None)
 
 
 class RecentMentions:
@@ -453,7 +475,7 @@ class ReviewRequestHandler:
         try:
             self.spawn(self.admit, event, pr, peer)
         except BaseException:
-            self.throttle.end()
+            self.throttle.end(event.get("user", ""))
             self.claims.release(thread)
             raise
 
@@ -504,7 +526,7 @@ class ReviewRequestHandler:
             try:
                 policy = self._guard(event, pr, peer)
             finally:
-                self.throttle.end()
+                self.throttle.end(event.get("user", ""))
             if policy is None:
                 return
             admission = ReviewAdmission(
@@ -518,3 +540,71 @@ class ReviewRequestHandler:
                 admission.refuse("refused_error", ERROR_REPLY)
         finally:
             self.claims.release(thread)
+
+
+class PeerRequestError(RuntimeError):
+    """A peer-review request this agent must not send; the message says why."""
+
+    def __init__(self, outcome: str, message: str):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+def format_sent_audit(*, pr: str | None, outcome: str) -> str:
+    return f"REVIEW_REQUEST_SENT | PR:{pr or 'none'} | OUTCOME:{outcome}"
+
+
+def request_peer_review(
+    url_text: str,
+    *,
+    config: Mapping,
+    env: Mapping[str, str],
+    lookup: Callable[[str, Path], PullRequestInfo],
+    post: Callable[[str, str], None],
+    audit: Callable[[str], None],
+) -> str:
+    """Ask the configured peer to review this agent's own open PR in the review-only room.
+
+    The caller supplies only the URL; the room and the mention come from config. Returns the room ID.
+    """
+    pr: str | None = None
+    try:
+        refusal = review_route_refusal(config, env)
+        if refusal:
+            raise PeerRequestError("refused_review_turn", "a review turn cannot request reviews")
+        urls = pr_urls(url_text)
+        if len(urls) != 1:
+            raise PeerRequestError("refused_no_pr", "give exactly one https://github.com/Cargo-Chief/<repo>/pull/<n> URL")
+        pr = urls[0]
+        channels = config.get("channels") if isinstance(config, Mapping) else None
+        rooms = [
+            str(channel) for channel in (channels if isinstance(channels, Mapping) else {})
+            if is_review_only_room(config, str(channel))
+        ]
+        if len(rooms) != 1:
+            raise PeerRequestError("refused_room", f"expected exactly one review-only room, found {len(rooms)}")
+        room = rooms[0]
+        try:
+            peer = peer_review_config(config)
+            policy = resolve_room_policy(dict(config), room, "")
+        except SafetyError as exc:
+            raise PeerRequestError("refused_config", str(exc)) from exc
+        if len(peer.peer_bot_user_ids) != 1:
+            raise PeerRequestError(
+                "refused_peer", f"expected exactly one peer bot, found {len(peer.peer_bot_user_ids)}"
+            )
+        (peer_id,) = peer.peer_bot_user_ids
+        try:
+            info = lookup(pr, policy.root)
+        except ReviewGuardError as exc:
+            raise PeerRequestError("refused_lookup", f"could not check the PR: {exc}") from exc
+        if normalize_login(info.author) != normalize_login(peer.self_github_login):
+            raise PeerRequestError("refused_not_own_pr", "request reviews only of your own PRs")
+        if info.state != "OPEN":
+            raise PeerRequestError("refused_state", "the PR is not open")
+        post(room, f"<@{peer_id}> please review {pr}")
+    except PeerRequestError as exc:
+        audit(format_sent_audit(pr=pr, outcome=exc.outcome))
+        raise
+    audit(format_sent_audit(pr=pr, outcome="sent"))
+    return room

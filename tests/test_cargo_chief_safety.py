@@ -1,4 +1,6 @@
 import dataclasses
+import fnmatch
+import re
 import json
 import os
 from pathlib import Path
@@ -1035,9 +1037,13 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "x", "AWS_SESSION_TOKEN": "x",
             "CC_AWS_PROFILE": "kirk", "SLACK_BOT_TOKEN": "x", "SLACK_SIGNING_SECRET": "x",
             "SLACK_APP_TOKEN": "x", "CLAUDE_CODE_OAUTH_TOKEN": "keep",
+            "OPENAI_API_KEY": "x", "GEMINI_API_KEY": "x", "DD_API_KEY": "x", "GH_TOKEN": "x",
+            "GITHUB_TOKEN": "x", "SOME_SERVICE_SECRET": "x", "DB_PASSWORD": "x",
+            "ANTHROPIC_API_KEY": "keep-anthropic",
         }
         env = review_turn_env(base)
         self.assertEqual("keep", env.pop("CLAUDE_CODE_OAUTH_TOKEN"))
+        self.assertEqual("keep-anthropic", env.pop("ANTHROPIC_API_KEY"))
         self.assertEqual({
             "PATH": "/usr/bin",
             "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS": '{"contents":"read","pull_requests":"write"}',
@@ -1066,6 +1072,48 @@ class ReviewOnlyRoomTest(unittest.TestCase):
         ):
             self.assertTrue(any(needle in rule for rule in REVIEW_ONLY_DENY_RULES), needle)
 
+    def test_deny_rules_block_writes_and_allow_review_posting(self):
+        # Claude Code's Bash rule semantics, as mirrored by agent-kit's
+        # permissions/test_install_permissions.py bash_rule_matches: a whole-string fnmatch glob
+        # over each subcommand split on shell separators.
+        separators = re.compile(r"\s*(?:&&|\|\||\|&|;|\||&|\n)\s*")
+
+        def denied(command):
+            return [
+                rule for rule in REVIEW_ONLY_DENY_RULES
+                for sub in separators.split(command) if sub.strip()
+                if fnmatch.fnmatchcase(sub.strip(), rule[len("Bash("):-1])
+            ]
+
+        wrap = "/venv/bin/python /root/docs/scripts/ops/with_github_app_token.py -- "
+        for allowed in (
+            wrap + "gh api repos/Cargo-Chief/c4/pulls/4250/comments --input /root/work/run/c1.json",
+            wrap + "gh api repos/Cargo-Chief/c4/pulls/4250/comments/123/replies --input /root/work/run/r.json",
+            wrap + "gh pr view https://github.com/Cargo-Chief/c4/pull/4250 --json files,headRefOid",
+            wrap + "gh pr diff 4250 --repo Cargo-Chief/c4",
+            "git -C /root/repos/c4 fetch origin pull/4250/head",
+        ):
+            with self.subTest(allowed=allowed):
+                self.assertEqual([], denied(allowed))
+        for blocked in (
+            wrap + "git push origin HEAD",
+            wrap + "gh pr merge 4250 --squash",
+            wrap + "gh pr review 4250 --approve",
+            wrap + "gh api repos/Cargo-Chief/c4/pulls/4250/reviews -f event=APPROVE",
+            wrap + "gh api repos/Cargo-Chief/c4/pulls/4250/merge -X PUT",
+            wrap + "gh api repos/Cargo-Chief/c4/pulls/4250 -X PATCH -f state=closed",
+            wrap + "gh api --method PATCH repos/Cargo-Chief/c4/pulls/4250",
+            "env -i HOME=/x python3 wrapper.py",
+            "env CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS= gh pr merge 1",
+            "unset CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS",
+            "cat ~/.config/cargo-chief/github-app" + ".env",
+            "aws s3 ls",
+            "./dev_deploy.sh",
+            "python3 docs/scripts/ops/jira_service.py get CN-1",
+        ):
+            with self.subTest(blocked=blocked):
+                self.assertNotEqual([], denied(blocked))
+
     def test_route_refusals_check_config_and_env(self):
         config = {"channels": {"CREVIEWS": {"review_only": True}, "C1": {}}}
         self.assertIsNotNone(review_route_refusal(config, {"CLAUDE_CHANNEL_ID": "CREVIEWS"}))
@@ -1086,6 +1134,10 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             wrapper.write_text("def main():\n    pass\n")
             self.assertFalse(github_wrapper_downscopes(root))
             wrapper.write_text('PERMISSIONS_ENV = "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS"\n')
+            self.assertFalse(github_wrapper_downscopes(root), "the env name alone is not enough")
+            wrapper.write_text("".join("# " + line + "\n" for line in 'PERMISSIONS_ENV = "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS"\\ndef requested_permissions(env=None):\\n    pass\\nMESSAGE = "GitHub granted more than the requested permissions"\\n'.splitlines()))
+            self.assertFalse(github_wrapper_downscopes(root), "comments do not count")
+            wrapper.write_text('PERMISSIONS_ENV = "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS"\\ndef requested_permissions(env=None):\\n    pass\\nMESSAGE = "GitHub granted more than the requested permissions"\\n')
             self.assertTrue(github_wrapper_downscopes(root))
 
     def command(self, review_only):
@@ -1117,8 +1169,11 @@ class ReviewOnlyRoomTest(unittest.TestCase):
         for route in ("--escalate", "--check-parking", "bundle.txt", "parking.txt", "escalation.txt"):
             self.assertNotIn(route, prompt)
         self.assertIn("review requester with no approval authority", prompt)
+        self.assertNotIn("--request-review", prompt)
         normal_prompt = self.command(False)
-        self.assertIn("--escalate", normal_prompt[normal_prompt.index("--append-system-prompt") + 1])
+        normal_text = normal_prompt[normal_prompt.index("--append-system-prompt") + 1]
+        self.assertIn("--escalate", normal_text)
+        self.assertIn("/venv/bin/python /home-base/bot.py --request-review <PR URL>", normal_text)
         deny = json.loads(review[review.index("--settings") + 1])["permissions"]["deny"]
         self.assertEqual(list(REVIEW_ONLY_DENY_RULES), deny)
         normal = self.command(False)
