@@ -421,7 +421,9 @@ _THREAD_WORK = (
     "the code at the head: if the finding is fixed, reply naming the fix and resolve it; if the "
     "author declined it with a reason, reply saying whether you accept the reason, and resolve it "
     "only if you do. Put those replies in review.json's `replies` "
-    "([{\"thread_id\": <id>, \"body\": <text>}]) and pass `--resolve <id>` for each thread you resolve."
+    "([{\"thread_id\": <id>, \"body\": <text>}]) and pass `--resolve <id>` for each thread you resolve. "
+    "If GitHub refuses a resolve on a thread you have answered, the thread still counts as settled; "
+    "the result names it for the author to resolve, so say so in your summary."
 )
 
 

@@ -48,7 +48,9 @@ the PR the harness admitted (`CARGO_CHIEF_REVIEW_PR`). `submit` posts one review
 inline comments and an explicit verdict (`comment`, `request_changes` or `approve`) against the
 current head, then resolves the threads named with `--resolve`, which must be threads this agent's
 Bot account started (`threads` lists them). An approval needs an open, non-draft PR whose head has
-not moved, no inline findings, none of the agent's own threads left open, a requester listed in
+not moved, no inline findings, none of the agent's own threads left open (a thread named in
+`--resolve` where the agent has the last word counts as settled even if GitHub refuses the resolve,
+since a review token may not be able to; the result names it for the author), a requester listed in
 `peer_review.github_logins` (Slack user ID to login, passed in by the harness), and a PR the agent did
 not write. A requester may get an approval on their own PR, and a bot approval counts toward branch
 protection's required review; both are by design. Which threads a new head fixes, and the verdict

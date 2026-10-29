@@ -12,7 +12,9 @@ The room's permission rules deny the raw reviews and GraphQL endpoints because t
 payload file; this script reads the payload and enforces the rules in code. It posts only to the
 PR the harness admitted and touches only threads this agent started. A comment or change request
 posts first and then does its thread work; an approval does its thread work first and posts only
-if all of it succeeded. It approves only an open, non-draft PR whose head is still the reviewed
+if all of it succeeded. A thread named for resolving where this agent has the last word counts as
+settled even if GitHub refuses the resolve (a review token cannot always resolve); the result
+names it for the author to resolve. It approves only an open, non-draft PR whose head is still the reviewed
 commit, with no findings attached, none of this agent's own threads left open, a requester with a
 mapped GitHub login, and a PR this agent did not write.
 """
@@ -48,6 +50,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
         nodes {
           id isResolved path line
           comments(first: 1) { nodes { author { __typename login } body } }
+          latest: comments(last: 1) { nodes { author { __typename login } } }
         }
       }
     }
@@ -132,6 +135,15 @@ class GitHub:
 def _first_comment(thread: Mapping) -> Mapping:
     nodes = (thread.get("comments") or {}).get("nodes") or []
     return nodes[0] if nodes else {}
+
+
+def _has_last_word(thread: Mapping, login: str) -> bool:
+    nodes = (thread.get("latest") or {}).get("nodes") or []
+    return bool(nodes) and is_this_app(nodes[0].get("author") or {}, login)
+
+
+def _reason(exc: Exception) -> str:
+    return " ".join(str(exc).split())[:200]
 
 
 def own_threads(github: GitHub, owner: str, repo: str, number: int, login: str) -> list[Mapping]:
@@ -219,16 +231,21 @@ def approval_refusal(*, pull: Mapping, login: str, requester_login: str, open_ow
 
 def _thread_work(
     github: GitHub, replies: list[tuple[str, str]], resolve_ids: list[str], mine: Mapping[str, Mapping],
-) -> tuple[int, int, list[str]]:
-    """Post the replies, then resolve; a thread whose reply failed stays open."""
-    failed, unreplied = [], set()
-    replied = resolved = 0
+    login: str,
+) -> tuple[int, int, list[str], list[str]]:
+    """Post the replies, then resolve; a thread whose reply failed stays open.
+
+    Returns replies posted, threads resolved, blocking failures, and threads left for the author:
+    a refused resolve on a thread where this agent has the last word is settled, not failed.
+    """
+    failed, unreplied, replied_ids, left = [], set(), set(), []
+    resolved = 0
     for thread_id, body in replies:
         try:
             github.reply(thread_id, body)
-            replied += 1
-        except Exception:
-            failed.append(f"reply on {thread_id}")
+            replied_ids.add(thread_id)
+        except Exception as exc:
+            failed.append(f"reply on {thread_id}: {_reason(exc)}")
             unreplied.add(thread_id)
     for thread_id in resolve_ids:
         if mine[thread_id].get("isResolved"):
@@ -239,9 +256,12 @@ def _thread_work(
         try:
             github.resolve(thread_id)
             resolved += 1
-        except Exception:
-            failed.append(f"resolve {thread_id}")
-    return replied, resolved, failed
+        except Exception as exc:
+            if thread_id in replied_ids or _has_last_word(mine[thread_id], login):
+                left.append(f"{thread_id} ({_reason(exc)})")
+            else:
+                failed.append(f"resolve {thread_id}: {_reason(exc)}")
+    return len(replied_ids), resolved, failed, left
 
 
 def submit(
@@ -286,7 +306,7 @@ def submit(
 
     if verdict == "approve":
         # The approval lands only after every reply and resolve it depends on has.
-        replied, resolved, failed = _thread_work(github, replies, resolve_ids, mine)
+        replied, resolved, failed, left = _thread_work(github, replies, resolve_ids, mine, login)
         if failed:
             raise ReviewPostError(f"approval not posted: {', '.join(failed)}")
         if github.pull(owner, repo, number)["head"]["sha"] != head_sha:
@@ -295,13 +315,15 @@ def submit(
     else:
         result = github.submit(owner, repo, number, review)
         # The review is posted; from here a failure is reported, never raised as a refusal.
-        replied, resolved, failed = _thread_work(github, replies, resolve_ids, mine)
+        replied, resolved, failed, left = _thread_work(github, replies, resolve_ids, mine, login)
     message = (
         f"{review['event']} review posted for pass {pass_no} ({mode}): "
         f"{(result or {}).get('html_url', '')} ({replied} replies, resolved {resolved} threads)"
     )
     if failed:
         message += f"; failed: {', '.join(failed)}"
+    if left:
+        message += f"; answered but not resolved, for the author to resolve: {', '.join(left)}"
     return message
 
 
