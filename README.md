@@ -28,10 +28,12 @@ redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` au
 review-only room without a valid `peer_review.self_github_login` is refused.
 
 The review task asks the model to end its final reply with a line reading `REVIEW COMPLETE`
-(`REVIEW_DONE_MARKER`). A review turn ends at the first `result` after that line while no
-background subagent it started (the review's finders) is still running; the line itself is not
-posted. Any other `result` pauses the turn: its text folds into the status line, and the turn
-continues when a finder's notification starts the next one. Background shell tasks and `Monitor`
+(`REVIEW_DONE_MARKER`; case, trailing punctuation and markdown emphasis are ignored). The message
+carrying that line is posted as the reply as soon as it arrives, without the line. A review turn
+ends at the first `result` after it while no background subagent it started (the review's
+finders) is still running. Any other `result` pauses the turn: its text folds into the status
+line, and the turn continues when a finder's notification starts the next one. A review that
+already posted its completion line and then times out ends without a timeout note. Background shell tasks and `Monitor`
 timers are not counted; they die with the process. While a finder is tracked (at most 30 minutes
 each) the inactivity limit does not fire, so `REVIEW_MAX_RUNTIME` (45 minutes) is the bound that
 always holds; otherwise the usual inactivity limit applies. A review holds its turn-admission

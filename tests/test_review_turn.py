@@ -233,6 +233,7 @@ class FakeSession:
         self.session_id = None
         self.pending_reactions = []
         self.pending_tools = mock.MagicMock()
+        self.review_done = False
         self._turn_done = threading.Event()
         self.thread_ts = "1.1"
 
@@ -314,6 +315,16 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual(1, len(posted))
         self.assertIn("ask again to rerun it", posted[0])
         self.assertNotIn("resume", posted[0])
+        self.assertEqual([self.session], self.closed)
+
+    def test_a_finished_review_that_times_out_posts_no_timeout_note(self):
+        posted = []
+        self.session.review_done = True
+        self.ns["slack_client"].chat_postMessage.side_effect = lambda **kwargs: posted.append(kwargs["text"])
+        self.ns["stop_timed_out_session"] = lambda session, interrupt: "review stopped"
+        self.ns["wait_for_turn_completion"] = lambda *args, **kwargs: False
+        self.run_turn(self.admission())
+        self.assertEqual([], posted)
         self.assertEqual([self.session], self.closed)
 
     def test_unauthorized_sender_is_still_refused_in_a_normal_room(self):

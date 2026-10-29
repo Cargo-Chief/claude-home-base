@@ -1161,17 +1161,39 @@ def _finish_turn(session: LiveSession, parking=None, parking_refused: str | None
     session._turn_done.set()
 
 
+_REVIEW_DONE_LINE = re.compile(
+    r"^(?P<before>.*?)[\s>*_`.!:-]*(?<![A-Za-z0-9])" + re.escape(REVIEW_DONE_MARKER) + r"(?![A-Za-z0-9])[\s*_`.!]*$",
+    re.IGNORECASE,
+)
+
+
 def _take_review_marker(session: LiveSession, text_blocks: list[str]) -> list[str]:
-    """Drop the review's completion line from its text, noting that the review says it is done."""
+    """Post a message carrying the review's completion line as its reply at once, without that line.
+
+    Posting it here keeps a later pause from folding the reply into the status line.
+    """
+    found = False
     kept = []
     for text in text_blocks:
-        lines = text.splitlines()
-        if any(line.strip().strip("`*") == REVIEW_DONE_MARKER for line in lines):
-            session.review_done = True
-            text = "\n".join(line for line in lines if line.strip().strip("`*") != REVIEW_DONE_MARKER).strip()
+        lines = []
+        for line in text.splitlines():
+            match = _REVIEW_DONE_LINE.match(line)
+            if match:
+                found = True
+                line = match.group("before").rstrip()
+            lines.append(line)
+        text = "\n".join(lines).strip()
         if text:
             kept.append(text)
-    return kept
+    if not found:
+        return text_blocks
+    session.review_done = True
+    for text in kept:
+        if session._on_text:
+            _deliver_text(session, text)
+    if session.reporter:
+        session.reporter.delivered()
+    return []
 
 
 def _pause_review_turn(session: LiveSession) -> None:
@@ -2676,20 +2698,22 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                         session.reporter.finish(state="stopped")
                     stop_outcome = stop_timed_out_session(session, _stop_review if review else _interrupt_session)
                     minutes = CLAUDE_TIMEOUT // 60
-                    slack_client.chat_postMessage(
-                        channel=channel, thread_ts=thread_ts,
-                        text=(
-                            (f"Turn went {minutes} minutes with no output and no tool running; stopped. "
-                             if timeout_limit == "inactivity" else
-                             f"Turn reached its {format_elapsed(turn_limit)} hard limit; stopped. ")
-                            + ("The review never confirmed it finished; check the PR for its comments, "
-                               "or ask again to rerun it." if review else
-                               "Working files and thread continuity were preserved; "
-                               "tell me to resume when ready.")
-                            + ("" if stop_outcome != "still running"
-                               else f" But I {_STILL_RUNNING_NOTE.format(pid=session.proc.pid)}.")
-                        ),
-                    )
+                    # A review that already posted its reply and completion line needs no timeout note.
+                    if not (review and session.review_done):
+                        slack_client.chat_postMessage(
+                            channel=channel, thread_ts=thread_ts,
+                            text=(
+                                (f"Turn went {minutes} minutes with no output and no tool running; stopped. "
+                                 if timeout_limit == "inactivity" else
+                                 f"Turn reached its {format_elapsed(turn_limit)} hard limit; stopped. ")
+                                + ("The review never confirmed it finished; check the PR for its comments, "
+                                   "or ask again to rerun it." if review else
+                                   "Working files and thread continuity were preserved; "
+                                   "tell me to resume when ready.")
+                                + ("" if stop_outcome != "still running"
+                                   else f" But I {_STILL_RUNNING_NOTE.format(pid=session.proc.pid)}.")
+                            ),
+                        )
                     logger.warning(
                         "TURN_TIMEOUT | USER:%s | CHANNEL:%s | THREAD:%s | "
                         "LIMIT:%s | STOP:%s | SESSION:%s",

@@ -59,7 +59,7 @@ def load_functions(**overrides):
     constants = [
         node for node in tree.body
         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id.startswith("CTX_")
+        and (node.targets[0].id.startswith("CTX_") or node.targets[0].id == "_REVIEW_DONE_LINE")
     ]
     namespace = {
         "LiveSession": object,
@@ -68,6 +68,7 @@ def load_functions(**overrides):
         "SOURCE_DIR": Path("."),
         "SafetyError": SafetyError,
         "json": json,
+        "re": re,
         "threading": threading,
         "time": time,
         "sys": sys,
@@ -118,13 +119,19 @@ class FakeReporter:
         self.notes.append(note)
 
     def finish(self, **kwargs):
+        if self.active and kwargs.get("post_reply", True):
+            self.posted_tail = getattr(self, "posted_tail", []) + getattr(self, "tail", [])
+        self.tail = []
         self.finished.append(kwargs)
 
     def text(self, text):
         self.texts = getattr(self, "texts", []) + [text]
+        self.tail = getattr(self, "tail", []) + [text]
 
     def tool_used(self):
+        """Like TurnReporter.tool_used: text before a tool call is narration, not the reply."""
         self.tools = getattr(self, "tools", 0) + 1
+        self.tail = []
 
     def delivered(self):
         self.answered = True
@@ -218,20 +225,39 @@ class ReviewReaderTest(unittest.TestCase):
         self.assertEqual(1, session.reporter.tools, "narration is folded out of the reply tail")
 
     def test_the_completion_line_ends_the_review_and_is_not_posted(self):
+        posted = []
         session = self.review_session([
             agent_started("a"), result(), task_done("a"),
             assistant_text("Posted 3 findings on the PR.\nREVIEW COMPLETE"), result("s-5"),
-        ])
-        session.reporter.finished.clear()
+        ], posted)
         load_functions()["_reader_loop"](session)
         self.assertTrue(session.review_done)
+        self.assertEqual(["Posted 3 findings on the PR."], posted)
         self.assertEqual([{"post_reply": True}], self.finished_by_result(session))
 
-    def test_the_completion_line_while_a_finder_runs_still_pauses(self):
-        session = self.review_session([agent_started("a"), assistant_text("REVIEW COMPLETE"), result()])
+    def test_a_summary_written_while_a_finder_runs_is_posted_not_folded(self):
+        posted = []
+        session = self.review_session([
+            agent_started("a"), assistant_text("Posted 3 findings.\nREVIEW COMPLETE"), result(),
+        ], posted)
         load_functions()["_reader_loop"](session)
-        self.assertTrue(session.review_done)
-        self.assertEqual([], self.finished_by_result(session))
+        self.assertEqual(["Posted 3 findings."], posted)
+        self.assertEqual([], self.finished_by_result(session), "still paused while the finder runs")
+
+    def test_common_spellings_of_the_completion_line_count(self):
+        for line, left in [("REVIEW COMPLETE.", ""), ("_review complete_", ""), ("> **REVIEW COMPLETE**", ""),
+                           ("Findings posted. REVIEW COMPLETE", "Findings posted")]:
+            with self.subTest(line=line):
+                posted = []
+                session = self.review_session([assistant_text(line), result()], posted)
+                load_functions()["_reader_loop"](session)
+                self.assertTrue(session.review_done)
+                self.assertEqual([left] if left else [], posted)
+
+    def test_a_mention_of_the_words_mid_sentence_does_not_count(self):
+        session = self.review_session([assistant_text("I will write REVIEW COMPLETE when done, not yet."), result()])
+        load_functions()["_reader_loop"](session)
+        self.assertFalse(session.review_done)
 
     def test_a_limit_notice_held_at_a_pause_still_reaches_the_turn(self):
         posted = []
