@@ -84,6 +84,10 @@ class BotTurnStructureTest(unittest.TestCase):
                         "the limit is read before any Slack call delays it")
         reader = ast.unparse(self._function("_reader_loop"))
         self.assertIn("session.pending_tools.observe(data)", reader)
+        self.assertIn("session.background_tasks.observe(data)", reader)
+        self.assertIn("if review and (not await_background_settle(session.background_tasks", source)
+        self.assertLess(source.index("await_background_settle("), source.index("audit_session_id = session.session_id"),
+                        "a review waits for its background work before the turn is accounted")
 
     def test_slack_posts_skip_previews_and_redelivered_events(self):
         source = (Path(__file__).parents[1] / "bot.py").read_text(encoding="utf-8")

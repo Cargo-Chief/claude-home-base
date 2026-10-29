@@ -124,11 +124,13 @@ from review_requests import (
     lookup_pr,
 )
 from session_lifecycle import (
+    BackgroundTasks,
     PendingTools,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
     stop_timed_out_session,
+    await_background_settle,
     wait_for_turn_completion,
 )
 from governed_delegation import (
@@ -241,6 +243,8 @@ SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 CLAUDE_TIMEOUT = RUNTIME_POLICY.claude_timeout
 DELEGATE_TIMEOUT = delegate_timeout_from_env(os.environ)
 MAX_TURN_RUNTIME = max(RUNTIME_POLICY.max_turn_runtime, DELEGATE_TIMEOUT + CLAUDE_TIMEOUT)
+# How long a review turn that has replied may wait on its background finders.
+REVIEW_BACKGROUND_LIMIT = 45 * 60
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -703,6 +707,7 @@ class LiveSession:
     workspace: ThreadWorkspace | None = None
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
     pending_tools: PendingTools = field(default_factory=PendingTools)
+    background_tasks: BackgroundTasks = field(default_factory=BackgroundTasks)
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
     # Set while a stop kills this process tree, and set again once that stop is finished.
@@ -1142,6 +1147,7 @@ def _reader_loop(session: LiveSession) -> None:
                     session.reporter.activity()
             session.delegation_tracker.observe(data)
             session.pending_tools.observe(data)
+            session.background_tasks.observe(data)
 
             if msg_type == "system":
                 sid = data.get("session_id")
@@ -2643,6 +2649,36 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                         user_id, channel, thread_ts,
                         timeout_limit,
                         stop_outcome,
+                        session.session_id or "none",
+                    )
+                    return
+
+                # A review turn may end while its finders run in the background; the process
+                # closes after this, so wait here for them and for the turn that consumes them.
+                if review and not await_background_settle(
+                    session.background_tasks,
+                    session._turn_done,
+                    alive=lambda: session.proc.poll() is None,
+                    deadline=min(turn_deadline, time.monotonic() + REVIEW_BACKGROUND_LIMIT),
+                ):
+                    exited = session.proc.poll() is not None
+                    session._on_text = None
+                    try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
+                    except Exception: pass
+                    slack_client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts,
+                        text=(
+                            "The review did not finish: "
+                            + ("its process exited while background work was outstanding. "
+                               if exited else
+                               f"background work was still running after {format_elapsed(REVIEW_BACKGROUND_LIMIT)}. ")
+                            + "Nothing more will be posted from it; ask again to rerun the review."
+                        ),
+                    )
+                    logger.warning(
+                        "REVIEW_UNFINISHED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s | SESSION:%s",
+                        user_id, channel, thread_ts,
+                        "exited" if exited else "limit",
                         session.session_id or "none",
                     )
                     return

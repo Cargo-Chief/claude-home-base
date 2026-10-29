@@ -139,6 +139,65 @@ class PendingTools:
             self._issued.clear()
 
 
+class BackgroundTasks:
+    """The owner's background tasks still running, and whether a finished one has yet to wake it.
+
+    A background task reports through a task_notification, often after the owner's turn has ended;
+    the CLI then starts a new turn to consume it, so busy() holds until that turn's result. Tasks the
+    turn awaits, and tasks owned by a subagent, finish inside a turn and are left out.
+    """
+
+    def __init__(self) -> None:
+        self._running: set[str] = set()
+        self._wake_pending = False
+        self._lock = threading.Lock()
+
+    def observe(self, event: Mapping[str, Any]) -> None:
+        event_type = event.get("type")
+        subtype = event.get("subtype")
+        task_id = event.get("task_id")
+        with self._lock:
+            if event_type == "result":
+                self._wake_pending = False
+            elif event_type != "system" or not isinstance(task_id, str):
+                return
+            elif subtype == "task_started":
+                if not (event.get("awaited") or event.get("owned_by_subagent") or event.get("ambient")):
+                    self._running.add(task_id)
+            elif subtype == "task_notification" and task_id in self._running:
+                self._running.discard(task_id)
+                self._wake_pending = True
+
+    def busy(self) -> bool:
+        with self._lock:
+            return bool(self._running) or self._wake_pending
+
+
+def await_background_settle(
+    tasks: BackgroundTasks,
+    done_event: Any,
+    *,
+    alive: Callable[[], bool],
+    deadline: float,
+    clock: Callable[[], float] = time.monotonic,
+    poll_interval: float = 5.0,
+) -> bool:
+    """Hold a finished turn open until its background tasks report and the woken turn ends.
+
+    Returns False when the process exits or the deadline passes with work still outstanding.
+    """
+    while tasks.busy():
+        if not alive():
+            return False
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        done_event.clear()
+        if tasks.busy():
+            done_event.wait(timeout=min(poll_interval, remaining))
+    return True
+
+
 def stop_timed_out_session(session: Any, interrupt) -> str:
     """Silence a timed-out turn before interrupting it.
 

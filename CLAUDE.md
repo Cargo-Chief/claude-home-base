@@ -41,5 +41,8 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   or listed peer bot (`review_requests.py`); it needs a top-level `peer_review` block with a valid
   `self_github_login`. `peer_bot_user_ids` (default empty) and `max_reviews_per_pr` (default 3,
   range 1–10) are optional. See README's safety gate
+- A review turn's process closes when the review ends, so `process_message_async` first waits (up to
+  `REVIEW_BACKGROUND_LIMIT`) for background tasks it started to report and for the turn that
+  consumes them (`session_lifecycle.BackgroundTasks`)
 
 Keep this CLAUDE.md up-to-date with the latest changes / decisions made in the project.

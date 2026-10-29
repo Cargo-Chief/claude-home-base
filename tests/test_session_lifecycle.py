@@ -1,8 +1,11 @@
 import threading
 import unittest
+from unittest import mock
 
 from session_lifecycle import (
+    BackgroundTasks,
     PendingTools,
+    await_background_settle,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -282,6 +285,101 @@ class SessionLifecycleTests(unittest.TestCase):
             "message": {"content": [{"type": "tool_result", "content": "done"}]},
         }))
         self.assertTrue(owner_stream_event_is_activity({"type": "assistant"}))
+
+
+def task_started(task_id, **extra):
+    return {"type": "system", "subtype": "task_started", "task_id": task_id, **extra}
+
+
+def task_notification(task_id):
+    return {"type": "system", "subtype": "task_notification", "task_id": task_id, "status": "completed"}
+
+
+class BackgroundTasksTest(unittest.TestCase):
+    def test_background_task_holds_until_the_woken_turn_ends(self):
+        tasks = BackgroundTasks()
+        tasks.observe(task_started("a"))
+        tasks.observe({"type": "result"})
+        self.assertTrue(tasks.busy(), "the turn ended with the finder still running")
+        tasks.observe(task_notification("a"))
+        self.assertTrue(tasks.busy(), "the CLI has yet to run the turn that consumes it")
+        tasks.observe({"type": "result"})
+        self.assertFalse(tasks.busy())
+
+    def test_awaited_subagent_owned_and_ambient_tasks_are_ignored(self):
+        tasks = BackgroundTasks()
+        tasks.observe(task_started("a", awaited=True))
+        tasks.observe(task_started("b", owned_by_subagent=True))
+        tasks.observe(task_started("c", ambient=True))
+        tasks.observe(task_notification("a"))
+        self.assertFalse(tasks.busy())
+
+    def test_unknown_notification_and_malformed_events_change_nothing(self):
+        tasks = BackgroundTasks()
+        tasks.observe(task_notification("ghost"))
+        tasks.observe({"type": "system", "subtype": "task_started"})
+        tasks.observe({"type": "system", "subtype": "task_started", "task_id": 7})
+        self.assertFalse(tasks.busy())
+
+    def test_notification_inside_a_running_turn_clears_at_its_result(self):
+        tasks = BackgroundTasks()
+        tasks.observe(task_started("a"))
+        tasks.observe(task_notification("a"))
+        tasks.observe({"type": "result"})
+        self.assertFalse(tasks.busy())
+
+
+class AwaitBackgroundSettleTest(unittest.TestCase):
+    def test_returns_at_once_when_nothing_is_outstanding(self):
+        done = threading.Event()
+        self.assertTrue(await_background_settle(
+            BackgroundTasks(), done, alive=lambda: True, deadline=0, clock=FakeClock(),
+        ))
+
+    def test_waits_through_the_wake_turn(self):
+        clock = FakeClock()
+        tasks = BackgroundTasks()
+        tasks.observe(task_started("a"))
+        tasks.observe({"type": "result"})
+        events = [task_notification("a"), {"type": "result"}]
+
+        class Done:
+            waits = 0
+
+            def clear(self):
+                pass
+
+            def wait(self, timeout):
+                clock.now += timeout
+                Done.waits += 1
+                if events:
+                    tasks.observe(events.pop(0))
+                return True
+
+        self.assertTrue(await_background_settle(
+            tasks, Done(), alive=lambda: True, deadline=100, clock=clock, poll_interval=5,
+        ))
+        self.assertEqual(2, Done.waits)
+
+    def test_deadline_with_work_outstanding_fails(self):
+        clock = FakeClock()
+        tasks = BackgroundTasks()
+        tasks.observe(task_started("a"))
+        done = FakeDoneEvent(clock)
+        done.clear = lambda: None
+        self.assertFalse(await_background_settle(
+            tasks, done, alive=lambda: True, deadline=12, clock=clock, poll_interval=5,
+        ))
+        self.assertEqual(12, clock.now)
+
+    def test_exited_process_fails_without_waiting(self):
+        tasks = BackgroundTasks()
+        tasks.observe(task_started("a"))
+        done = mock.MagicMock()
+        self.assertFalse(await_background_settle(
+            tasks, done, alive=lambda: False, deadline=100, clock=FakeClock(),
+        ))
+        done.wait.assert_not_called()
 
 
 if __name__ == "__main__":
