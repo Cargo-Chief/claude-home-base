@@ -143,11 +143,16 @@ class BackgroundAgents:
     """Background subagents the owner started and has not yet been notified about.
 
     Only agent tasks count; a background shell or Monitor timer dies with the process rather than
-    holding it open. Tasks the turn awaits, and tasks owned by a subagent, finish inside a turn.
+    holding it open. Tasks the turn awaits, and tasks owned by a subagent, finish inside a turn. An
+    agent stops counting after max_age, so a lost notification cannot hold the turn open.
     """
 
-    def __init__(self) -> None:
-        self._running: set[str] = set()
+    MAX_AGE_SECONDS = 1800.0
+
+    def __init__(self, max_age: float = MAX_AGE_SECONDS, clock: Callable[[], float] = time.monotonic) -> None:
+        self._running: dict[str, float] = {}
+        self._max_age = max_age
+        self._clock = clock
         self._lock = threading.Lock()
 
     def observe(self, event: Mapping[str, Any]) -> None:
@@ -160,46 +165,14 @@ class BackgroundAgents:
             if event.get("subtype") == "task_started":
                 if (event.get("task_type") == "local_agent"
                         and not (event.get("awaited") or event.get("owned_by_subagent") or event.get("ambient"))):
-                    self._running.add(task_id)
+                    self._running[task_id] = self._clock()
             elif event.get("subtype") == "task_notification":
-                self._running.discard(task_id)
+                self._running.pop(task_id, None)
 
     def running(self) -> bool:
+        now = self._clock()
         with self._lock:
-            return bool(self._running)
-
-
-class SettleGate:
-    """Ends a turn only once its last result is followed by a quiet grace period.
-
-    Any later stream event (a task notification, or the turn the CLI starts to consume one) cancels
-    the pending end; that turn's own result schedules a new one.
-    """
-
-    def __init__(self, grace: float, timer: Callable[..., Any] = threading.Timer) -> None:
-        self._grace = grace
-        self._timer = timer
-        self._seq = 0
-        self._lock = threading.Lock()
-
-    def event(self) -> None:
-        with self._lock:
-            self._seq += 1
-
-    def result(self, finish: Callable[[], None]) -> None:
-        with self._lock:
-            self._seq += 1
-            mine = self._seq
-        timer = self._timer(self._grace, self._fire, args=(mine, finish))
-        timer.daemon = True
-        timer.start()
-
-    def _fire(self, mine: int, finish: Callable[[], None]) -> None:
-        with self._lock:
-            if self._seq != mine:
-                return
-            self._seq += 1
-        finish()
+            return any(now - started < self._max_age for started in self._running.values())
 
 
 def stop_timed_out_session(session: Any, interrupt) -> str:

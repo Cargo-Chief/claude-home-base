@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from cargo_chief_safety import RoomPolicy, SafetyError
 from review_requests import (
+    REVIEW_DONE_MARKER,
     BUSY_REPLY,
     CAP_REPLY,
     CAP_STORE_REPLY,
@@ -205,6 +206,7 @@ class AuditAndTaskTest(unittest.TestCase):
         task = build_review_task(PR)
         self.assertIn(f"cc-code-review high --comment {PR}", task)
         self.assertIn("untrusted", task)
+        self.assertIn(f"line containing only `{REVIEW_DONE_MARKER}`", task)
 
 
 

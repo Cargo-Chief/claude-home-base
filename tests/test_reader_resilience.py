@@ -12,12 +12,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from session_lifecycle import BackgroundAgents, PendingTools, SettleGate, owner_stream_event_is_activity
+from session_lifecycle import BackgroundAgents, PendingTools, owner_stream_event_is_activity
 
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "_reader_loop", "_deliver_text", "_stop_unread_process", "_post_context_notice", "_track_context",
-    "_owner_turn_busy", "_finish_turn",
+    "_owner_turn_busy", "_finish_turn", "_take_review_marker", "_pause_review_turn", "_stop_review",
 )
 
 
@@ -68,6 +68,7 @@ def load_functions(**overrides):
         "SOURCE_DIR": Path("."),
         "SafetyError": SafetyError,
         "json": json,
+        "threading": threading,
         "time": time,
         "sys": sys,
         "subprocess": subprocess,
@@ -91,6 +92,7 @@ def load_functions(**overrides):
         "slack_client": None,
         "stop_process_tree": _fake_stop_process_tree,
         "governed_delegate_active": lambda pid_file: False,
+        "REVIEW_DONE_MARKER": "REVIEW COMPLETE",
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=constants + wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -120,6 +122,9 @@ class FakeReporter:
 
     def text(self, text):
         self.texts = getattr(self, "texts", []) + [text]
+
+    def tool_used(self):
+        self.tools = getattr(self, "tools", 0) + 1
 
     def delivered(self):
         self.answered = True
@@ -159,8 +164,9 @@ class FakeSession:
         self.delegation_tracker = FakeTracker()
         self.pending_tools = PendingTools()
         self.review = False
+        self.review_done = False
         self.background_agents = BackgroundAgents()
-        self.settle = SettleGate(0.01)
+        self.stop_done = None
         self.escalation_message_file = None
         self.escalation_receipt_file = None
         self.private_escalation_pending = False
@@ -193,65 +199,49 @@ def task_done(task_id):
     return {"type": "system", "subtype": "task_notification", "task_id": task_id, "status": "completed"}
 
 
-class ManualTimer:
-    def __init__(self, created):
-        self.created = created
-
-    def __call__(self, interval, fn, args=()):
-        timer = _Scheduled(fn, args)
-        self.created.append(timer)
-        return timer
-
-
-class _Scheduled:
-    def __init__(self, fn, args):
-        self.fn, self.args, self.daemon = fn, args, False
-
-    def start(self):
-        pass
-
-    def fire(self):
-        self.fn(*self.args)
-
-
 class ReviewReaderTest(unittest.TestCase):
-    def review_session(self, events):
-        self.timers = []
-        session = FakeSession(events, on_text=lambda text: None, reporter=FakeReporter(active=True))
+    def review_session(self, events, posted=None):
+        session = FakeSession(events, on_text=(posted.append if posted is not None else lambda text: None),
+                              reporter=FakeReporter(active=True))
         session.review = True
-        session.settle = SettleGate(15, timer=ManualTimer(self.timers))
         return session
 
-    def test_a_result_while_finders_run_pauses_the_review(self):
-        session = self.review_session([agent_started("a"), assistant_text("waiting on finders"), result()])
-        load_functions()["_reader_loop"](session)
-        self.assertEqual([], self.timers, "nothing schedules the end while a finder runs")
-        self.assertEqual([{"state": "stopped"}], session.reporter.finished, "only the process exit finished it")
-        self.assertEqual(["waiting on finders"], session.reporter.texts)
+    def finished_by_result(self, session):
+        """reporter.finish calls other than the reader's own process-exit one."""
+        return [call for call in session.reporter.finished if call != {"state": "stopped"}]
 
-    def test_the_review_ends_after_the_wake_turn_and_a_quiet_grace(self):
+    def test_a_result_without_the_completion_line_pauses_and_folds_narration(self):
+        session = self.review_session([assistant_text("launched finders, waiting"), result()])
+        load_functions()["_reader_loop"](session)
+        self.assertEqual([], self.finished_by_result(session))
+        self.assertEqual(["launched finders, waiting"], session.reporter.texts)
+        self.assertEqual(1, session.reporter.tools, "narration is folded out of the reply tail")
+
+    def test_the_completion_line_ends_the_review_and_is_not_posted(self):
         session = self.review_session([
-            agent_started("a"), result(), task_done("a"), assistant_text("summary"), result("s-5"),
+            agent_started("a"), result(), task_done("a"),
+            assistant_text("Posted 3 findings on the PR.\nREVIEW COMPLETE"), result("s-5"),
         ])
-        load_functions()["_reader_loop"](session)
-        self.assertEqual(1, len(self.timers))
         session.reporter.finished.clear()
-        self.timers[0].fire()
-        self.assertEqual([{"post_reply": True}], session.reporter.finished)
+        load_functions()["_reader_loop"](session)
+        self.assertTrue(session.review_done)
+        self.assertEqual([{"post_reply": True}], self.finished_by_result(session))
 
-    def test_a_later_event_cancels_a_scheduled_end(self):
-        session = self.review_session([result(), task_done("ghost"), assistant_text("more"), result("s-6")])
+    def test_the_completion_line_while_a_finder_runs_still_pauses(self):
+        session = self.review_session([agent_started("a"), assistant_text("REVIEW COMPLETE"), result()])
         load_functions()["_reader_loop"](session)
-        self.assertEqual(2, len(self.timers))
-        session.reporter.finished.clear()
-        self.timers[0].fire()
-        self.assertEqual([], session.reporter.finished, "the first end was superseded")
-        self.timers[1].fire()
-        self.assertEqual([{"post_reply": True}], session.reporter.finished)
+        self.assertTrue(session.review_done)
+        self.assertEqual([], self.finished_by_result(session))
+
+    def test_a_limit_notice_held_at_a_pause_still_reaches_the_turn(self):
+        posted = []
+        session = self.review_session([assistant_text("LIMIT"), result()], posted)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertEqual(["LIMIT"], posted)
 
     def test_a_review_never_consumes_bundle_or_parking_claims(self):
         consumed = []
-        session = self.review_session([result()])
+        session = self.review_session([assistant_text("REVIEW COMPLETE"), result()])
         session.workspace = type("W", (), {
             "bundle_claim_file": Path(__file__), "parking_claim_file": Path(__file__), "root": Path("."),
         })()
@@ -260,6 +250,15 @@ class ReviewReaderTest(unittest.TestCase):
             consume_parking_claim=lambda *args, **kwargs: consumed.append("parking"),
         )["_reader_loop"](session)
         self.assertEqual([], consumed)
+
+    def test_stopping_a_review_kills_it_and_releases_the_request(self):
+        session = self.review_session([])
+        session.proc.alive = True
+        outcome = load_functions()["_stop_review"](session)
+        self.assertEqual("review stopped", outcome)
+        self.assertEqual(["stop_tree"], session.proc.calls)
+        self.assertTrue(session.stop_done.is_set())
+        self.assertTrue(session._turn_done.is_set())
 
 
 class HarnessTest(unittest.TestCase):
@@ -361,6 +360,16 @@ class OwnerTurnBusyTest(unittest.TestCase):
         session.pending_tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}})
         self.assertTrue(busy(session))
         session.pending_tools.observe({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}})
+        self.assertFalse(busy(session))
+
+    def test_a_running_background_agent_keeps_only_a_review_busy(self):
+        busy = load_functions()["_owner_turn_busy"]
+        session = FakeSession([])
+        session.background_agents.observe(agent_started("a"))
+        self.assertFalse(busy(session))
+        session.review = True
+        self.assertTrue(busy(session))
+        session.background_agents.observe(task_done("a"))
         self.assertFalse(busy(session))
 
     def test_a_live_governed_delegate_keeps_the_turn_busy(self):

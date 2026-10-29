@@ -5,7 +5,6 @@ from unittest import mock
 from session_lifecycle import (
     BackgroundAgents,
     PendingTools,
-    SettleGate,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -323,35 +322,15 @@ class BackgroundAgentsTest(unittest.TestCase):
         self.assertFalse(agents.running())
 
 
-class SettleGateTest(unittest.TestCase):
-    def setUp(self):
-        self.timers = []
-
-        def timer(interval, fn, args=()):
-            self.assertEqual(15, interval)
-            scheduled = mock.MagicMock()
-            scheduled.fire = lambda: fn(*args)
-            self.timers.append(scheduled)
-            return scheduled
-
-        self.gate = SettleGate(15, timer=timer)
-        self.finished = []
-
-    def test_a_quiet_grace_ends_the_turn_once(self):
-        self.gate.result(lambda: self.finished.append(1))
-        self.timers[0].start.assert_called_once_with()
-        self.timers[0].fire()
-        self.timers[0].fire()
-        self.assertEqual([1], self.finished)
-
-    def test_any_later_event_cancels_the_pending_end(self):
-        self.gate.result(lambda: self.finished.append("first"))
-        self.gate.event()
-        self.gate.result(lambda: self.finished.append("second"))
-        self.timers[0].fire()
-        self.timers[1].fire()
-        self.assertEqual(["second"], self.finished)
-
+class BackgroundAgentsAgeTest(unittest.TestCase):
+    def test_an_agent_whose_notification_never_comes_stops_counting(self):
+        clock = FakeClock()
+        agents = BackgroundAgents(max_age=60, clock=clock)
+        agents.observe(started("a"))
+        clock.now = 59
+        self.assertTrue(agents.running())
+        clock.now = 60
+        self.assertFalse(agents.running())
 
 if __name__ == "__main__":
     unittest.main()

@@ -312,7 +312,7 @@ class ProcessReviewTest(unittest.TestCase):
         self.ns["wait_for_turn_completion"] = lambda *args, **kwargs: False
         self.run_turn(self.admission())
         self.assertEqual(1, len(posted))
-        self.assertIn("Ask again to rerun the review.", posted[0])
+        self.assertIn("ask again to rerun it", posted[0])
         self.assertNotIn("resume", posted[0])
         self.assertEqual([self.session], self.closed)
 

@@ -111,6 +111,7 @@ from review_requests import (
     CONFIG_REPLY,
     ERROR_REPLY,
     PROVIDER_REPLY,
+    REVIEW_DONE_MARKER,
     WRAPPER_REPLY,
     RecentMentions,
     RequestThrottle,
@@ -126,7 +127,6 @@ from review_requests import (
 from session_lifecycle import (
     BackgroundAgents,
     PendingTools,
-    SettleGate,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -245,8 +245,6 @@ DELEGATE_TIMEOUT = delegate_timeout_from_env(os.environ)
 MAX_TURN_RUNTIME = max(RUNTIME_POLICY.max_turn_runtime, DELEGATE_TIMEOUT + CLAUDE_TIMEOUT)
 # A review turn's whole runtime, including the background finders it waits on.
 REVIEW_MAX_RUNTIME = 45 * 60
-# Quiet time after a review's last result before it ends; a queued task notification starts its turn first.
-REVIEW_SETTLE_GRACE = 15.0
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -712,7 +710,8 @@ class LiveSession:
     # A review turn: fresh, never resumed, closed when the review ends
     review: bool = False
     background_agents: BackgroundAgents = field(default_factory=BackgroundAgents)
-    settle: SettleGate = field(default_factory=lambda: SettleGate(REVIEW_SETTLE_GRACE))
+    # Set once the review's reply carries REVIEW_DONE_MARKER
+    review_done: bool = False
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
     # Set while a stop kills this process tree, and set again once that stop is finished.
@@ -1162,6 +1161,33 @@ def _finish_turn(session: LiveSession, parking=None, parking_refused: str | None
     session._turn_done.set()
 
 
+def _take_review_marker(session: LiveSession, text_blocks: list[str]) -> list[str]:
+    """Drop the review's completion line from its text, noting that the review says it is done."""
+    kept = []
+    for text in text_blocks:
+        lines = text.splitlines()
+        if any(line.strip().strip("`*") == REVIEW_DONE_MARKER for line in lines):
+            session.review_done = True
+            text = "\n".join(line for line in lines if line.strip().strip("`*") != REVIEW_DONE_MARKER).strip()
+        if text:
+            kept.append(text)
+    return kept
+
+
+def _pause_review_turn(session: LiveSession) -> None:
+    """A review turn that ended without finishing: its text is narration, folded into the status."""
+    for text in session.pre_tool_text:
+        if text.strip() == "SKIP" or is_claude_limit_notice(text) or _ATTACH_PATTERN.search(text):
+            if session._on_text:
+                _deliver_text(session, text)
+        elif session.reporter:
+            session.reporter.text(text)
+    session.pre_tool_text.clear()
+    session.first_tool_seen = False
+    if session.reporter:
+        session.reporter.tool_used()
+
+
 def _reader_loop(session: LiveSession) -> None:
     """Read stdout from a live Claude process and post responses to Slack.
 
@@ -1191,8 +1217,6 @@ def _reader_loop(session: LiveSession) -> None:
             session.delegation_tracker.observe(data)
             session.pending_tools.observe(data)
             session.background_agents.observe(data)
-            if session.review:
-                session.settle.event()
 
             if msg_type == "system":
                 sid = data.get("session_id")
@@ -1230,6 +1254,8 @@ def _reader_loop(session: LiveSession) -> None:
                     if isinstance(block, dict) and block.get("type") == "text"
                     and block.get("text", "").strip()
                 ]
+                if session.review:
+                    text_blocks = _take_review_marker(session, text_blocks)
                 if not session.turn_lock.locked() and not session.after_turn_noticed:
                     _notice_output_after_turn(session)
                 if not session.first_tool_seen:
@@ -1323,15 +1349,9 @@ def _reader_loop(session: LiveSession) -> None:
                             thread=session.thread_ts,
                             session_id=sid,
                         )
-                if session.review:
-                    # A review that ended its turn to wait on background finders is not done yet.
-                    if session.reporter and session.reporter.active:
-                        for text in session.pre_tool_text:
-                            session.reporter.text(text)
-                        session.pre_tool_text.clear()
-                    session.first_tool_seen = False
-                    if not session.background_agents.running():
-                        session.settle.result(lambda: _finish_turn(session))
+                # A review ends only on its completion line, never while a finder still runs.
+                if session.review and not (session.review_done and not session.background_agents.running()):
+                    _pause_review_turn(session)
                     continue
                 _finish_turn(session, parking=parking, parking_refused=parking_refused)
 
@@ -2654,7 +2674,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                             pass
                     if session.reporter:
                         session.reporter.finish(state="stopped")
-                    stop_outcome = stop_timed_out_session(session, _interrupt_session)
+                    stop_outcome = stop_timed_out_session(session, _stop_review if review else _interrupt_session)
                     minutes = CLAUDE_TIMEOUT // 60
                     slack_client.chat_postMessage(
                         channel=channel, thread_ts=thread_ts,
@@ -2662,7 +2682,8 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                             (f"Turn went {minutes} minutes with no output and no tool running; stopped. "
                              if timeout_limit == "inactivity" else
                              f"Turn reached its {format_elapsed(turn_limit)} hard limit; stopped. ")
-                            + ("Ask again to rerun the review." if review else
+                            + ("The review never confirmed it finished; check the PR for its comments, "
+                               "or ask again to rerun it." if review else
                                "Working files and thread continuity were preserved; "
                                "tell me to resume when ready.")
                             + ("" if stop_outcome != "still running"
@@ -2817,6 +2838,7 @@ def _stop_review(session: LiveSession) -> str:
         gone = False
     finally:
         session.stop_done.set()
+    session._turn_done.set()
     return "review stopped" if gone else "still running"
 
 

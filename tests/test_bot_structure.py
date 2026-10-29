@@ -85,7 +85,8 @@ class BotTurnStructureTest(unittest.TestCase):
         reader = ast.unparse(self._function("_reader_loop"))
         self.assertIn("session.pending_tools.observe(data)", reader)
         self.assertIn("session.background_agents.observe(data)", reader)
-        self.assertIn("session.settle.result(lambda: _finish_turn(session))", reader)
+        self.assertIn("_pause_review_turn(session)", reader)
+        self.assertIn("text_blocks = _take_review_marker(session, text_blocks)", reader)
         self.assertIn("if session.review and session.background_agents.running():",
                       ast.unparse(self._function("_owner_turn_busy")))
         stop = ast.unparse(self._function("_maybe_stop_from_message"))
