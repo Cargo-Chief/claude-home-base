@@ -1,7 +1,9 @@
 import threading
 import unittest
+from unittest import mock
 
 from session_lifecycle import (
+    BackgroundAgents,
     PendingTools,
     TurnAdmission,
     oldest_evictable_session,
@@ -283,6 +285,52 @@ class SessionLifecycleTests(unittest.TestCase):
         }))
         self.assertTrue(owner_stream_event_is_activity({"type": "assistant"}))
 
+
+def started(task_id, **extra):
+    return {"type": "system", "subtype": "task_started", "task_id": task_id, "task_type": "local_agent", **extra}
+
+
+def notified(task_id):
+    return {"type": "system", "subtype": "task_notification", "task_id": task_id, "status": "completed"}
+
+
+class BackgroundAgentsTest(unittest.TestCase):
+    def test_a_background_agent_runs_until_its_notification(self):
+        agents = BackgroundAgents()
+        agents.observe(started("a"))
+        agents.observe(started("b"))
+        agents.observe({"type": "result"})
+        self.assertTrue(agents.running())
+        agents.observe(notified("a"))
+        self.assertTrue(agents.running())
+        agents.observe(notified("b"))
+        self.assertFalse(agents.running())
+
+    def test_shell_awaited_subagent_owned_and_ambient_tasks_are_ignored(self):
+        agents = BackgroundAgents()
+        agents.observe({"type": "system", "subtype": "task_started", "task_id": "s", "task_type": "local_bash"})
+        agents.observe(started("w", awaited=True))
+        agents.observe(started("o", owned_by_subagent=True))
+        agents.observe(started("m", ambient=True))
+        self.assertFalse(agents.running())
+
+    def test_malformed_events_change_nothing(self):
+        agents = BackgroundAgents()
+        agents.observe({"type": "system", "subtype": "task_started", "task_type": "local_agent"})
+        agents.observe(started(7))
+        agents.observe(notified("ghost"))
+        self.assertFalse(agents.running())
+
+
+class BackgroundAgentsAgeTest(unittest.TestCase):
+    def test_an_agent_whose_notification_never_comes_stops_counting(self):
+        clock = FakeClock()
+        agents = BackgroundAgents(max_age=60, clock=clock)
+        agents.observe(started("a"))
+        clock.now = 59
+        self.assertTrue(agents.running())
+        clock.now = 60
+        self.assertFalse(agents.running())
 
 if __name__ == "__main__":
     unittest.main()

@@ -41,6 +41,9 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   or listed peer bot (`review_requests.py`); it needs a top-level `peer_review` block with a valid
   `self_github_login`. `peer_bot_user_ids` (default empty) and `max_reviews_per_pr` (default 3,
   range 1–10) are optional. See README's safety gate
+- A review turn's process is closed when the turn ends, so the reader ends a review only at a
+  `result` after its `REVIEW_DONE_MARKER` line with no background subagent running
+  (`session_lifecycle.BackgroundAgents`); every other `result` is a pause. See README
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:
