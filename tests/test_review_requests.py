@@ -7,8 +7,9 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from cargo_chief_safety import RoomPolicy, SafetyError
+from cargo_chief_safety import REVIEW_ONLY_DENY_RULES, RoomPolicy, SafetyError
 from review_requests import (
+    REVIEW_POST_SCRIPT,
     REVIEW_DONE_MARKER,
     BUSY_REPLY,
     CAP_REPLY,
@@ -203,10 +204,22 @@ class AuditAndTaskTest(unittest.TestCase):
         ))
 
     def test_task_is_fixed_and_names_the_pr(self):
-        task = build_review_task(PR)
-        self.assertIn(f"cc-code-review high --comment {PR}", task)
+        task = build_review_task(PR, Path("/root"))
+        self.assertIn(f"cc-code-review high {PR}` without `--comment`", task)
         self.assertIn("untrusted", task)
         self.assertIn(f"line containing only `{REVIEW_DONE_MARKER}`", task)
+
+    def test_task_posts_through_review_post_with_a_verdict(self):
+        task = build_review_task(PR, Path("/root"))
+        post = f"python3 /root/docs/scripts/ops/with_github_app_token.py -- python3 {REVIEW_POST_SCRIPT}"
+        self.assertTrue(REVIEW_POST_SCRIPT.is_absolute())
+        self.assertIn(f"`{post} submit {PR} --review", task)
+        self.assertIn(f"`{post} threads {PR}`", task)
+        for verdict in ("request_changes", "approve", "comment"):
+            self.assertIn(f"`{verdict}`", task)
+        self.assertIn("--resolve <id>", task)
+        self.assertIn("Bash(*pulls/*/reviews*)", REVIEW_ONLY_DENY_RULES)
+        self.assertIn("Bash(*graphql*)", REVIEW_ONLY_DENY_RULES)
 
 
 

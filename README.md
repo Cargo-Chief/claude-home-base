@@ -16,7 +16,7 @@ A room entry may add `"review_only": true` (for example `#pr-reviews`, with
 `autonomous_overlay` pointing at the kit's `modes/review-only.md`). Plain posts there are ignored;
 a mention from any human member, or from a bot listed in `peer_review.peer_bot_user_ids`, carrying
 exactly one `https://github.com/Cargo-Chief/<repo>/pull/<n>` link starts a fresh, harness-built
-`cc-code-review high --comment` turn. The sender is marked `review_requester` with no approver
+`cc-code-review high` turn. The sender is marked `review_requester` with no approver
 authority, and the turn gets a read/PR-write GitHub token request, no AWS variables or Slack
 secrets, and extra deny rules. It never resumes, steers, escalates or registers a reply route, and
 `bot.py --escalate`, `--forward-to` and `/internal/forward` refuse review-only rooms server-side.
@@ -26,6 +26,23 @@ cap record, and PRs past `peer_review.max_reviews_per_pr` (default 3, range 1–
 24 hours. At most two requests are admitted at once and each requester may make ten an hour; a
 redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line. A
 review-only room without a valid `peer_review.self_github_login` is refused.
+
+The turn posts only through `review_post.py`, run under the GitHub App wrapper with the absolute
+paths the task names. The deny rules block the raw reviews and GraphQL endpoints because they cannot
+see a payload file, so the script reads the payload and enforces the rules in code. It posts only to
+the PR the harness admitted (`CARGO_CHIEF_REVIEW_PR`). `submit` posts one review with validated
+inline comments and an explicit verdict (`comment`, `request_changes` or `approve`) against the
+current head, then resolves the threads named with `--resolve`, which must be threads this agent's
+Bot account started (`threads` lists them). An approval needs an open, non-draft PR whose head has
+not moved, no inline findings, none of the agent's own threads left open, a requester listed in
+`peer_review.github_logins` (Slack user ID to login, passed in by the harness), and a PR the agent did
+not write. A requester may get an approval on their own PR, and a bot approval counts toward branch
+protection's required review; both are by design. Which threads a new head fixes, and the verdict
+itself, are the model's judgement. A review turn's file tools are denied inside the checkouts
+(`claude-home-base`, `docs`, `agent-kit`, `repos`, `worktrees`). Bash deny rules match command
+text, so a shell write into those checkouts, or code the agent writes under `work/` and runs, is
+not blocked: the script's checks are guardrails rather than a sandbox, and a turn that ignores its
+task can still use its PR-write token directly.
 
 The review task asks the model to end its final reply with a line reading `REVIEW COMPLETE`
 (`REVIEW_DONE_MARKER`; case, trailing punctuation and markdown emphasis are ignored). The message

@@ -44,6 +44,8 @@ preflight. Keep broadly useful transport improvements separable so they can be p
 - A review turn's process is closed when the turn ends, so the reader ends a review only at a
   `result` after its `REVIEW_DONE_MARKER` line with no background subagent running
   (`session_lifecycle.BackgroundAgents`); every other `result` is a pause. See README
+- A review turn writes to GitHub only through `review_post.py` (verdict, inline comments, resolving
+  its own threads); approvals need the requester in `peer_review.github_logins`. See README
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:
