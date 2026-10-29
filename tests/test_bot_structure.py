@@ -84,10 +84,13 @@ class BotTurnStructureTest(unittest.TestCase):
                         "the limit is read before any Slack call delays it")
         reader = ast.unparse(self._function("_reader_loop"))
         self.assertIn("session.pending_tools.observe(data)", reader)
-        self.assertIn("session.background_tasks.observe(data)", reader)
-        self.assertIn("if review and (not await_background_settle(session.background_tasks", source)
-        self.assertLess(source.index("await_background_settle("), source.index("audit_session_id = session.session_id"),
-                        "a review waits for its background work before the turn is accounted")
+        self.assertIn("session.background_agents.observe(data)", reader)
+        self.assertIn("session.settle.result(lambda: _finish_turn(session))", reader)
+        self.assertIn("if session.review and session.background_agents.running():",
+                      ast.unparse(self._function("_owner_turn_busy")))
+        stop = ast.unparse(self._function("_maybe_stop_from_message"))
+        self.assertIn("outcome = _stop_review(session)", stop)
+        self.assertIn("not (review and session.stop_done)", source)
 
     def test_slack_posts_skip_previews_and_redelivered_events(self):
         source = (Path(__file__).parents[1] / "bot.py").read_text(encoding="utf-8")
@@ -189,7 +192,8 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("session.reporter.text(text)", reader)
         self.assertIn("session.reporter.tool_used()", reader)
         self.assertIn(
-            "session.reporter.finish(post_reply=not session.private_escalation_pending)", reader
+            "session.reporter.finish(post_reply=not session.private_escalation_pending)",
+            ast.unparse(self._function("_finish_turn")),
         )
         self.assertIn("session.reporter.finish(state='stopped')", reader)
         self.assertIn("_live_sessions.get(session.thread_ts) is session", reader)

@@ -12,12 +12,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from session_lifecycle import BackgroundTasks, PendingTools, owner_stream_event_is_activity
+from session_lifecycle import BackgroundAgents, PendingTools, SettleGate, owner_stream_event_is_activity
 
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "_reader_loop", "_deliver_text", "_stop_unread_process", "_post_context_notice", "_track_context",
-    "_owner_turn_busy",
+    "_owner_turn_busy", "_finish_turn",
 )
 
 
@@ -118,6 +118,9 @@ class FakeReporter:
     def finish(self, **kwargs):
         self.finished.append(kwargs)
 
+    def text(self, text):
+        self.texts = getattr(self, "texts", []) + [text]
+
     def delivered(self):
         self.answered = True
 
@@ -155,7 +158,9 @@ class FakeSession:
         self.reporter = reporter
         self.delegation_tracker = FakeTracker()
         self.pending_tools = PendingTools()
-        self.background_tasks = BackgroundTasks()
+        self.review = False
+        self.background_agents = BackgroundAgents()
+        self.settle = SettleGate(0.01)
         self.escalation_message_file = None
         self.escalation_receipt_file = None
         self.private_escalation_pending = False
@@ -178,6 +183,83 @@ def assistant_text(*texts):
 
 def result(sid="s-2"):
     return {"type": "result", "session_id": sid}
+
+
+def agent_started(task_id):
+    return {"type": "system", "subtype": "task_started", "task_id": task_id, "task_type": "local_agent"}
+
+
+def task_done(task_id):
+    return {"type": "system", "subtype": "task_notification", "task_id": task_id, "status": "completed"}
+
+
+class ManualTimer:
+    def __init__(self, created):
+        self.created = created
+
+    def __call__(self, interval, fn, args=()):
+        timer = _Scheduled(fn, args)
+        self.created.append(timer)
+        return timer
+
+
+class _Scheduled:
+    def __init__(self, fn, args):
+        self.fn, self.args, self.daemon = fn, args, False
+
+    def start(self):
+        pass
+
+    def fire(self):
+        self.fn(*self.args)
+
+
+class ReviewReaderTest(unittest.TestCase):
+    def review_session(self, events):
+        self.timers = []
+        session = FakeSession(events, on_text=lambda text: None, reporter=FakeReporter(active=True))
+        session.review = True
+        session.settle = SettleGate(15, timer=ManualTimer(self.timers))
+        return session
+
+    def test_a_result_while_finders_run_pauses_the_review(self):
+        session = self.review_session([agent_started("a"), assistant_text("waiting on finders"), result()])
+        load_functions()["_reader_loop"](session)
+        self.assertEqual([], self.timers, "nothing schedules the end while a finder runs")
+        self.assertEqual([{"state": "stopped"}], session.reporter.finished, "only the process exit finished it")
+        self.assertEqual(["waiting on finders"], session.reporter.texts)
+
+    def test_the_review_ends_after_the_wake_turn_and_a_quiet_grace(self):
+        session = self.review_session([
+            agent_started("a"), result(), task_done("a"), assistant_text("summary"), result("s-5"),
+        ])
+        load_functions()["_reader_loop"](session)
+        self.assertEqual(1, len(self.timers))
+        session.reporter.finished.clear()
+        self.timers[0].fire()
+        self.assertEqual([{"post_reply": True}], session.reporter.finished)
+
+    def test_a_later_event_cancels_a_scheduled_end(self):
+        session = self.review_session([result(), task_done("ghost"), assistant_text("more"), result("s-6")])
+        load_functions()["_reader_loop"](session)
+        self.assertEqual(2, len(self.timers))
+        session.reporter.finished.clear()
+        self.timers[0].fire()
+        self.assertEqual([], session.reporter.finished, "the first end was superseded")
+        self.timers[1].fire()
+        self.assertEqual([{"post_reply": True}], session.reporter.finished)
+
+    def test_a_review_never_consumes_bundle_or_parking_claims(self):
+        consumed = []
+        session = self.review_session([result()])
+        session.workspace = type("W", (), {
+            "bundle_claim_file": Path(__file__), "parking_claim_file": Path(__file__), "root": Path("."),
+        })()
+        load_functions(
+            consume_bundle_claim=lambda *args, **kwargs: consumed.append("bundle"),
+            consume_parking_claim=lambda *args, **kwargs: consumed.append("parking"),
+        )["_reader_loop"](session)
+        self.assertEqual([], consumed)
 
 
 class HarnessTest(unittest.TestCase):

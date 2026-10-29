@@ -139,63 +139,67 @@ class PendingTools:
             self._issued.clear()
 
 
-class BackgroundTasks:
-    """The owner's background tasks still running, and whether a finished one has yet to wake it.
+class BackgroundAgents:
+    """Background subagents the owner started and has not yet been notified about.
 
-    A background task reports through a task_notification, often after the owner's turn has ended;
-    the CLI then starts a new turn to consume it, so busy() holds until that turn's result. Tasks the
-    turn awaits, and tasks owned by a subagent, finish inside a turn and are left out.
+    Only agent tasks count; a background shell or Monitor timer dies with the process rather than
+    holding it open. Tasks the turn awaits, and tasks owned by a subagent, finish inside a turn.
     """
 
     def __init__(self) -> None:
         self._running: set[str] = set()
-        self._wake_pending = False
         self._lock = threading.Lock()
 
     def observe(self, event: Mapping[str, Any]) -> None:
-        event_type = event.get("type")
-        subtype = event.get("subtype")
+        if event.get("type") != "system":
+            return
         task_id = event.get("task_id")
+        if not isinstance(task_id, str):
+            return
         with self._lock:
-            if event_type == "result":
-                self._wake_pending = False
-            elif event_type != "system" or not isinstance(task_id, str):
-                return
-            elif subtype == "task_started":
-                if not (event.get("awaited") or event.get("owned_by_subagent") or event.get("ambient")):
+            if event.get("subtype") == "task_started":
+                if (event.get("task_type") == "local_agent"
+                        and not (event.get("awaited") or event.get("owned_by_subagent") or event.get("ambient"))):
                     self._running.add(task_id)
-            elif subtype == "task_notification" and task_id in self._running:
+            elif event.get("subtype") == "task_notification":
                 self._running.discard(task_id)
-                self._wake_pending = True
 
-    def busy(self) -> bool:
+    def running(self) -> bool:
         with self._lock:
-            return bool(self._running) or self._wake_pending
+            return bool(self._running)
 
 
-def await_background_settle(
-    tasks: BackgroundTasks,
-    done_event: Any,
-    *,
-    alive: Callable[[], bool],
-    deadline: float,
-    clock: Callable[[], float] = time.monotonic,
-    poll_interval: float = 5.0,
-) -> bool:
-    """Hold a finished turn open until its background tasks report and the woken turn ends.
+class SettleGate:
+    """Ends a turn only once its last result is followed by a quiet grace period.
 
-    Returns False when the process exits or the deadline passes with work still outstanding.
+    Any later stream event (a task notification, or the turn the CLI starts to consume one) cancels
+    the pending end; that turn's own result schedules a new one.
     """
-    while tasks.busy():
-        if not alive():
-            return False
-        remaining = deadline - clock()
-        if remaining <= 0:
-            return False
-        done_event.clear()
-        if tasks.busy():
-            done_event.wait(timeout=min(poll_interval, remaining))
-    return True
+
+    def __init__(self, grace: float, timer: Callable[..., Any] = threading.Timer) -> None:
+        self._grace = grace
+        self._timer = timer
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    def event(self) -> None:
+        with self._lock:
+            self._seq += 1
+
+    def result(self, finish: Callable[[], None]) -> None:
+        with self._lock:
+            self._seq += 1
+            mine = self._seq
+        timer = self._timer(self._grace, self._fire, args=(mine, finish))
+        timer.daemon = True
+        timer.start()
+
+    def _fire(self, mine: int, finish: Callable[[], None]) -> None:
+        with self._lock:
+            if self._seq != mine:
+                return
+            self._seq += 1
+        finish()
 
 
 def stop_timed_out_session(session: Any, interrupt) -> str:

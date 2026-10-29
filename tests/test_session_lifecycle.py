@@ -3,9 +3,9 @@ import unittest
 from unittest import mock
 
 from session_lifecycle import (
-    BackgroundTasks,
+    BackgroundAgents,
     PendingTools,
-    await_background_settle,
+    SettleGate,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -287,99 +287,70 @@ class SessionLifecycleTests(unittest.TestCase):
         self.assertTrue(owner_stream_event_is_activity({"type": "assistant"}))
 
 
-def task_started(task_id, **extra):
-    return {"type": "system", "subtype": "task_started", "task_id": task_id, **extra}
+def started(task_id, **extra):
+    return {"type": "system", "subtype": "task_started", "task_id": task_id, "task_type": "local_agent", **extra}
 
 
-def task_notification(task_id):
+def notified(task_id):
     return {"type": "system", "subtype": "task_notification", "task_id": task_id, "status": "completed"}
 
 
-class BackgroundTasksTest(unittest.TestCase):
-    def test_background_task_holds_until_the_woken_turn_ends(self):
-        tasks = BackgroundTasks()
-        tasks.observe(task_started("a"))
-        tasks.observe({"type": "result"})
-        self.assertTrue(tasks.busy(), "the turn ended with the finder still running")
-        tasks.observe(task_notification("a"))
-        self.assertTrue(tasks.busy(), "the CLI has yet to run the turn that consumes it")
-        tasks.observe({"type": "result"})
-        self.assertFalse(tasks.busy())
+class BackgroundAgentsTest(unittest.TestCase):
+    def test_a_background_agent_runs_until_its_notification(self):
+        agents = BackgroundAgents()
+        agents.observe(started("a"))
+        agents.observe(started("b"))
+        agents.observe({"type": "result"})
+        self.assertTrue(agents.running())
+        agents.observe(notified("a"))
+        self.assertTrue(agents.running())
+        agents.observe(notified("b"))
+        self.assertFalse(agents.running())
 
-    def test_awaited_subagent_owned_and_ambient_tasks_are_ignored(self):
-        tasks = BackgroundTasks()
-        tasks.observe(task_started("a", awaited=True))
-        tasks.observe(task_started("b", owned_by_subagent=True))
-        tasks.observe(task_started("c", ambient=True))
-        tasks.observe(task_notification("a"))
-        self.assertFalse(tasks.busy())
+    def test_shell_awaited_subagent_owned_and_ambient_tasks_are_ignored(self):
+        agents = BackgroundAgents()
+        agents.observe({"type": "system", "subtype": "task_started", "task_id": "s", "task_type": "local_bash"})
+        agents.observe(started("w", awaited=True))
+        agents.observe(started("o", owned_by_subagent=True))
+        agents.observe(started("m", ambient=True))
+        self.assertFalse(agents.running())
 
-    def test_unknown_notification_and_malformed_events_change_nothing(self):
-        tasks = BackgroundTasks()
-        tasks.observe(task_notification("ghost"))
-        tasks.observe({"type": "system", "subtype": "task_started"})
-        tasks.observe({"type": "system", "subtype": "task_started", "task_id": 7})
-        self.assertFalse(tasks.busy())
-
-    def test_notification_inside_a_running_turn_clears_at_its_result(self):
-        tasks = BackgroundTasks()
-        tasks.observe(task_started("a"))
-        tasks.observe(task_notification("a"))
-        tasks.observe({"type": "result"})
-        self.assertFalse(tasks.busy())
+    def test_malformed_events_change_nothing(self):
+        agents = BackgroundAgents()
+        agents.observe({"type": "system", "subtype": "task_started", "task_type": "local_agent"})
+        agents.observe(started(7))
+        agents.observe(notified("ghost"))
+        self.assertFalse(agents.running())
 
 
-class AwaitBackgroundSettleTest(unittest.TestCase):
-    def test_returns_at_once_when_nothing_is_outstanding(self):
-        done = threading.Event()
-        self.assertTrue(await_background_settle(
-            BackgroundTasks(), done, alive=lambda: True, deadline=0, clock=FakeClock(),
-        ))
+class SettleGateTest(unittest.TestCase):
+    def setUp(self):
+        self.timers = []
 
-    def test_waits_through_the_wake_turn(self):
-        clock = FakeClock()
-        tasks = BackgroundTasks()
-        tasks.observe(task_started("a"))
-        tasks.observe({"type": "result"})
-        events = [task_notification("a"), {"type": "result"}]
+        def timer(interval, fn, args=()):
+            self.assertEqual(15, interval)
+            scheduled = mock.MagicMock()
+            scheduled.fire = lambda: fn(*args)
+            self.timers.append(scheduled)
+            return scheduled
 
-        class Done:
-            waits = 0
+        self.gate = SettleGate(15, timer=timer)
+        self.finished = []
 
-            def clear(self):
-                pass
+    def test_a_quiet_grace_ends_the_turn_once(self):
+        self.gate.result(lambda: self.finished.append(1))
+        self.timers[0].start.assert_called_once_with()
+        self.timers[0].fire()
+        self.timers[0].fire()
+        self.assertEqual([1], self.finished)
 
-            def wait(self, timeout):
-                clock.now += timeout
-                Done.waits += 1
-                if events:
-                    tasks.observe(events.pop(0))
-                return True
-
-        self.assertTrue(await_background_settle(
-            tasks, Done(), alive=lambda: True, deadline=100, clock=clock, poll_interval=5,
-        ))
-        self.assertEqual(2, Done.waits)
-
-    def test_deadline_with_work_outstanding_fails(self):
-        clock = FakeClock()
-        tasks = BackgroundTasks()
-        tasks.observe(task_started("a"))
-        done = FakeDoneEvent(clock)
-        done.clear = lambda: None
-        self.assertFalse(await_background_settle(
-            tasks, done, alive=lambda: True, deadline=12, clock=clock, poll_interval=5,
-        ))
-        self.assertEqual(12, clock.now)
-
-    def test_exited_process_fails_without_waiting(self):
-        tasks = BackgroundTasks()
-        tasks.observe(task_started("a"))
-        done = mock.MagicMock()
-        self.assertFalse(await_background_settle(
-            tasks, done, alive=lambda: False, deadline=100, clock=FakeClock(),
-        ))
-        done.wait.assert_not_called()
+    def test_any_later_event_cancels_the_pending_end(self):
+        self.gate.result(lambda: self.finished.append("first"))
+        self.gate.event()
+        self.gate.result(lambda: self.finished.append("second"))
+        self.timers[0].fire()
+        self.timers[1].fire()
+        self.assertEqual(["second"], self.finished)
 
 
 if __name__ == "__main__":

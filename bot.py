@@ -124,13 +124,13 @@ from review_requests import (
     lookup_pr,
 )
 from session_lifecycle import (
-    BackgroundTasks,
+    BackgroundAgents,
     PendingTools,
+    SettleGate,
     TurnAdmission,
     oldest_evictable_session,
     owner_stream_event_is_activity,
     stop_timed_out_session,
-    await_background_settle,
     wait_for_turn_completion,
 )
 from governed_delegation import (
@@ -243,8 +243,10 @@ SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 CLAUDE_TIMEOUT = RUNTIME_POLICY.claude_timeout
 DELEGATE_TIMEOUT = delegate_timeout_from_env(os.environ)
 MAX_TURN_RUNTIME = max(RUNTIME_POLICY.max_turn_runtime, DELEGATE_TIMEOUT + CLAUDE_TIMEOUT)
-# How long a review turn that has replied may wait on its background finders.
-REVIEW_BACKGROUND_LIMIT = 45 * 60
+# A review turn's whole runtime, including the background finders it waits on.
+REVIEW_MAX_RUNTIME = 45 * 60
+# Quiet time after a review's last result before it ends; a queued task notification starts its turn first.
+REVIEW_SETTLE_GRACE = 15.0
 
 # Channel filtering — only respond in channels whose names contain one of these substrings.
 # Applies to both public and private channels. Sender authorization is a
@@ -707,7 +709,10 @@ class LiveSession:
     workspace: ThreadWorkspace | None = None
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
     pending_tools: PendingTools = field(default_factory=PendingTools)
-    background_tasks: BackgroundTasks = field(default_factory=BackgroundTasks)
+    # A review turn: fresh, never resumed, closed when the review ends
+    review: bool = False
+    background_agents: BackgroundAgents = field(default_factory=BackgroundAgents)
+    settle: SettleGate = field(default_factory=lambda: SettleGate(REVIEW_SETTLE_GRACE))
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
     # Set while a stop kills this process tree, and set again once that stop is finished.
@@ -1119,6 +1124,44 @@ def _stop_unread_process(session: LiveSession) -> None:
         logger.warning(f"Could not stop pid={session.proc.pid}: {e}")
 
 
+def _finish_turn(session: LiveSession, parking=None, parking_refused: str | None = None) -> None:
+    """Deliver the turn's held text, finish its reporter and release the waiting request."""
+    if session.private_escalation_pending:
+        delivered = bool(
+            session.escalation_receipt_file
+            and session.escalation_receipt_file.is_file()
+        )
+        if session.escalation_receipt_file:
+            try:
+                session.escalation_receipt_file.unlink()
+            except OSError:
+                pass
+        status = private_escalation_status(
+            delivered=delivered,
+            parking=parking,
+            parking_refused=bool(parking_refused),
+        )
+        if session._on_text:
+            _deliver_text(session, status)
+    else:
+        for text in session.pre_tool_text:
+            if session._on_text:
+                _deliver_text(session, text)
+    if session.reporter:
+        session.reporter.finish(post_reply=not session.private_escalation_pending)
+    session.private_escalation_pending = False
+    session.first_tool_seen = False
+    session.pre_tool_text.clear()
+    # Clear eyes reactions from steering messages this turn absorbed
+    while session.pending_reactions:
+        ch, ts = session.pending_reactions.pop(0)
+        try:
+            slack_client.reactions_remove(channel=ch, name="eyes", timestamp=ts)
+        except Exception:
+            pass
+    session._turn_done.set()
+
+
 def _reader_loop(session: LiveSession) -> None:
     """Read stdout from a live Claude process and post responses to Slack.
 
@@ -1147,7 +1190,9 @@ def _reader_loop(session: LiveSession) -> None:
                     session.reporter.activity()
             session.delegation_tracker.observe(data)
             session.pending_tools.observe(data)
-            session.background_tasks.observe(data)
+            session.background_agents.observe(data)
+            if session.review:
+                session.settle.event()
 
             if msg_type == "system":
                 sid = data.get("session_id")
@@ -1227,7 +1272,8 @@ def _reader_loop(session: LiveSession) -> None:
                         channel=session.channel,
                         thread=session.thread_ts,
                     ))
-                if session.workspace and session.workspace.bundle_claim_file.exists():
+                # A review turn has no bundle binding or parking claim.
+                if not session.review and session.workspace and session.workspace.bundle_claim_file.exists():
                     try:
                         bundle = consume_bundle_claim(
                             session.workspace,
@@ -1248,7 +1294,7 @@ def _reader_loop(session: LiveSession) -> None:
                             )
                 parking = None
                 parking_refused = None
-                if session.workspace and session.workspace.parking_claim_file.exists():
+                if not session.review and session.workspace and session.workspace.parking_claim_file.exists():
                     try:
                         parking = consume_parking_claim(session.workspace)
                     except SafetyError as exc:
@@ -1277,40 +1323,17 @@ def _reader_loop(session: LiveSession) -> None:
                             thread=session.thread_ts,
                             session_id=sid,
                         )
-                if session.private_escalation_pending:
-                    delivered = bool(
-                        session.escalation_receipt_file
-                        and session.escalation_receipt_file.is_file()
-                    )
-                    if session.escalation_receipt_file:
-                        try:
-                            session.escalation_receipt_file.unlink()
-                        except OSError:
-                            pass
-                    status = private_escalation_status(
-                        delivered=delivered,
-                        parking=parking,
-                        parking_refused=bool(parking_refused),
-                    )
-                    if session._on_text:
-                        _deliver_text(session, status)
-                else:
-                    for text in session.pre_tool_text:
-                        if session._on_text:
-                            _deliver_text(session, text)
-                if session.reporter:
-                    session.reporter.finish(post_reply=not session.private_escalation_pending)
-                session.private_escalation_pending = False
-                session.first_tool_seen = False
-                session.pre_tool_text.clear()
-                # Clear eyes reactions from steering messages this turn absorbed
-                while session.pending_reactions:
-                    ch, ts = session.pending_reactions.pop(0)
-                    try:
-                        slack_client.reactions_remove(channel=ch, name="eyes", timestamp=ts)
-                    except Exception:
-                        pass
-                session._turn_done.set()
+                if session.review:
+                    # A review that ended its turn to wait on background finders is not done yet.
+                    if session.reporter and session.reporter.active:
+                        for text in session.pre_tool_text:
+                            session.reporter.text(text)
+                        session.pre_tool_text.clear()
+                    session.first_tool_seen = False
+                    if not session.background_agents.running():
+                        session.settle.result(lambda: _finish_turn(session))
+                    continue
+                _finish_turn(session, parking=parking, parking_refused=parking_refused)
 
     except Exception as e:
         logger.error(f"Reader loop error for thread {session.thread_ts}: {e}")
@@ -1386,6 +1409,7 @@ def _get_or_create_live_session(
             escalation_message_file=None if fresh else workspace.escalation_message_file,
             escalation_receipt_file=None if fresh else workspace.escalation_receipt_file,
             workspace=workspace,
+            review=fresh,
         )
         _live_sessions[thread_ts] = session
 
@@ -2592,7 +2616,8 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
         # If another message is already being processed, we block here.
         if session:
             with session.turn_lock:
-                turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
+                turn_limit = min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME) if review else MAX_TURN_RUNTIME
+                turn_deadline = time.monotonic() + turn_limit
                 session._on_text = on_text
                 if session.reporter and session.reporter.active:
                     session.reporter.finish(state="stopped")
@@ -2636,9 +2661,10 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                         text=(
                             (f"Turn went {minutes} minutes with no output and no tool running; stopped. "
                              if timeout_limit == "inactivity" else
-                             f"Turn reached its {format_elapsed(MAX_TURN_RUNTIME)} hard limit; stopped. ")
-                            + "Working files and thread continuity were preserved; "
-                            "tell me to resume when ready."
+                             f"Turn reached its {format_elapsed(turn_limit)} hard limit; stopped. ")
+                            + ("Ask again to rerun the review." if review else
+                               "Working files and thread continuity were preserved; "
+                               "tell me to resume when ready.")
                             + ("" if stop_outcome != "still running"
                                else f" But I {_STILL_RUNNING_NOTE.format(pid=session.proc.pid)}.")
                         ),
@@ -2649,36 +2675,6 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                         user_id, channel, thread_ts,
                         timeout_limit,
                         stop_outcome,
-                        session.session_id or "none",
-                    )
-                    return
-
-                # A review turn may end while its finders run in the background; the process
-                # closes after this, so wait here for them and for the turn that consumes them.
-                if review and not await_background_settle(
-                    session.background_tasks,
-                    session._turn_done,
-                    alive=lambda: session.proc.poll() is None,
-                    deadline=min(turn_deadline, time.monotonic() + REVIEW_BACKGROUND_LIMIT),
-                ):
-                    exited = session.proc.poll() is not None
-                    session._on_text = None
-                    try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-                    except Exception: pass
-                    slack_client.chat_postMessage(
-                        channel=channel, thread_ts=thread_ts,
-                        text=(
-                            "The review did not finish: "
-                            + ("its process exited while background work was outstanding. "
-                               if exited else
-                               f"background work was still running after {format_elapsed(REVIEW_BACKGROUND_LIMIT)}. ")
-                            + "Nothing more will be posted from it; ask again to rerun the review."
-                        ),
-                    )
-                    logger.warning(
-                        "REVIEW_UNFINISHED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s | SESSION:%s",
-                        user_id, channel, thread_ts,
-                        "exited" if exited else "limit",
                         session.session_id or "none",
                     )
                     return
@@ -2709,6 +2705,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
 
                 # Check if the process died without producing a response
                 if (not all_texts and not skip_detected and session.proc.poll() is not None
+                        and not (review and session.stop_done)
                         and not (session.reporter and session.reporter.noticed_no_reply)):
                     try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                     except Exception: pass
@@ -2769,6 +2766,8 @@ def _owner_turn_busy(session: LiveSession) -> bool:
     """Work the turn is waiting on that streams nothing: a pending tool call or a governed delegate."""
     if session.pending_tools.active():
         return True
+    if session.review and session.background_agents.running():
+        return True
     return bool(session.workspace and governed_delegate_active(session.workspace.delegate_pid_file))
 
 
@@ -2806,6 +2805,19 @@ _STILL_RUNNING_NOTE = (
     "tried to stop the process but could not confirm it exited (pid {pid}); "
     "check the host before resuming this thread"
 )
+
+
+def _stop_review(session: LiveSession) -> str:
+    """Kill a review's process tree; returns "review stopped" or "still running"."""
+    session.stop_done = threading.Event()
+    try:
+        gone = stop_process_tree(session.proc)
+    except Exception as e:
+        logger.warning(f"Could not stop review pid={session.proc.pid}: {e}")
+        gone = False
+    finally:
+        session.stop_done.set()
+    return "review stopped" if gone else "still running"
 
 
 def _stop_background_delegates(session) -> None:
@@ -2928,8 +2940,14 @@ def _maybe_stop_from_message(event: dict) -> bool:
     def _do_stop():
         if session.reporter:
             session.reporter.mark_stopped()
-        outcome = _interrupt_session(session)
-        if outcome == "interrupted":
+        if session.review:
+            # A review never resumes, and it may be idle waiting on finders; end the process.
+            outcome = _stop_review(session)
+        else:
+            outcome = _interrupt_session(session)
+        if outcome == "review stopped":
+            note = "stopped the review; ask again to rerun it"
+        elif outcome == "interrupted":
             note = "stopped mid-run — tell me where to go instead"
         elif outcome == "killed":
             note = "had to hard-kill the process; the thread resumes with full context on your next message"

@@ -27,6 +27,15 @@ cap record, and PRs past `peer_review.max_reviews_per_pr` (default 3, range 1–
 redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line. A
 review-only room without a valid `peer_review.self_github_login` is refused.
 
+A review turn stays open while background subagents it started (the review's finders) are
+running: a `result` in that state pauses the turn instead of ending it. The turn ends 15 seconds
+(`REVIEW_SETTLE_GRACE`) after a result with no finder running and no further output, so a
+finished finder's notification starts its own turn first. Background shell tasks and `Monitor`
+timers do not hold it open; they die with the process. The whole review is bounded by
+`REVIEW_MAX_RUNTIME` (45 minutes) and the usual inactivity limit, and holds its turn-admission
+slot until it ends. `stop` in a review thread ends the process; a review is never resumed. A
+review turn never consumes a bundle or parking claim.
+
 The sending side is `bot.py --request-review <PR URL>`, which normal turns are told about. It
 takes only the URL, checks that the PR is open and authored by this agent's own App, and posts
 `<@peer> please review <URL>` in the single review-only room to the single configured peer bot.

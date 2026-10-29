@@ -35,7 +35,6 @@ from cargo_chief_safety import (
     prepare_thread_workspace,
     review_turn_env,
 )
-from session_lifecycle import BackgroundTasks
 from review_requests import (
     BUSY_REPLY,
     CAP_REPLY,
@@ -93,7 +92,7 @@ def load(**overrides):
         "github_wrapper_downscopes": github_wrapper_downscopes,
         "BUSY_REPLY": BUSY_REPLY, "CONFIG_REPLY": CONFIG_REPLY, "ERROR_REPLY": ERROR_REPLY,
         "WRAPPER_REPLY": WRAPPER_REPLY, "PROVIDER_REPLY": "paused",
-        "BOT_USER_ID": "ULISA", "MAX_TURN_RUNTIME": 60, "CLAUDE_TIMEOUT": 60, "REVIEW_BACKGROUND_LIMIT": 45,
+        "BOT_USER_ID": "ULISA", "MAX_TURN_RUNTIME": 60, "CLAUDE_TIMEOUT": 60, "REVIEW_MAX_RUNTIME": 45,
         "STOP_WAIT_SECONDS": 1, "MAX_LIVE_SESSIONS": 2,
         "logger": logging.getLogger("test-review-turn"),
         "audit_logger": logging.getLogger("test-review-turn-audit"),
@@ -234,7 +233,6 @@ class FakeSession:
         self.session_id = None
         self.pending_reactions = []
         self.pending_tools = mock.MagicMock()
-        self.background_tasks = BackgroundTasks()
         self._turn_done = threading.Event()
         self.thread_ts = "1.1"
 
@@ -295,29 +293,27 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual(["accepted"], self.outcomes())
         self.assertEqual([self.session], self.closed)
 
-    def test_review_waits_for_background_work_before_closing(self):
-        calls = []
+    def test_a_review_turn_is_bounded_by_the_review_limit(self):
+        limits = []
 
-        def settle(tasks, done, *, alive, deadline):
-            calls.append((tasks, done, alive()))
-            self.assertEqual([], self.closed, "the process is still open while it waits")
+        def wait(*args, max_duration, **kwargs):
+            limits.append(max_duration)
             return True
 
-        self.ns["await_background_settle"] = settle
+        self.ns["wait_for_turn_completion"] = wait
         self.run_turn(self.admission())
-        self.assertEqual([(self.session.background_tasks, self.session._turn_done, True)], calls)
-        self.assertEqual([self.session], self.closed)
-        self.assertEqual(["accepted"], self.outcomes())
+        self.assertEqual(1, len(limits))
+        self.assertLessEqual(limits[0], 45)
 
-    def test_unfinished_review_says_so_and_closes(self):
+    def test_a_timed_out_review_asks_for_a_rerun_not_a_resume(self):
         posted = []
         self.ns["slack_client"].chat_postMessage.side_effect = lambda **kwargs: posted.append(kwargs["text"])
-        self.ns["await_background_settle"] = lambda *args, **kwargs: False
+        self.ns["stop_timed_out_session"] = lambda session, interrupt: "interrupted"
+        self.ns["wait_for_turn_completion"] = lambda *args, **kwargs: False
         self.run_turn(self.admission())
         self.assertEqual(1, len(posted))
-        self.assertIn("The review did not finish", posted[0])
-        self.assertIn("still running", posted[0])
-        self.assertIsNone(self.session._on_text)
+        self.assertIn("Ask again to rerun the review.", posted[0])
+        self.assertNotIn("resume", posted[0])
         self.assertEqual([self.session], self.closed)
 
     def test_unauthorized_sender_is_still_refused_in_a_normal_room(self):
