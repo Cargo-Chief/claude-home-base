@@ -148,10 +148,10 @@ class ReviewPostTest(unittest.TestCase):
         self.assertIn("ready-for-review", approval_refusal(**{**ok, "pull": {**OPEN, "draft": True}}))
         self.assertIn("ready-for-review", approval_refusal(**{**ok, "pull": {**OPEN, "state": "closed"}}))
 
-    def test_submit_posts_the_review_before_resolving_threads(self):
+    def test_an_approval_posts_after_its_thread_work(self):
         github = FakeGitHub(threads=[thread("T1"), thread("T2", login="nedcc"), thread("T3", resolved=True)])
         out = submit(github, PR, payload(), "approve", ["T1", "T3"], ENV)
-        self.assertEqual(["pull", "threads", "pull", "submit", "resolve:T1"], github.names())
+        self.assertEqual(["pull", "threads", "resolve:T1", "pull", "submit"], github.names())
         self.assertIn("APPROVE review posted", out)
         self.assertIn("resolved 1 threads", out)
 
@@ -246,7 +246,7 @@ class ReviewPassPostTest(unittest.TestCase):
         github = FakeGitHub(threads=[thread("T1")])
         body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed in abc."}]}
         submit(github, PR, body, "approve", ["T1"], CLOSEOUT)
-        self.assertEqual(["pull", "threads", "compare", "pull", "submit", "reply:T1", "resolve:T1"], github.names())
+        self.assertEqual(["pull", "threads", "compare", "reply:T1", "resolve:T1", "pull", "submit"], github.names())
         self.assertIn("mode=closeout", github.submitted["body"])
 
     def test_replies_post_after_the_review_and_before_resolving(self):
@@ -300,6 +300,24 @@ class ReviewPassFixesTest(unittest.TestCase):
             self.assertNotIn("submit", github.names())
         with self.assertRaisesRegex(ReviewPostError, "rewritten"):
             submit(FakeGitHub(), PR, payload(), "approve", [], {**CLOSEOUT, "CARGO_CHIEF_REVIEW_BASE": ""})
+
+
+class ReReviewFixesTest(unittest.TestCase):
+    def test_an_approval_is_withheld_when_its_thread_work_fails(self):
+        github = FakeGitHub(threads=[thread("T1")], reply_error=ReviewPostError("graphql failed"))
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed."}]}
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted"):
+            submit(github, PR, body, "approve", ["T1"], ENV)
+        self.assertNotIn("submit", github.names())
+        self.assertNotIn("resolve:T1", github.names())
+
+    def test_a_closeout_that_does_not_approve_keeps_the_base(self):
+        github = FakeGitHub()
+        submit(github, PR, payload(body="New commits go beyond the fixes; Kirk needs to look."), "comment", [], CLOSEOUT)
+        self.assertTrue(github.submitted["body"].endswith(f"head={'b' * 40} -->"))
+        approved = FakeGitHub()
+        submit(approved, PR, payload(), "approve", [], CLOSEOUT)
+        self.assertTrue(approved.submitted["body"].endswith(f"head={HEAD} -->"))
 
 
 if __name__ == "__main__":
