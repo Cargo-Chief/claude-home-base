@@ -241,5 +241,14 @@ class BotTurnStructureTest(unittest.TestCase):
         lookup = ast.unparse(self._function("_lookup_review_pr"))
         self.assertIn("review_turn_env(claude_owner_env(os.environ))", lookup)
 
+    def test_review_spawn_passes_self_and_requester_logins(self):
+        spawn = ast.unparse(self._function("_spawn_claude_process"))
+        self.assertIn("self_login=peer.self_github_login", spawn)
+        self.assertIn("requester_login=peer.github_logins.get(user_id, '')", spawn)
+        self.assertIn("pr=review_pr", spawn)
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("review_pr=review_admission.pr if review else ''", process)
+        self.assertIn("build_review_task(review_admission.pr, room_policy.root)", process)
+
 if __name__ == "__main__":
     unittest.main()

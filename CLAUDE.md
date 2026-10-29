@@ -44,5 +44,7 @@ preflight. Keep broadly useful transport improvements separable so they can be p
 - A review turn's process is closed when the turn ends, so the reader ends a review only at a
   `result` after its `REVIEW_DONE_MARKER` line with no background subagent running
   (`session_lifecycle.BackgroundAgents`); every other `result` is a pause. See README
+- A review turn writes to GitHub only through `review_post.py` (verdict, inline comments, resolving
+  its own threads); approvals need the requester in `peer_review.github_logins`. See README
 
 Keep this CLAUDE.md up-to-date with the latest changes / decisions made in the project.
