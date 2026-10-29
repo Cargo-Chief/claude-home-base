@@ -39,9 +39,10 @@ not moved, no inline findings, none of the agent's own threads left open, a requ
 not write. A requester may get an approval on their own PR, and a bot approval counts toward branch
 protection's required review; both are by design. Which threads a new head fixes, and the verdict
 itself, are the model's judgement. A review turn's file tools are denied inside the checkouts
-(`claude-home-base`, `docs`, `agent-kit`, `repos`, `worktrees`), so it cannot rewrite the script.
-The deny rules still cover only what the agent types or edits with its tools, not code it writes
-under `work/` and runs, so the script's checks are guardrails rather than a sandbox.
+(`claude-home-base`, `docs`, `agent-kit`, `repos`, `worktrees`). Bash deny rules match command
+text, so a shell write into those checkouts, or code the agent writes under `work/` and runs, is
+not blocked: the script's checks are guardrails rather than a sandbox, and a turn that ignores its
+task can still use its PR-write token directly.
 
 The review task asks the model to end its final reply with a line reading `REVIEW COMPLETE`
 (`REVIEW_DONE_MARKER`; case, trailing punctuation and markdown emphasis are ignored). The message

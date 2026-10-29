@@ -1098,7 +1098,7 @@ class ReviewOnlyRoomTest(unittest.TestCase):
         for needle in (
             "git push", "gh pr merge", "gh pr ready", "gh pr close", "gh pr reopen", "gh pr edit",
             "--approve", "event=APPROVE", "deploy", "aws ", "jira_service.py",
-            "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS", "CARGO_CHIEF_REVIEW_ONLY", "CARGO_CHIEF_REVIEW_PR=", "github-app" + ".env",
+            "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS", "CARGO_CHIEF_REVIEW_ONLY", "CARGO_CHIEF_REVIEW_PR","github-app" + ".env",
             ".pem",
         ):
             self.assertTrue(any(needle in rule for rule in REVIEW_ONLY_DENY_RULES), needle)
@@ -1152,6 +1152,9 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN=kfranzenCC " + wrap + "python3 review_post.py submit x",
             "export CARGO_CHIEF_REVIEW_SELF_LOGIN=someone",
             "export CARGO_CHIEF_REVIEW_PR=https://github.com/Cargo-Chief/c4/pull/9",
+            "CARGO_CHIEF_REVIEW_PR+=https://github.com/Cargo-Chief/c4/pull/9 " + wrap + "python3 review_post.py submit x",
+            "read CARGO_CHIEF_REVIEW_PR <<< https://github.com/Cargo-Chief/c4/pull/9",
+            "printf -v CARGO_CHIEF_REVIEW_PR %s https://github.com/Cargo-Chief/c4/pull/9",
         ):
             with self.subTest(blocked=blocked):
                 self.assertNotEqual([], denied(blocked))

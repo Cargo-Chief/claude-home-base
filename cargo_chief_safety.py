@@ -1076,7 +1076,7 @@ REVIEW_ONLY_DENY_RULES = (
     "Bash(*CARGO_CHIEF_REVIEW_ONLY*)",
     "Bash(*CARGO_CHIEF_REVIEW_SELF_LOGIN*)",
     "Bash(*CARGO_CHIEF_REVIEW_REQUESTER_LOGIN*)",
-    "Bash(*CARGO_CHIEF_REVIEW_PR=*)",
+    "Bash(*CARGO_CHIEF_REVIEW_PR*)",
     "Bash(*github-app.env*)",
     "Bash(*.pem*)",
     "Bash(*env -i*)",
