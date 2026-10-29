@@ -45,6 +45,7 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_sdk import WebClient
 
 from cargo_chief_safety import (
+    HANDOFF_CLAIM_NAME,
     AuthorityPolicy,
     RuntimePolicy,
     SafetyError,
@@ -92,6 +93,15 @@ from agent_status import (
 )
 from delegation_observability import DelegationTracker, format_delegation_audit
 from turn_reporter import TurnReporter, format_elapsed, tick_all
+from thread_handoff import (
+    HandoffRequest,
+    consume_handoff_claim,
+    discard_handoff_claim,
+    handoff_refusal,
+    handoff_turn_message,
+    new_thread_text,
+    source_thread_text,
+)
 from process_control import close_process_tree, stop_process_tree
 from slack_transport import NoUnfurlMixin, RecentEvents
 from openai_fallback import (
@@ -876,6 +886,7 @@ def _spawn_claude_process(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=workspace.bundle_claim_file,
         parking_claim_file=workspace.parking_claim_file,
+        handoff_claim_file=None if policy.review_only else workspace.handoff_claim_file,
         identity_prompt=_identity_prompt(),
         model_prompt=model_prompt,
         session_id=session_id,
@@ -902,6 +913,7 @@ def _spawn_claude_process(
         proc_env["CARGO_CHIEF_ESCALATION_ATTEMPT_FILE"] = str(workspace.escalation_attempt_file)
         proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
         proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
+        proc_env["CARGO_CHIEF_HANDOFF_CLAIM_FILE"] = str(workspace.handoff_claim_file)
     proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
     proc_env["CARGO_CHIEF_ROOT"] = str(policy.root)
     proc_env["CARGO_CHIEF_OWNER_PROVIDER"] = "claude"
@@ -2045,6 +2057,7 @@ def _run_openai_fallback(
         workspace.escalation_receipt_file,
         workspace.escalation_attempt_file,
         workspace.parking_claim_file,
+        workspace.handoff_claim_file,
         workspace.delegation_request_file,
         workspace.implementation_claim_file,
     ):
@@ -2070,6 +2083,7 @@ def _run_openai_fallback(
         delegation_request_file=workspace.delegation_request_file,
         implementation_claim_file=workspace.implementation_claim_file,
         delegate_timeout=DELEGATE_TIMEOUT,
+        handoff_claim_file=workspace.handoff_claim_file,
         identity_prompt=_identity_prompt(),
     )
     proc_env = {**os.environ}
@@ -2083,6 +2097,7 @@ def _run_openai_fallback(
         "CARGO_CHIEF_THREAD_WORK_DIR": str(workspace.path),
         "CARGO_CHIEF_BUNDLE_CLAIM_FILE": str(workspace.bundle_claim_file),
         "CARGO_CHIEF_PARKING_CLAIM_FILE": str(workspace.parking_claim_file),
+        "CARGO_CHIEF_HANDOFF_CLAIM_FILE": str(workspace.handoff_claim_file),
         "CARGO_CHIEF_ROOT": str(policy.root),
         "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(workspace.delegation_request_file),
         "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(workspace.implementation_claim_file),
@@ -2251,7 +2266,11 @@ class _ReviewBusy(Exception):
     """A review found a turn already running in its thread."""
 
 
-def process_message_async(event: dict, review_admission: ReviewAdmission | None = None) -> None:
+def process_message_async(
+    event: dict,
+    review_admission: ReviewAdmission | None = None,
+    handoff_from: str | None = None,
+) -> None:
     """Process a message in a background thread.
 
     Uses long-lived Claude processes with stream-json I/O and a profile-governed
@@ -2263,6 +2282,9 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
     ``review_admission`` marks an admitted review request: the sender is a review requester,
     valid only in a review-only room, and the turn is a fresh harness-built review of that PR
     under the policy pinned at admission. Every refusal on that path replies and is audited.
+
+    ``handoff_from`` marks a turn this agent's own handoff started from that source thread: it runs
+    as the requester but never as an approver, and its own handoff claim is refused.
     """
     user_id = event.get("user", "")
     text = event.get("text", "").strip()
@@ -2300,7 +2322,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
     # into a new DM session. A review turn never consumes or creates a route.
     forward = None
     original_thread = None
-    if not review:
+    if not review and not handoff_from:
         route_result = _reply_routes.claim(
             from_channel=channel,
             from_thread=thread_ts,
@@ -2447,7 +2469,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
             show_reminder = True
 
     prefix = ""
-    if not review and needs_relevance_prefix(
+    if not review and not handoff_from and needs_relevance_prefix(
         event_type=event.get("type", ""),
         is_dm=is_dm,
         has_existing_session=has_existing_session,
@@ -2471,6 +2493,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
         thread_context=thread_context,
         forwarded_from=original_thread,
         review_requester=review,
+        handoff_from=handoff_from,
     )
     text = f"{build_review_task(review_admission.pr)}\n\n{envelope}" if review else prefix + envelope
 
@@ -2602,6 +2625,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                 session._turn_done.clear()
                 if session.workspace:
                     cleanup_stale_delegate_pid(session.workspace.delegate_pid_file)
+                    discard_handoff_claim(session.workspace.handoff_claim_file)
 
                 _send_to_claude(session, text)
 
@@ -2722,6 +2746,79 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
 
     full_response = "\n\n".join(all_texts)
     audit_interaction(event, full_response, duration, audit_session_id)
+    _finish_handoff(
+        room_policy.root, channel=channel, channel_type=channel_type, thread_ts=thread_ts,
+        user_id=user_id, review=review, from_handoff=bool(handoff_from),
+    )
+
+
+def _finish_handoff(
+    root: Path,
+    *,
+    channel: str,
+    channel_type: str,
+    thread_ts: str,
+    user_id: str,
+    review: bool,
+    from_handoff: bool,
+) -> None:
+    """Act on the handoff claim a completed turn wrote, if any."""
+    try:
+        workspace = validate_existing_thread_workspace(root, channel=channel, thread=thread_ts)
+    except SafetyError:
+        return
+    try:
+        request = consume_handoff_claim(workspace / HANDOFF_CLAIM_NAME)
+        if request is None:
+            return
+        refusal = handoff_refusal(review=review, from_handoff=from_handoff)
+        if refusal:
+            raise SafetyError(refusal)
+    except SafetyError as exc:
+        audit_logger.warning(
+            "HANDOFF_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+            user_id, channel, thread_ts, str(exc),
+        )
+        post_response(channel, f"Handoff refused: {exc}", thread_ts=thread_ts)
+        return
+    _start_handoff(request, user_id=user_id, channel=channel, channel_type=channel_type, source_thread=thread_ts)
+
+
+def _thread_link(channel: str, ts: str, fallback: str) -> str:
+    try:
+        return slack_client.chat_getPermalink(channel=channel, message_ts=ts)["permalink"]
+    except Exception:
+        return fallback
+
+
+def _start_handoff(
+    request: HandoffRequest, *, user_id: str, channel: str, channel_type: str, source_thread: str
+) -> None:
+    """Open the new thread, link it from the source, and start its first turn as the requester."""
+    source_link = _thread_link(channel, source_thread, "an earlier thread")
+    new_ts = post_response(channel, new_thread_text(request, source_link=source_link))
+    if not new_ts:
+        post_response(channel, "Handoff failed: Slack did not return the new thread.", thread_ts=source_thread)
+        return
+    post_response(
+        channel,
+        source_thread_text(request, new_link=_thread_link(channel, new_ts, "a new thread in this room")),
+        thread_ts=source_thread,
+    )
+    audit_logger.info(
+        "THREAD_HANDOFF | USER:%s | CHANNEL:%s | FROM:%s | TO:%s", user_id, channel, source_thread, new_ts,
+    )
+    event = {
+        "type": "handoff",
+        "user": user_id,
+        "channel": channel,
+        "channel_type": channel_type,
+        "ts": new_ts,
+        "text": handoff_turn_message(request),
+    }
+    threading.Thread(
+        target=process_message_async, args=(event,), kwargs={"handoff_from": source_thread}, daemon=True,
+    ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -2850,6 +2947,8 @@ def _maybe_stop_from_message(event: dict) -> bool:
         workspace = prepare_thread_workspace(
             policy.root, channel=event.get("channel", ""), thread=thread_ts
         )
+        # A stopped turn does not hand off.
+        discard_handoff_claim(workspace.handoff_claim_file)
         if workspace.delegate_pid_file.is_file() and not workspace.delegate_pid_file.is_symlink():
             pid_text = workspace.delegate_pid_file.read_text(encoding="utf-8").strip()
             if pid_text.isdigit() and int(pid_text) > 1:

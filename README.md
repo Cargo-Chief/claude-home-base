@@ -32,6 +32,16 @@ takes only the URL, checks that the PR is open and authored by this agent's own 
 `<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
 A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (`max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
 
+One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
+writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. After
+that turn completes, the harness opens a new top-level thread in the same room, links it from the
+source thread, and starts a fresh session there with the brief as its first turn. The turn runs as
+the person whose message started the source turn, re-checked against the allowlist, and its
+envelope carries `handoff_from_thread` and never `named_approver`. So it can do routine work, but
+any approval gate needs a person's message in the new thread. A handoff turn, a review turn, a
+stopped turn and a turn that timed out cannot open a thread. Each handoff writes a `THREAD_HANDOFF`
+or `HANDOFF_REFUSED` audit line.
+
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
 agent process. The one exception is a mention in a review-only room, which any member or listed
