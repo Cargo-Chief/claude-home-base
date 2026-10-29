@@ -41,8 +41,15 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   or listed peer bot (`review_requests.py`); it needs a top-level `peer_review` block with a valid
   `self_github_login`. `peer_bot_user_ids` (default empty) and `max_reviews_per_pr` (default 3,
   range 1–10) are optional. See README's safety gate
-- A turn's handoff claim (`thread_handoff.py`) is acted on only after the turn completes. It
-  starts a turn that no Slack message started, so that turn is never an approver and cannot hand
-  off again; keep both limits if you touch `_finish_handoff`
+- A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
+  and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
+  and cannot hand off again. The coupled pieces are:
+  - the refusal rules (`handoff_refusal`);
+  - the `_handoff_stops` mark set by `stop`;
+  - `turn_senders`;
+  - the Codex runner's discard on a stopped, failed or withheld turn;
+  - the `handoff_from` bypasses in `process_message_async`;
+  - the prompt text in `cargo_chief_safety.handoff_prompt`, which names the `handoff_from_thread`
+    envelope field.
 
-Keep this CLAUDE.md up-to-date with the latest changes / decisions made in the project.
+  Change them together.

@@ -14,16 +14,20 @@ from cargo_chief_safety import (
     HANDOFF_CLAIM_NAME,
     AuthorityPolicy,
     SafetyError,
+    ThreadWorkspace,
     build_authority_envelope,
     handoff_prompt,
     prepare_thread_workspace,
 )
+from governed_delegation import BUDGET_UNIT, DelegationError, budget_status, delegation_verification_status
 from thread_handoff import (
     HandoffRequest,
     consume_handoff_claim,
     discard_handoff_claim,
     handoff_refusal,
+    new_thread_text,
     read_handoff_claim,
+    source_thread_text,
 )
 
 BOT = Path(__file__).parents[1] / "bot.py"
@@ -32,6 +36,12 @@ BOT = Path(__file__).parents[1] / "bot.py"
 def _bot_function(name):
     tree = ast.parse(BOT.read_text(encoding="utf-8"))
     return next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
+def _compile(names, namespace):
+    functions = [_bot_function(name) for name in names]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(BOT), "exec"), namespace)
+    return namespace
 
 
 class ClaimTest(unittest.TestCase):
@@ -60,18 +70,21 @@ class ClaimTest(unittest.TestCase):
             {"title": "CN-1"},
             {"title": "CN-1", "brief": "b", "user": "U1"},
             {"title": "two\nlines", "brief": "b"},
+            {"title": "two\rlines", "brief": "b"},
+            {"title": "two lines", "brief": "b"},
             {"title": "x" * 121, "brief": "b"},
             {"title": "CN-1", "brief": " "},
             {"title": "CN-1", "brief": "b" * 6001},
             {"title": 1, "brief": "b"},
+            json.dumps({"title": "CN-1", "brief": "b" * 17000}),
         ):
-            with self.subTest(bad=bad):
+            with self.subTest(bad=str(bad)[:40]):
                 self.write(bad)
                 with self.assertRaises(SafetyError):
                     consume_handoff_claim(self.claim)
                 self.assertFalse(self.claim.exists())
 
-    def test_a_symlinked_claim_is_refused(self):
+    def test_a_symlinked_claim_is_refused_and_its_target_left_alone(self):
         target = Path(self.tmp.name) / "elsewhere.json"
         target.write_text(json.dumps({"title": "CN-1", "brief": "b"}), encoding="utf-8")
         os.symlink(target, self.claim)
@@ -82,20 +95,48 @@ class ClaimTest(unittest.TestCase):
         self.assertFalse(self.claim.is_symlink())
         self.assertTrue(target.exists())
 
+    def test_a_directory_at_the_claim_path_is_refused_and_removed_without_raising_os_errors(self):
+        self.claim.mkdir()
+        with self.assertRaises(SafetyError):
+            consume_handoff_claim(self.claim)
+        self.assertFalse(self.claim.exists())
+        self.claim.mkdir()
+        (self.claim / "inside").write_text("x", encoding="utf-8")
+        self.assertFalse(discard_handoff_claim(self.claim))
+
     def test_discard_reports_whether_a_claim_was_left(self):
         self.assertFalse(discard_handoff_claim(self.claim))
         self.write({"title": "CN-1", "brief": "b"})
         self.assertTrue(discard_handoff_claim(self.claim))
 
-    def test_review_and_handoff_turns_cannot_hand_off(self):
-        self.assertIsNone(handoff_refusal(review=False, from_handoff=False))
-        self.assertIn("review", handoff_refusal(review=True, from_handoff=False))
-        self.assertIn("handoff", handoff_refusal(review=False, from_handoff=True))
-
     def test_the_workspace_names_the_claim(self):
         workspace = prepare_thread_workspace(Path(self.tmp.name), channel="C1", thread="1.0")
         self.assertEqual(HANDOFF_CLAIM_NAME, workspace.handoff_claim_file.name)
         self.assertEqual(workspace.path, workspace.handoff_claim_file.parent)
+
+
+class RefusalAndTextTest(unittest.TestCase):
+    def test_each_condition_refuses(self):
+        self.assertIsNone(handoff_refusal(review=False, from_handoff=False))
+        for condition in ("forwarded", "stopped", "delegation_blocked"):
+            with self.subTest(condition=condition):
+                self.assertIsNotNone(handoff_refusal(review=False, from_handoff=False, **{condition: True}))
+        self.assertIn("review", handoff_refusal(review=True, from_handoff=False))
+        self.assertIn("handoff", handoff_refusal(review=False, from_handoff=True))
+        self.assertIn("more than one person", handoff_refusal(review=False, from_handoff=False, senders=2))
+
+    def test_posted_text_cannot_mention_link_or_broadcast(self):
+        request = HandoffRequest("CN-1 <!here>", "ping <!channel> and <@U123> & <https://x|y>")
+        posted = new_thread_text(request, source_link="https://slack/src")
+        for raw in ("<!here>", "<!channel>", "<@U123>", "<https://x|y>"):
+            self.assertNotIn(raw, posted)
+        self.assertIn("&lt;!channel&gt;", posted)
+        self.assertIn("&amp;", posted)
+        self.assertNotIn("<!here>", source_thread_text(request, new_link="https://slack/new"))
+
+    def test_the_turn_message_says_the_brief_is_the_agents_own(self):
+        message = thread_handoff.handoff_turn_message(HandoffRequest("CN-1", "brief"))
+        self.assertIn("not the requester's words", message)
 
 
 class AuthorityTest(unittest.TestCase):
@@ -127,11 +168,113 @@ class AuthorityTest(unittest.TestCase):
                 permission_mode="auto", message="brief", handoff_from="1.0",
             )
 
-    def test_the_prompt_names_the_claim_and_the_limits(self):
+    def test_the_prompt_names_the_claim_the_audience_and_the_limits(self):
         prompt = handoff_prompt(Path("/w/handoff-claim.json"))
         self.assertIn("/w/handoff-claim.json", prompt)
-        self.assertIn("never satisfies an approval gate", prompt)
+        self.assertIn("visible to everyone in this room", prompt)
+        self.assertIn("never satisfies an", prompt)
         self.assertIn("cannot hand off again", prompt)
+
+
+class FakeSlack:
+    def __init__(self, fail=()):
+        self.posts = []
+        self.fail = set(fail)
+
+    def chat_getPermalink(self, channel, message_ts):
+        return {"permalink": f"https://slack/{channel}/{message_ts}"}
+
+    def chat_postMessage(self, channel, text, thread_ts=None):
+        kind = "reply" if thread_ts else "top"
+        if kind in self.fail:
+            raise ConnectionError("slack refused")
+        self.posts.append((thread_ts, text))
+        return {"ts": "9.0"}
+
+
+class RecordingLog(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+class TakeHandoffTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workspace = prepare_thread_workspace(Path(self.tmp.name), channel="C1", thread="1.0")
+        self.slack = FakeSlack()
+        self.audit = RecordingLog()
+        audit_logger = logging.getLogger("test-take-handoff")
+        audit_logger.addHandler(self.audit)
+        audit_logger.propagate = False
+        audit_logger.setLevel(logging.INFO)
+        namespace = _compile(("_delegation_blocked", "_take_handoff"), {
+            "ThreadWorkspace": ThreadWorkspace,
+            "HandoffRequest": HandoffRequest,
+            "SafetyError": SafetyError,
+            "DelegationError": DelegationError,
+            "budget_status": budget_status,
+            "delegation_verification_status": delegation_verification_status,
+            "consume_handoff_claim": consume_handoff_claim,
+            "handoff_refusal": handoff_refusal,
+            "audit_logger": audit_logger,
+            "logger": logging.getLogger("test-take-handoff-log"),
+            "slack_client": self.slack,
+        })
+        self.take = namespace["_take_handoff"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def claim(self):
+        self.workspace.handoff_claim_file.write_text(json.dumps({"title": "CN-2 next", "brief": "b"}), encoding="utf-8")
+
+    def run_take(self, **conditions):
+        args = {"review": False, "from_handoff": False, **conditions}
+        return self.take(self.workspace, user_id="U1", channel="C1", thread_ts="1.0", **args)
+
+    def test_no_claim_is_none_and_silent(self):
+        self.assertIsNone(self.run_take())
+        self.assertEqual([], self.slack.posts)
+
+    def test_a_clean_turn_returns_the_request(self):
+        self.claim()
+        self.assertEqual(HandoffRequest("CN-2 next", "b"), self.run_take(senders=1))
+        self.assertFalse(self.workspace.handoff_claim_file.exists())
+
+    def test_each_refusal_posts_audits_and_consumes(self):
+        for conditions in ({"stopped": True}, {"forwarded": True}, {"senders": 2}, {"from_handoff": True}, {"review": True}):
+            with self.subTest(conditions=conditions):
+                self.slack.posts.clear()
+                self.audit.lines.clear()
+                self.claim()
+                self.assertIsNone(self.run_take(**conditions))
+                ((thread, text),) = self.slack.posts
+                self.assertEqual("1.0", thread)
+                self.assertTrue(text.startswith("Handoff refused:"))
+                self.assertTrue(self.audit.lines[0].startswith("HANDOFF_REFUSED"))
+                self.assertFalse(self.workspace.handoff_claim_file.exists())
+
+    def test_an_exhausted_delegation_budget_refuses(self):
+        self.workspace.delegation_budget_file.write_text(
+            json.dumps({"limit": 1000, "used": 1000, "unit": BUDGET_UNIT}), encoding="utf-8"
+        )
+        self.claim()
+        self.assertIsNone(self.run_take())
+        self.assertIn("delegation budget", self.slack.posts[0][1])
+
+    def test_a_directory_claim_is_refused_not_raised(self):
+        self.workspace.handoff_claim_file.mkdir()
+        self.assertIsNone(self.run_take())
+        self.assertTrue(self.slack.posts[0][1].startswith("Handoff refused:"))
+
+    def test_a_refusal_post_failure_does_not_raise(self):
+        self.slack.fail.add("reply")
+        self.claim()
+        self.assertIsNone(self.run_take(stopped=True))
 
 
 class FakeThread:
@@ -144,91 +287,57 @@ class FakeThread:
         FakeThread.started.append(self.call)
 
 
-class FakeSlack:
-    def chat_getPermalink(self, channel, message_ts):
-        return {"permalink": f"https://slack/{channel}/{message_ts}"}
-
-
-class FinishHandoffTest(unittest.TestCase):
+class StartHandoffTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.workspace = Path(self.tmp.name)
-        self.posts = []
         FakeThread.started = []
-
-        def post_response(channel, text, thread_ts=None):
-            self.posts.append((thread_ts, text))
-            return None if thread_ts else "9.0"
-
-        namespace = {
-            "Path": Path,
-            "SafetyError": SafetyError,
-            "HANDOFF_CLAIM_NAME": HANDOFF_CLAIM_NAME,
+        self.slack = FakeSlack()
+        self.audit = RecordingLog()
+        audit_logger = logging.getLogger("test-start-handoff")
+        audit_logger.addHandler(self.audit)
+        audit_logger.propagate = False
+        audit_logger.setLevel(logging.INFO)
+        namespace = _compile(("_thread_link", "_start_handoff"), {
             "HandoffRequest": HandoffRequest,
-            "validate_existing_thread_workspace": lambda root, channel, thread: self.workspace,
-            "audit_logger": logging.getLogger("test-handoff-audit"),
-            "post_response": post_response,
-            "slack_client": FakeSlack(),
+            "audit_logger": audit_logger,
+            "logger": logging.getLogger("test-start-handoff-log"),
+            "slack_client": self.slack,
             "threading": type("threading", (), {"Thread": FakeThread}),
             "process_message_async": "process_message_async",
-        }
-        for name in (
-            "consume_handoff_claim", "handoff_refusal", "handoff_turn_message", "new_thread_text",
-            "source_thread_text",
-        ):
-            namespace[name] = getattr(thread_handoff, name)
-        functions = [_bot_function(name) for name in ("_finish_handoff", "_thread_link", "_start_handoff")]
-        exec(compile(ast.Module(body=functions, type_ignores=[]), str(BOT), "exec"), namespace)
-        self.finish = namespace["_finish_handoff"]
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def claim(self):
-        (self.workspace / HANDOFF_CLAIM_NAME).write_text(
-            json.dumps({"title": "CN-2 next", "brief": "the brief"}), encoding="utf-8"
+            "new_thread_text": new_thread_text,
+            "source_thread_text": source_thread_text,
+            "handoff_turn_message": thread_handoff.handoff_turn_message,
+        })
+        self.start = lambda: namespace["_start_handoff"](
+            HandoffRequest("CN-2 next", "the brief"), user_id="U1", channel="C1", channel_type="channel",
+            source_thread="1.0",
         )
 
-    def run_finish(self, **kwargs):
-        args = {"review": False, "from_handoff": False, **kwargs}
-        self.finish(
-            Path("/root"), channel="C1", channel_type="channel", thread_ts="1.0", user_id="U1", **args,
-        )
-
-    def test_no_claim_does_nothing(self):
-        self.run_finish()
-        self.assertEqual([], self.posts)
-        self.assertEqual([], FakeThread.started)
-
-    def test_a_claim_opens_links_and_starts_the_new_thread_as_the_requester(self):
-        self.claim()
-        self.run_finish()
-        (new_parent, new_text), (source_thread, source_text) = self.posts
+    def test_opens_starts_then_links(self):
+        self.start()
+        (new_parent, new_text), (source_thread, source_text) = self.slack.posts
         self.assertIsNone(new_parent)
-        self.assertIn("*CN-2 next*", new_text)
         self.assertIn("https://slack/C1/1.0", new_text)
         self.assertEqual("1.0", source_thread)
         self.assertIn("https://slack/C1/9.0", source_text)
         ((target, (event,), kwargs),) = FakeThread.started
-        self.assertEqual("process_message_async", target)
         self.assertEqual({"handoff_from": "1.0"}, kwargs)
         self.assertEqual(("U1", "C1", "9.0", "channel"), (event["user"], event["channel"], event["ts"], event["channel_type"]))
-        self.assertIn("the brief", event["text"])
-        self.assertFalse((self.workspace / HANDOFF_CLAIM_NAME).exists())
+        self.assertTrue(self.audit.lines[0].startswith("THREAD_HANDOFF"))
 
-    def test_a_handoff_turn_cannot_chain(self):
-        self.claim()
-        self.run_finish(from_handoff=True)
-        ((thread, text),) = self.posts
+    def test_a_refused_new_thread_is_audited_and_reported(self):
+        self.slack.fail.add("top")
+        self.start()
+        self.assertEqual([], FakeThread.started)
+        self.assertTrue(self.audit.lines[0].startswith("HANDOFF_FAILED"))
+        ((thread, text),) = self.slack.posts
         self.assertEqual("1.0", thread)
-        self.assertTrue(text.startswith("Handoff refused:"))
-        self.assertEqual([], FakeThread.started)
-        self.assertFalse((self.workspace / HANDOFF_CLAIM_NAME).exists())
+        self.assertTrue(text.startswith("Handoff failed"))
 
-    def test_a_review_turn_cannot_hand_off(self):
-        self.claim()
-        self.run_finish(review=True)
-        self.assertEqual([], FakeThread.started)
+    def test_a_failed_link_still_starts_the_new_turn(self):
+        self.slack.fail.add("reply")
+        self.start()
+        self.assertEqual(1, len(FakeThread.started))
+        self.assertTrue(self.audit.lines[0].startswith("THREAD_HANDOFF"))
 
 
 class WiringTest(unittest.TestCase):
@@ -238,23 +347,25 @@ class WiringTest(unittest.TestCase):
         self.assertIn("if not review and (not handoff_from) and needs_relevance_prefix(", process)
         self.assertIn("handoff_from=handoff_from", process)
 
-    def test_the_claim_is_acted_on_only_after_a_completed_turn(self):
+    def test_the_claim_is_taken_inside_the_turn_and_acted_on_after_it(self):
         process = ast.unparse(_bot_function("process_message_async"))
-        self.assertLess(process.index("audit_interaction(event, full_response"), process.index("_finish_handoff("))
-        self.assertLess(process.index("if skip_detected:"), process.index("_finish_handoff("))
+        taken = [index for index in range(len(process)) if process.startswith("_take_handoff(", index)]
+        self.assertEqual(2, len(taken))
+        self.assertTrue(all(index < process.index("except _ReviewBusy:") for index in taken))
+        self.assertLess(process.index("audit_interaction(event, full_response"), process.index("_start_handoff("))
 
-    def test_a_claim_left_by_an_unfinished_turn_is_discarded_at_the_next_turn(self):
+    def test_steering_records_the_sender_and_never_steers_a_handoff(self):
         process = ast.unparse(_bot_function("process_message_async"))
-        self.assertLess(
-            process.index("discard_handoff_claim(session.workspace.handoff_claim_file)"),
-            process.index("if not wait_for_turn_completion("),
-        )
-        fallback = ast.unparse(_bot_function("_run_openai_fallback"))
-        self.assertIn("workspace.handoff_claim_file", fallback.split("cleanup_stale_delegate_pid")[0])
+        steer = process.index("if session and session.turn_lock.locked():\n            if handoff_from:")
+        self.assertLess(steer, process.index("session.turn_senders.add(user_id)"))
+        self.assertIn("session.turn_senders = {user_id}", process)
 
-    def test_stop_cancels_a_pending_handoff(self):
+    def test_stop_marks_the_thread_and_codex_drops_an_unclean_turns_claim(self):
         stop = ast.unparse(_bot_function("_maybe_stop_from_message"))
-        self.assertIn("discard_handoff_claim(workspace.handoff_claim_file)", stop)
+        self.assertIn("_handoff_stops.add(thread_ts)", stop)
+        fallback = ast.unparse(_bot_function("_run_openai_fallback"))
+        self.assertIn("if stopped or result.error or attempted or (verification_status is not None):", fallback)
+        self.assertEqual(2, fallback.count("discard_handoff_claim(workspace.handoff_claim_file)"))
 
 
 if __name__ == "__main__":

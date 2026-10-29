@@ -45,7 +45,6 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_sdk import WebClient
 
 from cargo_chief_safety import (
-    HANDOFF_CLAIM_NAME,
     AuthorityPolicy,
     RuntimePolicy,
     SafetyError,
@@ -713,6 +712,8 @@ class LiveSession:
     workspace: ThreadWorkspace | None = None
     delegation_tracker: DelegationTracker = field(default_factory=DelegationTracker)
     pending_tools: PendingTools = field(default_factory=PendingTools)
+    # Slack users whose messages started or were steered into the running turn
+    turn_senders: set[str] = field(default_factory=set)
     # Live status line, human messages and final reply for the running turn
     reporter: TurnReporter | None = None
     # Set while a stop kills this process tree, and set again once that stop is finished.
@@ -727,6 +728,8 @@ _live_sessions_lock = threading.Lock()
 _openai_turn_locks: dict[str, threading.Lock] = {}
 _openai_processes: dict[str, subprocess.Popen] = {}
 _openai_stopped: set[str] = set()
+# Threads whose running Claude turn was stopped; its handoff claim is refused. Guarded by _live_sessions_lock.
+_handoff_stops: set[str] = set()
 _openai_models_notified: dict[str, str] = {}
 
 
@@ -2037,8 +2040,8 @@ def _run_openai_fallback(
     prompt: str,
     on_text,
     max_duration: float = MAX_TURN_RUNTIME,
-) -> str | None:
-    """Run one profile-governed Codex turn and apply the shared harness claims."""
+) -> tuple[str | None, ThreadWorkspace]:
+    """Run one profile-governed Codex turn, apply the shared harness claims, and return the session and workspace."""
     validate_codex_runtime()
     for warning in preflight_room(policy):
         logger.warning(f"Cargo Chief fallback preflight: {warning}")
@@ -2057,7 +2060,6 @@ def _run_openai_fallback(
         workspace.escalation_receipt_file,
         workspace.escalation_attempt_file,
         workspace.parking_claim_file,
-        workspace.handoff_claim_file,
         workspace.delegation_request_file,
         workspace.implementation_claim_file,
     ):
@@ -2065,6 +2067,7 @@ def _run_openai_fallback(
             stale_path.unlink()
         except FileNotFoundError:
             pass
+    discard_handoff_claim(workspace.handoff_claim_file)
     cleanup_stale_delegate_pid(workspace.delegate_pid_file)
     bundle = resolve_thread_bundle(workspace)
     cwd = bundle or workspace.path
@@ -2246,13 +2249,17 @@ def _run_openai_fallback(
             + recovery
         )
 
+    if stopped or result.error or attempted or verification_status is not None:
+        # A stopped, failed, escalated or withheld turn does not hand off.
+        discard_handoff_claim(workspace.handoff_claim_file)
+
     audit_logger.info(
         "FALLBACK_INTERACTION | PROVIDER:openai | MODEL:%s | EFFORT:%s | USER:%s | CHANNEL:%s "
         "| THREAD:%s | SESSION:%s | RESP_BLOCKS:%d | DURATION:%.1fs",
         policy.fallback_model, policy.fallback_effort, user_id, channel, thread_ts,
         session_id or "none", len(result.texts), time.time() - started,
     )
-    return session_id
+    return session_id, workspace
 
 
 def _clear_eyes(channel: str, ts: str) -> None:
@@ -2544,12 +2551,13 @@ def process_message_async(
     audit_session_id = _get_openai_session(thread_ts) if use_openai else None
     turn_admitted = False
     session = None
+    handoff_request = None
 
     try:
         if use_openai:
             turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
             with _openai_turn_lock(thread_ts):
-                audit_session_id = _run_openai_fallback(
+                audit_session_id, fallback_workspace = _run_openai_fallback(
                     policy=room_policy,
                     channel=channel,
                     thread_ts=thread_ts,
@@ -2557,6 +2565,10 @@ def process_message_async(
                     prompt=text,
                     on_text=on_text,
                     max_duration=max(0.001, turn_deadline - time.monotonic()),
+                )
+                handoff_request = _take_handoff(
+                    fallback_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
+                    review=review, from_handoff=bool(handoff_from), forwarded=bool(forward),
                 )
             session = None
         else:
@@ -2599,6 +2611,11 @@ def process_message_async(
         # reader on that turn's result. `stop`/`esc` remains the hard
         # interrupt for aborting a slow tool call outright.
         if session and session.turn_lock.locked():
+            if handoff_from:
+                # A person already started a turn in the new thread; the brief is its opening message.
+                _clear_eyes(reaction_channel, reaction_msg_ts)
+                return
+            session.turn_senders.add(user_id)
             _send_to_claude(session, text)
             session.pending_reactions.append((reaction_channel, reaction_msg_ts))
             audit_interaction(event, "(steered into running turn)", 0.0, session.session_id)
@@ -2623,6 +2640,9 @@ def process_message_async(
                 session.reporter.begin()
                 session.pending_tools.clear()
                 session._turn_done.clear()
+                session.turn_senders = {user_id}
+                with _live_sessions_lock:
+                    _handoff_stops.discard(thread_ts)
                 if session.workspace:
                     cleanup_stale_delegate_pid(session.workspace.delegate_pid_file)
                     discard_handoff_claim(session.workspace.handoff_claim_file)
@@ -2672,6 +2692,7 @@ def process_message_async(
                     return
 
                 audit_session_id = session.session_id
+                fallback_workspace = None
                 if fallback_requested and review:
                     # The Codex fallback carries none of the review-only controls.
                     all_texts.append(PROVIDER_REPLY)
@@ -2685,7 +2706,7 @@ def process_message_async(
                             f"{fallback_context}\n[/UNTRUSTED_FAILOVER_THREAD_CONTEXT]"
                         )
                     with _openai_turn_lock(thread_ts):
-                        audit_session_id = _run_openai_fallback(
+                        audit_session_id, fallback_workspace = _run_openai_fallback(
                             policy=room_policy,
                             channel=channel,
                             thread_ts=thread_ts,
@@ -2706,6 +2727,18 @@ def process_message_async(
                         text="Sorry, I lost my train of thought. Could you try sending that again?",
                     )
                     return
+
+                # Take the claim before turn_lock releases, so the next turn can neither discard nor supply it.
+                handoff_workspace = fallback_workspace if fallback_requested and not review else session.workspace
+                if handoff_workspace:
+                    with _live_sessions_lock:
+                        stopped = thread_ts in _handoff_stops
+                        _handoff_stops.discard(thread_ts)
+                    handoff_request = _take_handoff(
+                        handoff_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
+                        review=review, from_handoff=bool(handoff_from), forwarded=bool(forward),
+                        stopped=stopped, senders=len(session.turn_senders),
+                    )
 
     except _ReviewBusy:
         _clear_eyes(reaction_channel, reaction_msg_ts)
@@ -2746,32 +2779,37 @@ def process_message_async(
 
     full_response = "\n\n".join(all_texts)
     audit_interaction(event, full_response, duration, audit_session_id)
-    _finish_handoff(
-        room_policy.root, channel=channel, channel_type=channel_type, thread_ts=thread_ts,
-        user_id=user_id, review=review, from_handoff=bool(handoff_from),
-    )
+    if handoff_request:
+        _start_handoff(
+            handoff_request, user_id=user_id, channel=channel, channel_type=channel_type,
+            source_thread=thread_ts,
+        )
 
 
-def _finish_handoff(
-    root: Path,
-    *,
-    channel: str,
-    channel_type: str,
-    thread_ts: str,
-    user_id: str,
-    review: bool,
-    from_handoff: bool,
-) -> None:
-    """Act on the handoff claim a completed turn wrote, if any."""
+def _delegation_blocked(workspace: ThreadWorkspace) -> bool:
+    """Whether the thread's durable delegation gates (budget, pending verification) are closed."""
     try:
-        workspace = validate_existing_thread_workspace(root, channel=channel, thread=thread_ts)
-    except SafetyError:
-        return
+        if delegation_verification_status(workspace.delegate_verification_file) in {
+            "pending", "invalid", "budget_exhausted",
+        }:
+            return True
+        if workspace.delegation_budget_file.exists():
+            state = budget_status(workspace.delegation_budget_file)
+            return state["used"] >= state["limit"]
+    except (DelegationError, OSError, KeyError, TypeError):
+        return True
+    return False
+
+
+def _take_handoff(
+    workspace: ThreadWorkspace, *, user_id: str, channel: str, thread_ts: str, **conditions,
+) -> HandoffRequest | None:
+    """Consume the turn's handoff claim and return it when this turn may hand off."""
     try:
-        request = consume_handoff_claim(workspace / HANDOFF_CLAIM_NAME)
+        request = consume_handoff_claim(workspace.handoff_claim_file)
         if request is None:
-            return
-        refusal = handoff_refusal(review=review, from_handoff=from_handoff)
+            return None
+        refusal = handoff_refusal(delegation_blocked=_delegation_blocked(workspace), **conditions)
         if refusal:
             raise SafetyError(refusal)
     except SafetyError as exc:
@@ -2779,9 +2817,12 @@ def _finish_handoff(
             "HANDOFF_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
             user_id, channel, thread_ts, str(exc),
         )
-        post_response(channel, f"Handoff refused: {exc}", thread_ts=thread_ts)
-        return
-    _start_handoff(request, user_id=user_id, channel=channel, channel_type=channel_type, source_thread=thread_ts)
+        try:
+            slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"Handoff refused: {exc}")
+        except Exception as post_exc:
+            logger.warning(f"Could not post handoff refusal in {thread_ts}: {post_exc}")
+        return None
+    return request
 
 
 def _thread_link(channel: str, ts: str, fallback: str) -> str:
@@ -2794,17 +2835,25 @@ def _thread_link(channel: str, ts: str, fallback: str) -> str:
 def _start_handoff(
     request: HandoffRequest, *, user_id: str, channel: str, channel_type: str, source_thread: str
 ) -> None:
-    """Open the new thread, link it from the source, and start its first turn as the requester."""
+    """Open the new thread, start its first turn as the requester, then link it from the source."""
     source_link = _thread_link(channel, source_thread, "an earlier thread")
-    new_ts = post_response(channel, new_thread_text(request, source_link=source_link))
-    if not new_ts:
-        post_response(channel, "Handoff failed: Slack did not return the new thread.", thread_ts=source_thread)
+    try:
+        new_ts = slack_client.chat_postMessage(
+            channel=channel, text=new_thread_text(request, source_link=source_link),
+        )["ts"]
+    except Exception as exc:
+        audit_logger.warning(
+            "HANDOFF_FAILED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+            user_id, channel, source_thread, type(exc).__name__,
+        )
+        try:
+            slack_client.chat_postMessage(
+                channel=channel, thread_ts=source_thread,
+                text="Handoff failed: Slack did not open the new thread. Ask me again to retry.",
+            )
+        except Exception:
+            pass
         return
-    post_response(
-        channel,
-        source_thread_text(request, new_link=_thread_link(channel, new_ts, "a new thread in this room")),
-        thread_ts=source_thread,
-    )
     audit_logger.info(
         "THREAD_HANDOFF | USER:%s | CHANNEL:%s | FROM:%s | TO:%s", user_id, channel, source_thread, new_ts,
     )
@@ -2819,6 +2868,13 @@ def _start_handoff(
     threading.Thread(
         target=process_message_async, args=(event,), kwargs={"handoff_from": source_thread}, daemon=True,
     ).start()
+    try:
+        slack_client.chat_postMessage(
+            channel=channel, thread_ts=source_thread,
+            text=source_thread_text(request, new_link=_thread_link(channel, new_ts, "a new thread in this room")),
+        )
+    except Exception as exc:
+        logger.warning(f"Could not link handoff thread {new_ts} from {source_thread}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -2947,8 +3003,10 @@ def _maybe_stop_from_message(event: dict) -> bool:
         workspace = prepare_thread_workspace(
             policy.root, channel=event.get("channel", ""), thread=thread_ts
         )
-        # A stopped turn does not hand off.
+        # A stopped turn does not hand off: drop any claim now and refuse one written before the turn ends.
         discard_handoff_claim(workspace.handoff_claim_file)
+        with _live_sessions_lock:
+            _handoff_stops.add(thread_ts)
         if workspace.delegate_pid_file.is_file() and not workspace.delegate_pid_file.is_symlink():
             pid_text = workspace.delegate_pid_file.read_text(encoding="utf-8").strip()
             if pid_text.isdigit() and int(pid_text) > 1:
