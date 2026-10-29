@@ -248,7 +248,10 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("pr=review_pr", spawn)
         process = ast.unparse(self._function("process_message_async"))
         self.assertIn("review_pr=review_admission.pr if review else ''", process)
-        self.assertIn("build_review_task(review_admission.pr, room_policy.root)", process)
+        self.assertIn("build_review_task(review_admission.pr, room_policy.root, review_admission.plan)", process)
+        self.assertIn("review_plan=review_admission.plan if review else None", process)
+        self.assertIn("mode=review_plan.mode if review_plan else ''", spawn)
+        self.assertIn("pass_no=review_plan.pass_no if review_plan else 0", spawn)
 
 if __name__ == "__main__":
     unittest.main()

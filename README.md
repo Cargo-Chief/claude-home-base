@@ -22,10 +22,20 @@ secrets, and extra deny rules. It never resumes, steers, escalates or registers 
 `bot.py --escalate`, `--forward-to` and `/internal/forward` refuse review-only rooms server-side.
 Before the turn the harness refuses the agent's own PRs (`peer_review.self_github_login`), PRs that
 are not open, PRs it cannot look up, a GitHub wrapper too old to downscope its token, an unreadable
-cap record, and PRs past `peer_review.max_reviews_per_pr` (default 3, range 1–10) started turns in
-24 hours. At most two requests are admitted at once and each requester may make ten an hour; a
+cap record, and PRs past twice `peer_review.max_reviews_per_pr` (default 3, range 1–10) started
+turns in 24 hours. At most two requests are admitted at once and each requester may make ten an hour; a
 redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line. A
 review-only room without a valid `peer_review.self_github_login` is refused.
+
+Each request for the same PR is the next pass. `review_post.py` stamps every review body with a
+hidden marker (`<!-- cc-peer-review pass=N mode=… head=… -->`), and the harness reads the agent's own
+Bot-authored marked reviews when it looks up the PR (`plan_review_pass`). Pass 1 is a full review.
+Passes up to `max_reviews_per_pr` review only the commits since the last marked head and go through
+the agent's open threads: a reply naming the fix or accepting or rejecting the author's reason, and
+a resolve for each fixed or accepted one. After the last pass a request runs a close-out instead of
+being refused: no `cc-code-review` run and no new findings, only the thread work, then an approval
+when no thread is left open or a comment naming the threads in dispute. The 24-hour cap is a rate
+limit at twice the pass cap, so passes plus close-outs still stop.
 
 The turn posts only through `review_post.py`, run under the GitHub App wrapper with the absolute
 paths the task names. The deny rules block the raw reviews and GraphQL endpoints because they cannot
@@ -60,7 +70,7 @@ resumed. A review turn never consumes a bundle or parking claim.
 The sending side is `bot.py --request-review <PR URL>`, which normal turns are told about. It
 takes only the URL, checks that the PR is open and authored by this agent's own App, and posts
 `<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
-A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (`max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
+A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (twice `max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
 
 One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
 writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. The

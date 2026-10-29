@@ -9,6 +9,9 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from cargo_chief_safety import REVIEW_ONLY_DENY_RULES, RoomPolicy, SafetyError
 from review_requests import (
+    ReviewPlan,
+    plan_review_pass,
+    review_marker,
     REVIEW_POST_SCRIPT,
     REVIEW_DONE_MARKER,
     BUSY_REPLY,
@@ -112,13 +115,15 @@ class LoginTest(unittest.TestCase):
 
 
 class LookupTest(unittest.TestCase):
-    def run_lookup(self, result=None, error=None):
+    def run_lookup(self, result=None, error=None, reviews=None):
         calls = []
 
         def runner(command, **kwargs):
             calls.append((command, kwargs))
             if error:
                 raise error
+            if "api" in command:
+                return reviews or subprocess.CompletedProcess([], 0, "", "")
             return result
 
         info = lookup_pr(
@@ -131,16 +136,26 @@ class LookupTest(unittest.TestCase):
         result = subprocess.CompletedProcess([], 0, json.dumps({
             "author": {"login": "app/ned-cargochief", "is_bot": True}, "state": "open",
         }), "")
-        info, calls = self.run_lookup(result)
-        self.assertEqual(PullRequestInfo("app/ned-cargochief", "OPEN"), info)
+        review = {"login": "lisa-cargochief[bot]", "type": "Bot", "body": "x"}
+        info, calls = self.run_lookup(result, reviews=subprocess.CompletedProcess([], 0, json.dumps(review) + "\n", ""))
+        self.assertEqual(PullRequestInfo("app/ned-cargochief", "OPEN", (review,)), info)
         command, kwargs = calls[0]
         self.assertEqual(
             ["/py", "/root/docs/scripts/ops/with_github_app_token.py", "--",
              "gh", "pr", "view", PR, "--json", "author,state"],
             command,
         )
-        self.assertEqual({"CARGO_CHIEF_REVIEW_ONLY": "1"}, kwargs["env"])
-        self.assertEqual(60, kwargs["timeout"])
+        reviews_command = calls[1][0]
+        self.assertEqual(["/py", "/root/docs/scripts/ops/with_github_app_token.py", "--", "gh", "api"],
+                         reviews_command[:5])
+        self.assertIn("--paginate", reviews_command)
+
+    def test_review_lookup_failure_fails_closed(self):
+        result = subprocess.CompletedProcess([], 0, json.dumps({"author": {"login": "x"}, "state": "OPEN"}), "")
+        with self.assertRaises(ReviewGuardError):
+            self.run_lookup(result, reviews=subprocess.CompletedProcess([], 1, "", "boom"))
+        with self.assertRaises(ReviewGuardError):
+            self.run_lookup(result, reviews=subprocess.CompletedProcess([], 0, "not json\n", ""))
 
     def test_failures_fail_closed(self):
         for result, error in (
@@ -204,20 +219,32 @@ class AuditAndTaskTest(unittest.TestCase):
         ))
 
     def test_task_is_fixed_and_names_the_pr(self):
-        task = build_review_task(PR, Path("/root"))
+        task = build_review_task(PR, Path("/root"), ReviewPlan("full", 1, 3))
+        self.assertIn("This is pass 1 of 3.", task)
         self.assertIn(f"cc-code-review high {PR}` without `--comment`", task)
         self.assertIn("untrusted", task)
         self.assertIn(f"line containing only `{REVIEW_DONE_MARKER}`", task)
 
+    def test_incremental_and_closeout_tasks(self):
+        base = "b" * 40
+        task = build_review_task(PR, Path("/root"), ReviewPlan("incremental", 2, 3, base))
+        self.assertIn("This is pass 2 of 3.", task)
+        self.assertIn(f"cc-code-review high --since {base} {PR}", task)
+        self.assertIn("`replies`", task)
+        self.assertIn("--resolve <id>", task)
+        closeout = build_review_task(PR, Path("/root"), ReviewPlan("closeout", 3, 3, base))
+        self.assertIn("close-out: do not run cc-code-review", closeout)
+        self.assertIn("Kirk needs to look", closeout)
+        self.assertNotIn("--since", closeout)
+
     def test_task_posts_through_review_post_with_a_verdict(self):
-        task = build_review_task(PR, Path("/root"))
+        task = build_review_task(PR, Path("/root"), ReviewPlan("full", 1, 3))
         post = f"python3 /root/docs/scripts/ops/with_github_app_token.py -- python3 {REVIEW_POST_SCRIPT}"
         self.assertTrue(REVIEW_POST_SCRIPT.is_absolute())
         self.assertIn(f"`{post} submit {PR} --review", task)
         self.assertIn(f"`{post} threads {PR}`", task)
         for verdict in ("request_changes", "approve", "comment"):
             self.assertIn(f"`{verdict}`", task)
-        self.assertIn("--resolve <id>", task)
         self.assertIn("Bash(*pulls/*/reviews*)", REVIEW_ONLY_DENY_RULES)
         self.assertIn("Bash(*graphql*)", REVIEW_ONLY_DENY_RULES)
 
@@ -288,7 +315,7 @@ class HandlerTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.config = {"peer_review": {
             "self_github_login": "lisa-cargochief[bot]", "peer_bot_user_ids": ["UNED"],
-            "max_reviews_per_pr": 2,
+            "max_reviews_per_pr": 1,
         }}
         self.posts = []
         self.audits = []
@@ -625,11 +652,11 @@ class PeerRequestTest(unittest.TestCase):
                     post=lambda channel, message: self.posts.append((channel, message)),
                     audit=self.audits.append, sent=sent,
                 )
-            for _ in range(3):
+            for _ in range(6):
                 send()
             with self.assertRaisesRegex(PeerRequestError, "used its review requests"):
                 send()
-        self.assertEqual(3, len(self.posts))
+        self.assertEqual(6, len(self.posts))
         self.assertIn("OUTCOME:refused_sent_cap", self.audits[-1])
 
     def test_a_failed_post_is_audited_and_refused(self):
@@ -641,3 +668,34 @@ class PeerRequestTest(unittest.TestCase):
                 post=boom, audit=self.audits.append,
             )
         self.assertIn("OUTCOME:refused_post", self.audits[-1])
+
+
+class PlanReviewPassTest(unittest.TestCase):
+    HEAD1, HEAD2 = "1" * 40, "2" * 40
+
+    def review(self, pass_no, mode, head, login="lisa-cargochief[bot]", type_="Bot"):
+        return {"login": login, "type": type_, "body": f"Summary\n\n{review_marker(pass_no, mode, head)}"}
+
+    def test_passes_come_from_the_agents_own_markers(self):
+        me = "lisa-cargochief[bot]"
+        self.assertEqual(ReviewPlan("full", 1, 3), plan_review_pass([], me, 3))
+        self.assertEqual(ReviewPlan("full", 1, 3), plan_review_pass(
+            [{"login": me, "type": "Bot", "body": "approved before passes existed"}], me, 3))
+        one = [self.review(1, "full", self.HEAD1)]
+        self.assertEqual(ReviewPlan("incremental", 2, 3, self.HEAD1), plan_review_pass(one, me, 3))
+        three = one + [self.review(2, "incremental", self.HEAD2), self.review(3, "incremental", self.HEAD1)]
+        self.assertEqual(ReviewPlan("closeout", 3, 3, self.HEAD1), plan_review_pass(three, me, 3))
+        later = three + [self.review(3, "closeout", self.HEAD2)]
+        self.assertEqual(ReviewPlan("closeout", 3, 3, self.HEAD2), plan_review_pass(later, me, 3))
+
+    def test_markers_from_other_accounts_do_not_count(self):
+        me = "lisa-cargochief[bot]"
+        spoofed = [
+            self.review(3, "full", self.HEAD1, login="lisa-cargochief", type_="User"),
+            self.review(3, "full", self.HEAD1, login="nedcc[bot]"),
+        ]
+        self.assertEqual(ReviewPlan("full", 1, 3), plan_review_pass(spoofed, me, 3))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,6 +4,10 @@ The review task gives the exact command lines. Subcommands:
     threads <pr-url>    list this agent's review threads on the PR
     submit <pr-url> --review <review.json> --verdict comment|request_changes|approve [--resolve <id>...]
 
+review.json may carry `replies` ([{"thread_id", "body"}]) on this agent's own threads; they post
+after the review and before any thread is resolved. Each review body carries the pass marker the
+harness reads to plan the next pass. A close-out adds no findings.
+
 The room's permission rules deny the raw reviews and GraphQL endpoints because they cannot see a
 payload file; this script reads the payload and enforces the rules in code. It posts only to the
 PR the harness admitted, submits one review with its inline comments, then resolves only threads
@@ -22,11 +26,13 @@ import sys
 from typing import Callable, Mapping
 
 from cargo_chief_safety import (
+    REVIEW_MODE_ENV,
+    REVIEW_PASS_ENV,
     REVIEW_PR_ENV,
     REVIEW_REQUESTER_LOGIN_ENV,
     REVIEW_SELF_LOGIN_ENV,
 )
-from review_requests import normalize_login, single_pr_url
+from review_requests import normalize_login, review_marker, single_pr_url
 
 VERDICTS = {"comment": "COMMENT", "request_changes": "REQUEST_CHANGES", "approve": "APPROVE"}
 SIDES = ("LEFT", "RIGHT")
@@ -46,6 +52,10 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }
 """
+REPLY_MUTATION = (
+    "mutation($id: ID!, $body: String!) { addPullRequestReviewThreadReply("
+    "input: {pullRequestReviewThreadId: $id, body: $body}) { comment { id } } }"
+)
 RESOLVE_MUTATION = "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"
 
 
@@ -104,6 +114,9 @@ class GitHub:
                 return threads
             cursor = page["pageInfo"]["endCursor"]
 
+    def reply(self, thread_id: str, body: str) -> None:
+        self._gh(["api", "graphql", "--input", "-"], {"query": REPLY_MUTATION, "variables": {"id": thread_id, "body": body}})
+
     def resolve(self, thread_id: str) -> None:
         self._gh(["api", "graphql", "--input", "-"], {"query": RESOLVE_MUTATION, "variables": {"id": thread_id}})
 
@@ -142,6 +155,27 @@ def _clean_comment(comment: object) -> dict:
         cleaned["start_side"] = comment.get("start_side", cleaned["side"])
         if cleaned["start_side"] not in SIDES:
             raise ReviewPostError(f"comment on {path} has an invalid start_side")
+    return cleaned
+
+
+def review_pass(env: Mapping[str, str]) -> tuple[str, int]:
+    """The mode and pass number the harness set for this turn."""
+    mode, pass_no = env.get(REVIEW_MODE_ENV, ""), env.get(REVIEW_PASS_ENV, "")
+    if mode not in ("full", "incremental", "closeout") or not pass_no.isdigit() or int(pass_no) < 1:
+        raise ReviewPostError(f"{REVIEW_MODE_ENV} and {REVIEW_PASS_ENV} are not set; run this from a review turn")
+    return mode, int(pass_no)
+
+
+def thread_replies(payload: Mapping) -> list[tuple[str, str]]:
+    replies = payload.get("replies") or []
+    if not isinstance(replies, list):
+        raise ReviewPostError("review.json replies must be a list")
+    cleaned = []
+    for item in replies:
+        if not isinstance(item, Mapping) or not isinstance(item.get("thread_id"), str) \
+                or not isinstance(item.get("body"), str) or not item["body"].strip():
+            raise ReviewPostError("every reply needs a thread_id and a body")
+        cleaned.append((item["thread_id"], item["body"]))
     return cleaned
 
 
@@ -184,17 +218,22 @@ def submit(
 ) -> str:
     login = self_login(env)
     owner, repo, number = admitted_pr(pr_url, env)
+    mode, pass_no = review_pass(env)
     pull = github.pull(owner, repo, number)
     if pull.get("state") != "open":
         raise ReviewPostError("the PR is no longer open")
     head_sha = pull["head"]["sha"]
     review = build_review(payload, verdict, head_sha)
+    if mode == "closeout" and (review.get("comments") or verdict == "request_changes"):
+        raise ReviewPostError("a close-out adds no findings; approve, or comment naming the threads still in dispute")
+    review["body"] = f"{review['body']}\n\n{review_marker(pass_no, mode, head_sha)}".lstrip()
+    replies = thread_replies(payload)
     resolve_ids = list(dict.fromkeys(resolve_ids))
 
     mine: dict[str, Mapping] = {}
-    if resolve_ids or verdict == "approve":
+    if resolve_ids or replies or verdict == "approve":
         mine = {thread["id"]: thread for thread in own_threads(github, owner, repo, number, login)}
-    unknown = [thread_id for thread_id in resolve_ids if thread_id not in mine]
+    unknown = [thread_id for thread_id in [*resolve_ids, *(tid for tid, _ in replies)] if thread_id not in mine]
     if unknown:
         raise ReviewPostError(f"not threads this agent started on this PR: {', '.join(unknown)}")
     if verdict == "approve":
@@ -210,7 +249,13 @@ def submit(
             raise ReviewPostError("the PR head moved during posting; review the current head")
 
     result = github.submit(owner, repo, number, review)
-    resolved, failed = 0, []
+    failed = []
+    for thread_id, body in replies:
+        try:
+            github.reply(thread_id, body)
+        except ReviewPostError:
+            failed.append(f"reply on {thread_id}")
+    resolved = 0
     for thread_id in resolve_ids:
         if mine[thread_id].get("isResolved"):
             continue
@@ -218,10 +263,14 @@ def submit(
             github.resolve(thread_id)
             resolved += 1
         except ReviewPostError:
-            failed.append(thread_id)
-    message = f"{review['event']} review posted: {(result or {}).get('html_url', '')} (resolved {resolved} threads)"
+            failed.append(f"resolve {thread_id}")
+    message = (
+        f"{review['event']} review posted for pass {pass_no} ({mode}): "
+        f"{(result or {}).get('html_url', '')} ({len(replies) - sum(f.startswith('reply') for f in failed)} replies, "
+        f"resolved {resolved} threads)"
+    )
     if failed:
-        message += f"; could not resolve {', '.join(failed)}"
+        message += f"; failed: {', '.join(failed)}"
     return message
 
 

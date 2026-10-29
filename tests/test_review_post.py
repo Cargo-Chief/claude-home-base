@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import cargo_chief_safety
 from review_post import (
+    REVIEW_MODE_ENV,
+    REVIEW_PASS_ENV,
     REVIEW_PR_ENV,
     REVIEW_REQUESTER_LOGIN_ENV,
     REVIEW_SELF_LOGIN_ENV,
@@ -27,7 +29,10 @@ ENV = {
     REVIEW_SELF_LOGIN_ENV: "lisa-cargochief[bot]",
     REVIEW_REQUESTER_LOGIN_ENV: "kfranzenCC",
     REVIEW_PR_ENV: PR,
+    REVIEW_MODE_ENV: "incremental",
+    REVIEW_PASS_ENV: "2",
 }
+CLOSEOUT = {**ENV, REVIEW_MODE_ENV: "closeout", REVIEW_PASS_ENV: "3"}
 OPEN = {"state": "open", "draft": False, "user": {"login": "dev1", "type": "User"}}
 
 
@@ -54,6 +59,11 @@ class FakeGitHub:
         self.calls.append(("threads",))
         return self._threads
 
+    def reply(self, thread_id, body):
+        self.calls.append(("reply", thread_id))
+        if thread_id in self.fail_resolve:
+            raise ReviewPostError("graphql failed")
+
     def resolve(self, thread_id):
         self.calls.append(("resolve", thread_id))
         if thread_id in self.fail_resolve:
@@ -61,12 +71,13 @@ class FakeGitHub:
 
     def submit(self, owner, repo, number, review):
         self.calls.append(("submit", review["event"]))
+        self.submitted = review
         if self.fail_submit:
             raise ReviewPostError("422")
         return {"html_url": "https://github.com/x"}
 
     def names(self):
-        return [call[0] if call[0] != "resolve" else f"resolve:{call[1]}" for call in self.calls]
+        return [f"{call[0]}:{call[1]}" if call[0] in ("resolve", "reply") else call[0] for call in self.calls]
 
 
 def payload(comments=(), body="Summary"):
@@ -145,7 +156,7 @@ class ReviewPostTest(unittest.TestCase):
         github = FakeGitHub(threads=[thread("T1"), thread("T2")], fail_resolve={"T1"})
         out = submit(github, PR, payload(), "comment", ["T1", "T2"], ENV)
         self.assertIn("resolved 1 threads", out)
-        self.assertIn("could not resolve T1", out)
+        self.assertIn("failed: resolve T1", out)
 
     def test_submit_refuses_approval_with_own_thread_left_open(self):
         github = FakeGitHub(threads=[thread("T1")])
@@ -201,6 +212,51 @@ class ReviewPostTest(unittest.TestCase):
             path.write_text("[]")
             self.assertEqual(2, main(["submit", PR, "--review", str(path), "--verdict", "comment"],
                                      github=FakeGitHub(), env=ENV))
+
+
+class ReviewPassPostTest(unittest.TestCase):
+    def test_review_body_carries_the_pass_marker(self):
+        github = FakeGitHub()
+        out = submit(github, PR, payload(["x"]), "request_changes", [], ENV)
+        self.assertTrue(github.submitted["body"].endswith(f"<!-- cc-peer-review pass=2 mode=incremental head={HEAD} -->"))
+        self.assertIn("pass 2 (incremental)", out)
+        approve = FakeGitHub()
+        submit(approve, PR, payload(body=""), "approve", [], ENV)
+        self.assertTrue(approve.submitted["body"].startswith("<!-- cc-peer-review pass=2"))
+
+    def test_needs_the_mode_from_the_harness(self):
+        for env in ({**ENV, REVIEW_MODE_ENV: ""}, {**ENV, REVIEW_PASS_ENV: "x"}, {**ENV, REVIEW_MODE_ENV: "bogus"}):
+            with self.subTest(env=env), self.assertRaisesRegex(ReviewPostError, "not set"):
+                submit(FakeGitHub(), PR, payload(), "comment", [], env)
+
+    def test_closeout_adds_no_findings(self):
+        with self.assertRaisesRegex(ReviewPostError, "close-out adds no findings"):
+            submit(FakeGitHub(), PR, payload(["new finding"]), "comment", [], CLOSEOUT)
+        with self.assertRaisesRegex(ReviewPostError, "close-out adds no findings"):
+            submit(FakeGitHub(), PR, payload(), "request_changes", [], CLOSEOUT)
+        github = FakeGitHub(threads=[thread("T1")])
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed in abc."}]}
+        submit(github, PR, body, "approve", ["T1"], CLOSEOUT)
+        self.assertEqual(["pull", "threads", "pull", "submit", "reply:T1", "resolve:T1"], github.names())
+        self.assertIn("mode=closeout", github.submitted["body"])
+
+    def test_replies_post_after_the_review_and_before_resolving(self):
+        github = FakeGitHub(threads=[thread("T1"), thread("T2")])
+        body = {**payload(), "replies": [{"thread_id": "T2", "body": "Reason not accepted: the cap still leaks."},
+                                         {"thread_id": "T1", "body": "Accepted."}]}
+        out = submit(github, PR, body, "comment", ["T1"], ENV)
+        self.assertEqual(["pull", "threads", "submit", "reply:T2", "reply:T1", "resolve:T1"], github.names())
+        self.assertIn("2 replies", out)
+
+    def test_replies_only_on_own_threads(self):
+        github = FakeGitHub(threads=[thread("T2", login="nedcc")])
+        body = {**payload(), "replies": [{"thread_id": "T2", "body": "x"}]}
+        with self.assertRaisesRegex(ReviewPostError, "not threads this agent started"):
+            submit(github, PR, body, "comment", [], ENV)
+        self.assertNotIn("submit", github.names())
+        for bad in ({"replies": "x"}, {"replies": [{"thread_id": "T1"}]}, {"replies": [{"thread_id": "T1", "body": " "}]}):
+            with self.subTest(bad=bad), self.assertRaises(ReviewPostError):
+                submit(FakeGitHub(threads=[thread("T1")]), PR, {**payload(), **bad}, "comment", [], ENV)
 
 
 if __name__ == "__main__":
