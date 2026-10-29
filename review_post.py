@@ -26,13 +26,14 @@ import sys
 from typing import Callable, Mapping
 
 from cargo_chief_safety import (
+    REVIEW_BASE_ENV,
     REVIEW_MODE_ENV,
     REVIEW_PASS_ENV,
     REVIEW_PR_ENV,
     REVIEW_REQUESTER_LOGIN_ENV,
     REVIEW_SELF_LOGIN_ENV,
 )
-from review_requests import normalize_login, review_marker, single_pr_url
+from review_requests import REVIEW_MARKER_RE, REVIEW_MODES, normalize_login, review_marker, single_pr_url
 
 VERDICTS = {"comment": "COMMENT", "request_changes": "REQUEST_CHANGES", "approve": "APPROVE"}
 SIDES = ("LEFT", "RIGHT")
@@ -120,6 +121,9 @@ class GitHub:
     def resolve(self, thread_id: str) -> None:
         self._gh(["api", "graphql", "--input", "-"], {"query": RESOLVE_MUTATION, "variables": {"id": thread_id}})
 
+    def compare_status(self, owner: str, repo: str, base: str, head: str) -> str:
+        return self._gh(["api", f"repos/{owner}/{repo}/compare/{base}...{head}", "--jq", "{status: .status}"])["status"]
+
     def submit(self, owner: str, repo: str, number: int, review: dict) -> Mapping:
         return self._gh(["api", f"repos/{owner}/{repo}/pulls/{number}/reviews", "--input", "-"], review)
 
@@ -161,7 +165,7 @@ def _clean_comment(comment: object) -> dict:
 def review_pass(env: Mapping[str, str]) -> tuple[str, int]:
     """The mode and pass number the harness set for this turn."""
     mode, pass_no = env.get(REVIEW_MODE_ENV, ""), env.get(REVIEW_PASS_ENV, "")
-    if mode not in ("full", "incremental", "closeout") or not pass_no.isdigit() or int(pass_no) < 1:
+    if mode not in REVIEW_MODES or not pass_no.isdigit() or int(pass_no) < 1:
         raise ReviewPostError(f"{REVIEW_MODE_ENV} and {REVIEW_PASS_ENV} are not set; run this from a review turn")
     return mode, int(pass_no)
 
@@ -226,7 +230,9 @@ def submit(
     review = build_review(payload, verdict, head_sha)
     if mode == "closeout" and (review.get("comments") or verdict == "request_changes"):
         raise ReviewPostError("a close-out adds no findings; approve, or comment naming the threads still in dispute")
-    review["body"] = f"{review['body']}\n\n{review_marker(pass_no, mode, head_sha)}".lstrip()
+    # Only the trailing marker is genuine; the model's text may quote one from the PR.
+    body = REVIEW_MARKER_RE.sub("", review["body"]).strip()
+    review["body"] = f"{body}\n\n{review_marker(pass_no, mode, head_sha)}".lstrip()
     replies = thread_replies(payload)
     resolve_ids = list(dict.fromkeys(resolve_ids))
 
@@ -244,30 +250,38 @@ def submit(
         )
         if refusal:
             raise ReviewPostError(refusal)
+        base = env.get(REVIEW_BASE_ENV, "")
+        if mode == "closeout" and (not base or github.compare_status(owner, repo, base, head_sha) not in ("ahead", "identical")):
+            raise ReviewPostError("the branch was rewritten since your last pass, so a close-out cannot approve it")
         # The author may push while threads are read; approve only what was reviewed.
         if github.pull(owner, repo, number)["head"]["sha"] != head_sha:
             raise ReviewPostError("the PR head moved during posting; review the current head")
 
     result = github.submit(owner, repo, number, review)
-    failed = []
+    # The review is posted; from here a failure is reported, never raised as a refusal.
+    failed, unreplied = [], set()
+    replied = resolved = 0
     for thread_id, body in replies:
         try:
             github.reply(thread_id, body)
-        except ReviewPostError:
+            replied += 1
+        except Exception:
             failed.append(f"reply on {thread_id}")
-    resolved = 0
+            unreplied.add(thread_id)
     for thread_id in resolve_ids:
         if mine[thread_id].get("isResolved"):
+            continue
+        if thread_id in unreplied:
+            failed.append(f"resolve {thread_id} (skipped: its reply failed)")
             continue
         try:
             github.resolve(thread_id)
             resolved += 1
-        except ReviewPostError:
+        except Exception:
             failed.append(f"resolve {thread_id}")
     message = (
         f"{review['event']} review posted for pass {pass_no} ({mode}): "
-        f"{(result or {}).get('html_url', '')} ({len(replies) - sum(f.startswith('reply') for f in failed)} replies, "
-        f"resolved {resolved} threads)"
+        f"{(result or {}).get('html_url', '')} ({replied} replies, resolved {resolved} threads)"
     )
     if failed:
         message += f"; failed: {', '.join(failed)}"

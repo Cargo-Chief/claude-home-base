@@ -29,13 +29,17 @@ review-only room without a valid `peer_review.self_github_login` is refused.
 
 Each request for the same PR is the next pass. `review_post.py` stamps every review body with a
 hidden marker (`<!-- cc-peer-review pass=N mode=… head=… -->`), and the harness reads the agent's own
-Bot-authored marked reviews when it looks up the PR (`plan_review_pass`). Pass 1 is a full review.
-Passes up to `max_reviews_per_pr` review only the commits since the last marked head and go through
-the agent's open threads: a reply naming the fix or accepting or rejecting the author's reason, and
-a resolve for each fixed or accepted one. After the last pass a request runs a close-out instead of
-being refused: no `cc-code-review` run and no new findings, only the thread work, then an approval
-when no thread is left open or a comment naming the threads in dispute. The 24-hour cap is a rate
-limit at twice the pass cap, so passes plus close-outs still stop.
+Bot-authored marked reviews when it looks up the PR (`plan_review_pass`); the latest marker sets
+the pass and the base, and `review_post.py` strips marker-shaped text from the model's body before
+stamping. With no marker the turn is pass 1, a full review. Passes 2 to `max_reviews_per_pr` review
+only the commits since the last marked head (`cc-code-review --since`, which falls back to a full
+review after a rebase). Every pass goes through the agent's open threads: a reply naming the fix or
+accepting or rejecting the author's reason, then a resolve for each fixed or accepted one; a thread
+whose reply failed is not resolved. After the last pass a request runs a close-out instead of being
+refused, numbered as the last pass: no `cc-code-review` run and no new findings, only the thread
+work over the commits since the last pass. It approves only when no thread is left open and the
+last reviewed head is still in the branch history; otherwise it comments naming what is in
+dispute. One review runs per PR at a time. The 24-hour cap is a rate limit at twice the pass cap.
 
 The turn posts only through `review_post.py`, run under the GitHub App wrapper with the absolute
 paths the task names. The deny rules block the raw reviews and GraphQL endpoints because they cannot

@@ -920,6 +920,7 @@ def _spawn_claude_process(
             requester_login=peer.github_logins.get(user_id, ""), pr=review_pr,
             mode=review_plan.mode if review_plan else "",
             pass_no=review_plan.pass_no if review_plan else 0,
+            review_base=review_plan.base if review_plan else "",
         )
     if thread_ts:
         proc_env["CLAUDE_THREAD_TS"] = thread_ts
@@ -3330,10 +3331,10 @@ def _review_room_policy(channel: str, user_id: str) -> RoomPolicy:
     return policy
 
 
-def _lookup_review_pr(pr_url: str, root: Path):
+def _lookup_review_pr(pr_url: str, root: Path, include_reviews: bool = True):
     return lookup_pr(
         pr_url, root=root, child_env=review_turn_env(claude_owner_env(os.environ)),
-        python=sys.executable,
+        python=sys.executable, include_reviews=include_reviews,
     )
 
 
@@ -3727,7 +3728,7 @@ def main():
                 args.request_review,
                 config=_load_model_config(),
                 env=os.environ,
-                lookup=_lookup_review_pr,
+                lookup=lambda pr, root: _lookup_review_pr(pr, root, include_reviews=False),
                 post=lambda channel, text: slack_client.chat_postMessage(channel=channel, text=text),
                 audit=audit_logger.info,
                 sent=ReviewCapStore(STATE_DIR / "review-requests-sent.json"),

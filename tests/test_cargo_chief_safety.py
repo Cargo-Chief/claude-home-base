@@ -1062,6 +1062,7 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "CARGO_CHIEF_REVIEW_PR": "",
             "CARGO_CHIEF_REVIEW_MODE": "",
             "CARGO_CHIEF_REVIEW_PASS": "",
+            "CARGO_CHIEF_REVIEW_BASE": "",
         }, env)
         self.assertIn("AWS_PROFILE", base, "the caller's mapping is not mutated")
 
@@ -1161,6 +1162,7 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "printf -v CARGO_CHIEF_REVIEW_PR %s https://github.com/Cargo-Chief/c4/pull/9",
             "export CARGO_CHIEF_REVIEW_MODE=closeout",
             "CARGO_CHIEF_REVIEW_PASS=1 python3 review_post.py submit x",
+            "export CARGO_CHIEF_REVIEW_BASE=abc",
         ):
             with self.subTest(blocked=blocked):
                 self.assertNotEqual([], denied(blocked))

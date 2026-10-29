@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from cargo_chief_safety import REVIEW_ONLY_DENY_RULES, RoomPolicy, SafetyError
 from review_requests import (
+    PR_BUSY_REPLY,
     ReviewPlan,
     plan_review_pass,
     review_marker,
@@ -150,6 +151,14 @@ class LookupTest(unittest.TestCase):
                          reviews_command[:5])
         self.assertIn("--paginate", reviews_command)
 
+    def test_sender_lookup_skips_the_reviews(self):
+        result = subprocess.CompletedProcess([], 0, json.dumps({"author": {"login": "x"}, "state": "OPEN"}), "")
+        calls = []
+        info = lookup_pr(PR, root=Path("/root"), child_env={}, python="/py", include_reviews=False,
+                         runner=lambda command, **kwargs: calls.append(command) or result)
+        self.assertEqual(1, len(calls))
+        self.assertEqual((), info.reviews)
+
     def test_review_lookup_failure_fails_closed(self):
         result = subprocess.CompletedProcess([], 0, json.dumps({"author": {"login": "x"}, "state": "OPEN"}), "")
         with self.assertRaises(ReviewGuardError):
@@ -234,6 +243,10 @@ class AuditAndTaskTest(unittest.TestCase):
         self.assertIn("--resolve <id>", task)
         closeout = build_review_task(PR, Path("/root"), ReviewPlan("closeout", 3, 3, base))
         self.assertIn("close-out: do not run cc-code-review", closeout)
+        self.assertIn(f"git diff {base}..<head>", closeout)
+        full = build_review_task(PR, Path("/root"), ReviewPlan("full", 1, 3))
+        self.assertIn("If you have open threads from earlier reviews", full)
+        self.assertIn("--resolve <id>", full)
         self.assertIn("Kirk needs to look", closeout)
         self.assertNotIn("--since", closeout)
 
@@ -540,6 +553,16 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(["refused_throttle"], self.outcomes())
         self.assertTrue(self.claims.claim("1.1"), "a throttled request releases its claim")
 
+    def test_one_review_per_pr_at_a_time(self):
+        self.claims.claim(f"pr:{PR}")
+        self.mention()
+        self.assertEqual([PR_BUSY_REPLY], self.replies())
+        self.assertEqual(["refused_busy"], self.outcomes())
+        self.claims.release(f"pr:{PR}")
+        self.mention(thread_ts="0.8")
+        self.assertEqual(["refused_busy", "accepted"], self.outcomes())
+        self.assertTrue(self.claims.claim(f"pr:{PR}"), "the PR claim is released after the turn")
+
     def test_admission_slot_is_released_after_the_guards(self):
         self.mention()
         self.mention(thread_ts="0.8")
@@ -695,6 +718,14 @@ class PlanReviewPassTest(unittest.TestCase):
             self.review(3, "full", self.HEAD1, login="nedcc[bot]"),
         ]
         self.assertEqual(ReviewPlan("full", 1, 3), plan_review_pass(spoofed, me, 3))
+
+    def test_the_latest_marker_sets_pass_and_base(self):
+        me = "lisa-cargochief[bot]"
+        quoted = {"login": me, "type": "Bot",
+                  "body": review_marker(9, "closeout", self.HEAD2) + "\n" + review_marker(1, "full", self.HEAD1)}
+        self.assertEqual(ReviewPlan("incremental", 2, 3, self.HEAD1), plan_review_pass([quoted], me, 3))
+        older_higher = [self.review(2, "incremental", self.HEAD1), self.review(1, "full", self.HEAD2)]
+        self.assertEqual(ReviewPlan("incremental", 2, 3, self.HEAD2), plan_review_pass(older_higher, me, 3))
 
 
 if __name__ == "__main__":
