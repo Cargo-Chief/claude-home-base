@@ -132,6 +132,7 @@ from review_requests import (
     ThreadClaims,
     request_peer_review,
     build_review_task,
+    ReviewPlan,
     lookup_pr,
 )
 from session_lifecycle import (
@@ -854,6 +855,7 @@ def _spawn_claude_process(
     channel: str = "",
     review_policy: RoomPolicy | None = None,
     review_pr: str = "",
+    review_plan: ReviewPlan | None = None,
 ) -> tuple[subprocess.Popen, ThreadWorkspace]:
     """Spawn a long-lived Claude CLI process with stream-json I/O.
 
@@ -916,6 +918,9 @@ def _spawn_claude_process(
         proc_env = review_turn_env(
             proc_env, self_login=peer.self_github_login,
             requester_login=peer.github_logins.get(user_id, ""), pr=review_pr,
+            mode=review_plan.mode if review_plan else "",
+            pass_no=review_plan.pass_no if review_plan else 0,
+            review_base=review_plan.base if review_plan else "",
         )
     if thread_ts:
         proc_env["CLAUDE_THREAD_TS"] = thread_ts
@@ -1417,7 +1422,7 @@ def _reader_loop(session: LiveSession) -> None:
 
 def _get_or_create_live_session(
     thread_ts: str, channel: str, user_id: str = "", review_policy: RoomPolicy | None = None,
-    review_pr: str = "",
+    review_pr: str = "", review_plan: ReviewPlan | None = None,
 ) -> LiveSession:
     """Get an existing live session or create a new one.
 
@@ -1464,6 +1469,7 @@ def _get_or_create_live_session(
             channel=channel,
             review_policy=review_policy,
             review_pr=review_pr,
+            review_plan=review_plan,
         )
         session = LiveSession(
             proc=proc,
@@ -2582,7 +2588,7 @@ def process_message_async(
         review_requester=review,
         handoff_from=handoff_from,
     )
-    text = f"{build_review_task(review_admission.pr, room_policy.root)}\n\n{envelope}" if review else prefix + envelope
+    text = f"{build_review_task(review_admission.pr, room_policy.root, review_admission.plan)}\n\n{envelope}" if review else prefix + envelope
 
     if review and _review_turn_running(thread_ts):
         review_admission.refuse("refused_busy", BUSY_REPLY)
@@ -2676,6 +2682,7 @@ def process_message_async(
                     thread_ts, channel, user_id=user_id,
                     review_policy=room_policy if review else None,
                     review_pr=review_admission.pr if review else "",
+                    review_plan=review_admission.plan if review else None,
                 )
                 # The cap is charged, and the request audited as accepted, only once its turn starts.
                 if review and not review_admission.start():
@@ -3324,10 +3331,10 @@ def _review_room_policy(channel: str, user_id: str) -> RoomPolicy:
     return policy
 
 
-def _lookup_review_pr(pr_url: str, root: Path):
+def _lookup_review_pr(pr_url: str, root: Path, include_reviews: bool = True):
     return lookup_pr(
         pr_url, root=root, child_env=review_turn_env(claude_owner_env(os.environ)),
-        python=sys.executable,
+        python=sys.executable, include_reviews=include_reviews,
     )
 
 
@@ -3721,7 +3728,7 @@ def main():
                 args.request_review,
                 config=_load_model_config(),
                 env=os.environ,
-                lookup=_lookup_review_pr,
+                lookup=lambda pr, root: _lookup_review_pr(pr, root, include_reviews=False),
                 post=lambda channel, text: slack_client.chat_postMessage(channel=channel, text=text),
                 audit=audit_logger.info,
                 sent=ReviewCapStore(STATE_DIR / "review-requests-sent.json"),

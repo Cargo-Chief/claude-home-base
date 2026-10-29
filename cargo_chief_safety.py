@@ -1070,6 +1070,9 @@ REVIEW_ONLY_ENV = "CARGO_CHIEF_REVIEW_ONLY"
 REVIEW_SELF_LOGIN_ENV = "CARGO_CHIEF_REVIEW_SELF_LOGIN"
 REVIEW_REQUESTER_LOGIN_ENV = "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN"
 REVIEW_PR_ENV = "CARGO_CHIEF_REVIEW_PR"
+REVIEW_MODE_ENV = "CARGO_CHIEF_REVIEW_MODE"
+REVIEW_PASS_ENV = "CARGO_CHIEF_REVIEW_PASS"
+REVIEW_BASE_ENV = "CARGO_CHIEF_REVIEW_BASE"
 REVIEW_TOKEN_PERMISSIONS = {"contents": "read", "pull_requests": "write"}
 REVIEW_STRIPPED_ENV_KEYS = ("CC_AWS_PROFILE",)
 REVIEW_ONLY_DENY_RULES = (
@@ -1090,6 +1093,9 @@ REVIEW_ONLY_DENY_RULES = (
     "Bash(*CARGO_CHIEF_REVIEW_SELF_LOGIN*)",
     "Bash(*CARGO_CHIEF_REVIEW_REQUESTER_LOGIN*)",
     "Bash(*CARGO_CHIEF_REVIEW_PR*)",
+    "Bash(*CARGO_CHIEF_REVIEW_MODE*)",
+    "Bash(*CARGO_CHIEF_REVIEW_PASS*)",
+    "Bash(*CARGO_CHIEF_REVIEW_BASE*)",
     "Bash(*github-app.env*)",
     "Bash(*.pem*)",
     "Bash(*env -i*)",
@@ -1124,6 +1130,7 @@ def _review_strips(key: str) -> bool:
 
 def review_turn_env(
     base: Mapping[str, str], *, self_login: str = "", requester_login: str = "", pr: str = "",
+    mode: str = "", pass_no: int = 0, review_base: str = "",
 ) -> dict[str, str]:
     """A review-only environment: a downscoped GitHub token request, no AWS identity, no Slack secrets.
 
@@ -1139,6 +1146,9 @@ def review_turn_env(
     result[REVIEW_SELF_LOGIN_ENV] = self_login
     result[REVIEW_REQUESTER_LOGIN_ENV] = requester_login
     result[REVIEW_PR_ENV] = pr
+    result[REVIEW_MODE_ENV] = mode
+    result[REVIEW_PASS_ENV] = str(pass_no) if pass_no else ""
+    result[REVIEW_BASE_ENV] = review_base
     return result
 
 

@@ -43,8 +43,11 @@ from review_requests import (
     WRAPPER_REPLY,
     ReviewAdmission,
     ReviewCapStore,
+    ReviewPlan,
     build_review_task,
 )
+
+PLAN = ReviewPlan("incremental", 2, 3, "a" * 40)
 
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
@@ -184,6 +187,7 @@ class SpawnTest(unittest.TestCase):
             self.assertNotIn(key, child, key)
         self.assertEqual("1", child["CARGO_CHIEF_REVIEW_ONLY"])
         self.assertEqual("", child["CARGO_CHIEF_REVIEW_PR"])
+        self.assertEqual("", child["CARGO_CHIEF_REVIEW_MODE"])
         self.assertIn(TOKEN_PERMISSIONS_ENV, child)
         self.assertEqual("keep", child["CLAUDE_CODE_OAUTH_TOKEN"])
         self.assertNotIn("bundle", str(kwargs["cwd"]))
@@ -250,11 +254,13 @@ class ProcessReviewTest(unittest.TestCase):
         self.created = []
         self.unauthorized = []
         self.created_prs = []
+        self.created_plans = []
         self.caps = ReviewCapStore(self.room.root / "caps.json")
         self.resolved = self.room.policy
         self.session = FakeSession()
 
-        def create(thread_ts, channel, user_id="", review_policy=None, review_pr=""):
+        def create(thread_ts, channel, user_id="", review_policy=None, review_pr="", review_plan=None):
+            self.created_plans.append(review_plan)
             self.created.append(review_policy)
             self.created_prs.append(review_pr)
             return self.session
@@ -273,6 +279,7 @@ class ProcessReviewTest(unittest.TestCase):
             event={"user": "USTRANGER", "channel": "CREVIEWS", "ts": "1.1", "text": f"review {PR}"},
             pr=PR, policy=self.room.policy, limit=limit, caps=self.caps,
             post=lambda channel, thread, text: self.posts.append(text), audit=self.audits.append,
+            plan=PLAN,
         )
 
     def run_turn(self, admission=None, event=None):
@@ -289,7 +296,8 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual([self.room.policy], self.created)
         self.assertEqual(1, len(self.sent))
         task, envelope = self.sent[0].split("\n\n", 1)
-        self.assertEqual(build_review_task(PR, self.room.policy.root), task)
+        self.assertEqual(build_review_task(PR, self.room.policy.root, PLAN), task)
+        self.assertEqual([PLAN], self.created_plans)
         self.assertEqual([PR], self.created_prs)
         payload = json.loads(envelope.splitlines()[1])
         self.assertEqual("review_requester", payload["current_sender"]["authority"])

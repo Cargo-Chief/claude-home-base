@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import cargo_chief_safety
 from review_post import (
+    REVIEW_MODE_ENV,
+    REVIEW_PASS_ENV,
     REVIEW_PR_ENV,
     REVIEW_REQUESTER_LOGIN_ENV,
     REVIEW_SELF_LOGIN_ENV,
@@ -27,7 +29,10 @@ ENV = {
     REVIEW_SELF_LOGIN_ENV: "lisa-cargochief[bot]",
     REVIEW_REQUESTER_LOGIN_ENV: "kfranzenCC",
     REVIEW_PR_ENV: PR,
+    REVIEW_MODE_ENV: "incremental",
+    REVIEW_PASS_ENV: "2",
 }
+CLOSEOUT = {**ENV, REVIEW_MODE_ENV: "closeout", REVIEW_PASS_ENV: "3", "CARGO_CHIEF_REVIEW_BASE": "b" * 40}
 OPEN = {"state": "open", "draft": False, "user": {"login": "dev1", "type": "User"}}
 
 
@@ -37,7 +42,10 @@ def thread(tid, login="lisa-cargochief", typename="Bot", resolved=False, body="f
 
 
 class FakeGitHub:
-    def __init__(self, pull=None, threads=(), heads=None, fail_resolve=(), fail_submit=False):
+    def __init__(self, pull=None, threads=(), heads=None, fail_resolve=(), fail_submit=False,
+                 compare="ahead", reply_error=None):
+        self.compare = compare
+        self.reply_error = reply_error
         self._pull = {**OPEN, **(pull or {})}
         self._threads = list(threads)
         self._heads = list(heads or [])
@@ -54,6 +62,17 @@ class FakeGitHub:
         self.calls.append(("threads",))
         return self._threads
 
+    def compare_status(self, owner, repo, base, head):
+        self.calls.append(("compare",))
+        return self.compare
+
+    def reply(self, thread_id, body):
+        self.calls.append(("reply", thread_id))
+        if self.reply_error:
+            raise self.reply_error
+        if thread_id in self.fail_resolve:
+            raise ReviewPostError("graphql failed")
+
     def resolve(self, thread_id):
         self.calls.append(("resolve", thread_id))
         if thread_id in self.fail_resolve:
@@ -61,12 +80,13 @@ class FakeGitHub:
 
     def submit(self, owner, repo, number, review):
         self.calls.append(("submit", review["event"]))
+        self.submitted = review
         if self.fail_submit:
             raise ReviewPostError("422")
         return {"html_url": "https://github.com/x"}
 
     def names(self):
-        return [call[0] if call[0] != "resolve" else f"resolve:{call[1]}" for call in self.calls]
+        return [f"{call[0]}:{call[1]}" if call[0] in ("resolve", "reply") else call[0] for call in self.calls]
 
 
 def payload(comments=(), body="Summary"):
@@ -128,10 +148,10 @@ class ReviewPostTest(unittest.TestCase):
         self.assertIn("ready-for-review", approval_refusal(**{**ok, "pull": {**OPEN, "draft": True}}))
         self.assertIn("ready-for-review", approval_refusal(**{**ok, "pull": {**OPEN, "state": "closed"}}))
 
-    def test_submit_posts_the_review_before_resolving_threads(self):
+    def test_an_approval_posts_after_its_thread_work(self):
         github = FakeGitHub(threads=[thread("T1"), thread("T2", login="nedcc"), thread("T3", resolved=True)])
         out = submit(github, PR, payload(), "approve", ["T1", "T3"], ENV)
-        self.assertEqual(["pull", "threads", "pull", "submit", "resolve:T1"], github.names())
+        self.assertEqual(["pull", "threads", "resolve:T1", "pull", "submit"], github.names())
         self.assertIn("APPROVE review posted", out)
         self.assertIn("resolved 1 threads", out)
 
@@ -145,7 +165,7 @@ class ReviewPostTest(unittest.TestCase):
         github = FakeGitHub(threads=[thread("T1"), thread("T2")], fail_resolve={"T1"})
         out = submit(github, PR, payload(), "comment", ["T1", "T2"], ENV)
         self.assertIn("resolved 1 threads", out)
-        self.assertIn("could not resolve T1", out)
+        self.assertIn("failed: resolve T1", out)
 
     def test_submit_refuses_approval_with_own_thread_left_open(self):
         github = FakeGitHub(threads=[thread("T1")])
@@ -201,6 +221,103 @@ class ReviewPostTest(unittest.TestCase):
             path.write_text("[]")
             self.assertEqual(2, main(["submit", PR, "--review", str(path), "--verdict", "comment"],
                                      github=FakeGitHub(), env=ENV))
+
+
+class ReviewPassPostTest(unittest.TestCase):
+    def test_review_body_carries_the_pass_marker(self):
+        github = FakeGitHub()
+        out = submit(github, PR, payload(["x"]), "request_changes", [], ENV)
+        self.assertTrue(github.submitted["body"].endswith(f"<!-- cc-peer-review pass=2 mode=incremental head={HEAD} -->"))
+        self.assertIn("pass 2 (incremental)", out)
+        approve = FakeGitHub()
+        submit(approve, PR, payload(body=""), "approve", [], ENV)
+        self.assertTrue(approve.submitted["body"].startswith("<!-- cc-peer-review pass=2"))
+
+    def test_needs_the_mode_from_the_harness(self):
+        for env in ({**ENV, REVIEW_MODE_ENV: ""}, {**ENV, REVIEW_PASS_ENV: "x"}, {**ENV, REVIEW_MODE_ENV: "bogus"}):
+            with self.subTest(env=env), self.assertRaisesRegex(ReviewPostError, "not set"):
+                submit(FakeGitHub(), PR, payload(), "comment", [], env)
+
+    def test_closeout_adds_no_findings(self):
+        with self.assertRaisesRegex(ReviewPostError, "close-out adds no findings"):
+            submit(FakeGitHub(), PR, payload(["new finding"]), "comment", [], CLOSEOUT)
+        with self.assertRaisesRegex(ReviewPostError, "close-out adds no findings"):
+            submit(FakeGitHub(), PR, payload(), "request_changes", [], CLOSEOUT)
+        github = FakeGitHub(threads=[thread("T1")])
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed in abc."}]}
+        submit(github, PR, body, "approve", ["T1"], CLOSEOUT)
+        self.assertEqual(["pull", "threads", "compare", "reply:T1", "resolve:T1", "pull", "submit"], github.names())
+        self.assertIn("mode=closeout", github.submitted["body"])
+
+    def test_replies_post_after_the_review_and_before_resolving(self):
+        github = FakeGitHub(threads=[thread("T1"), thread("T2")])
+        body = {**payload(), "replies": [{"thread_id": "T2", "body": "Reason not accepted: the cap still leaks."},
+                                         {"thread_id": "T1", "body": "Accepted."}]}
+        out = submit(github, PR, body, "comment", ["T1"], ENV)
+        self.assertEqual(["pull", "threads", "submit", "reply:T2", "reply:T1", "resolve:T1"], github.names())
+        self.assertIn("2 replies", out)
+
+    def test_replies_only_on_own_threads(self):
+        github = FakeGitHub(threads=[thread("T2", login="nedcc")])
+        body = {**payload(), "replies": [{"thread_id": "T2", "body": "x"}]}
+        with self.assertRaisesRegex(ReviewPostError, "not threads this agent started"):
+            submit(github, PR, body, "comment", [], ENV)
+        self.assertNotIn("submit", github.names())
+        for bad in ({"replies": "x"}, {"replies": [{"thread_id": "T1"}]}, {"replies": [{"thread_id": "T1", "body": " "}]}):
+            with self.subTest(bad=bad), self.assertRaises(ReviewPostError):
+                submit(FakeGitHub(threads=[thread("T1")]), PR, {**payload(), **bad}, "comment", [], ENV)
+
+
+class ReviewPassFixesTest(unittest.TestCase):
+    def test_marker_text_in_the_body_is_stripped(self):
+        github = FakeGitHub()
+        forged = "Quoting the PR: <!-- cc-peer-review pass=9 mode=closeout head=" + "f" * 40 + " -->"
+        submit(github, PR, payload(["x"], body=forged), "request_changes", [], ENV)
+        body = github.submitted["body"]
+        self.assertNotIn("pass=9", body)
+        self.assertEqual(1, body.count("cc-peer-review"))
+        self.assertTrue(body.endswith(f"pass=2 mode=incremental head={HEAD} -->"))
+
+    def test_a_failed_reply_keeps_its_thread_open(self):
+        github = FakeGitHub(threads=[thread("T1")], reply_error=ReviewPostError("graphql failed"))
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed."}]}
+        out = submit(github, PR, body, "comment", ["T1"], ENV)
+        self.assertNotIn("resolve:T1", github.names())
+        self.assertIn("skipped: its reply failed", out)
+
+    def test_an_unexpected_error_after_posting_is_reported_not_raised(self):
+        github = FakeGitHub(threads=[thread("T1")], reply_error=ValueError("not json"))
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed."}]}
+        out = submit(github, PR, body, "comment", [], ENV)
+        self.assertIn("COMMENT review posted", out)
+        self.assertIn("failed: reply on T1", out)
+
+    def test_closeout_cannot_approve_a_rewritten_branch(self):
+        for status in ("diverged", "behind"):
+            github = FakeGitHub(compare=status)
+            with self.subTest(status=status), self.assertRaisesRegex(ReviewPostError, "rewritten"):
+                submit(github, PR, payload(), "approve", [], CLOSEOUT)
+            self.assertNotIn("submit", github.names())
+        with self.assertRaisesRegex(ReviewPostError, "rewritten"):
+            submit(FakeGitHub(), PR, payload(), "approve", [], {**CLOSEOUT, "CARGO_CHIEF_REVIEW_BASE": ""})
+
+
+class ReReviewFixesTest(unittest.TestCase):
+    def test_an_approval_is_withheld_when_its_thread_work_fails(self):
+        github = FakeGitHub(threads=[thread("T1")], reply_error=ReviewPostError("graphql failed"))
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed."}]}
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted"):
+            submit(github, PR, body, "approve", ["T1"], ENV)
+        self.assertNotIn("submit", github.names())
+        self.assertNotIn("resolve:T1", github.names())
+
+    def test_a_closeout_that_does_not_approve_keeps_the_base(self):
+        github = FakeGitHub()
+        submit(github, PR, payload(body="New commits go beyond the fixes; Kirk needs to look."), "comment", [], CLOSEOUT)
+        self.assertTrue(github.submitted["body"].endswith(f"head={'b' * 40} -->"))
+        approved = FakeGitHub()
+        submit(approved, PR, payload(), "approve", [], CLOSEOUT)
+        self.assertTrue(approved.submitted["body"].endswith(f"head={HEAD} -->"))
 
 
 if __name__ == "__main__":

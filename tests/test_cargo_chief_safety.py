@@ -1060,6 +1060,9 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "CARGO_CHIEF_REVIEW_SELF_LOGIN": "",
             "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN": "",
             "CARGO_CHIEF_REVIEW_PR": "",
+            "CARGO_CHIEF_REVIEW_MODE": "",
+            "CARGO_CHIEF_REVIEW_PASS": "",
+            "CARGO_CHIEF_REVIEW_BASE": "",
         }, env)
         self.assertIn("AWS_PROFILE", base, "the caller's mapping is not mutated")
 
@@ -1070,6 +1073,8 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             pr="https://github.com/Cargo-Chief/c4/pull/1",
         )
         self.assertEqual("https://github.com/Cargo-Chief/c4/pull/1", env["CARGO_CHIEF_REVIEW_PR"])
+        paced = review_turn_env({}, mode="incremental", pass_no=2)
+        self.assertEqual(("incremental", "2"), (paced["CARGO_CHIEF_REVIEW_MODE"], paced["CARGO_CHIEF_REVIEW_PASS"]))
         self.assertEqual("lisa-cargochief[bot]", env["CARGO_CHIEF_REVIEW_SELF_LOGIN"])
         self.assertEqual("kfranzenCC", env["CARGO_CHIEF_REVIEW_REQUESTER_LOGIN"])
         self.assertNotIn("CARGO_CHIEF_REVIEW_X", env)
@@ -1155,6 +1160,9 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "CARGO_CHIEF_REVIEW_PR+=https://github.com/Cargo-Chief/c4/pull/9 " + wrap + "python3 review_post.py submit x",
             "read CARGO_CHIEF_REVIEW_PR <<< https://github.com/Cargo-Chief/c4/pull/9",
             "printf -v CARGO_CHIEF_REVIEW_PR %s https://github.com/Cargo-Chief/c4/pull/9",
+            "export CARGO_CHIEF_REVIEW_MODE=closeout",
+            "CARGO_CHIEF_REVIEW_PASS=1 python3 review_post.py submit x",
+            "export CARGO_CHIEF_REVIEW_BASE=abc",
         ):
             with self.subTest(blocked=blocked):
                 self.assertNotEqual([], denied(blocked))

@@ -4,10 +4,15 @@ The review task gives the exact command lines. Subcommands:
     threads <pr-url>    list this agent's review threads on the PR
     submit <pr-url> --review <review.json> --verdict comment|request_changes|approve [--resolve <id>...]
 
+review.json may carry `replies` ([{"thread_id", "body"}]) on this agent's own threads; they post
+after the review and before any thread is resolved. Each review body carries the pass marker the
+harness reads to plan the next pass. A close-out adds no findings.
+
 The room's permission rules deny the raw reviews and GraphQL endpoints because they cannot see a
 payload file; this script reads the payload and enforces the rules in code. It posts only to the
-PR the harness admitted, submits one review with its inline comments, then resolves only threads
-this agent started. It approves only an open, non-draft PR whose head is still the reviewed
+PR the harness admitted and touches only threads this agent started. A comment or change request
+posts first and then does its thread work; an approval does its thread work first and posts only
+if all of it succeeded. It approves only an open, non-draft PR whose head is still the reviewed
 commit, with no findings attached, none of this agent's own threads left open, a requester with a
 mapped GitHub login, and a PR this agent did not write.
 """
@@ -22,11 +27,14 @@ import sys
 from typing import Callable, Mapping
 
 from cargo_chief_safety import (
+    REVIEW_BASE_ENV,
+    REVIEW_MODE_ENV,
+    REVIEW_PASS_ENV,
     REVIEW_PR_ENV,
     REVIEW_REQUESTER_LOGIN_ENV,
     REVIEW_SELF_LOGIN_ENV,
 )
-from review_requests import normalize_login, single_pr_url
+from review_requests import REVIEW_MARKER_RE, REVIEW_MODES, normalize_login, review_marker, single_pr_url
 
 VERDICTS = {"comment": "COMMENT", "request_changes": "REQUEST_CHANGES", "approve": "APPROVE"}
 SIDES = ("LEFT", "RIGHT")
@@ -46,6 +54,10 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }
 """
+REPLY_MUTATION = (
+    "mutation($id: ID!, $body: String!) { addPullRequestReviewThreadReply("
+    "input: {pullRequestReviewThreadId: $id, body: $body}) { comment { id } } }"
+)
 RESOLVE_MUTATION = "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"
 
 
@@ -104,8 +116,14 @@ class GitHub:
                 return threads
             cursor = page["pageInfo"]["endCursor"]
 
+    def reply(self, thread_id: str, body: str) -> None:
+        self._gh(["api", "graphql", "--input", "-"], {"query": REPLY_MUTATION, "variables": {"id": thread_id, "body": body}})
+
     def resolve(self, thread_id: str) -> None:
         self._gh(["api", "graphql", "--input", "-"], {"query": RESOLVE_MUTATION, "variables": {"id": thread_id}})
+
+    def compare_status(self, owner: str, repo: str, base: str, head: str) -> str:
+        return self._gh(["api", f"repos/{owner}/{repo}/compare/{base}...{head}", "--jq", "{status: .status}"])["status"]
 
     def submit(self, owner: str, repo: str, number: int, review: dict) -> Mapping:
         return self._gh(["api", f"repos/{owner}/{repo}/pulls/{number}/reviews", "--input", "-"], review)
@@ -145,6 +163,27 @@ def _clean_comment(comment: object) -> dict:
     return cleaned
 
 
+def review_pass(env: Mapping[str, str]) -> tuple[str, int]:
+    """The mode and pass number the harness set for this turn."""
+    mode, pass_no = env.get(REVIEW_MODE_ENV, ""), env.get(REVIEW_PASS_ENV, "")
+    if mode not in REVIEW_MODES or not pass_no.isdigit() or int(pass_no) < 1:
+        raise ReviewPostError(f"{REVIEW_MODE_ENV} and {REVIEW_PASS_ENV} are not set; run this from a review turn")
+    return mode, int(pass_no)
+
+
+def thread_replies(payload: Mapping) -> list[tuple[str, str]]:
+    replies = payload.get("replies") or []
+    if not isinstance(replies, list):
+        raise ReviewPostError("review.json replies must be a list")
+    cleaned = []
+    for item in replies:
+        if not isinstance(item, Mapping) or not isinstance(item.get("thread_id"), str) \
+                or not isinstance(item.get("body"), str) or not item["body"].strip():
+            raise ReviewPostError("every reply needs a thread_id and a body")
+        cleaned.append((item["thread_id"], item["body"]))
+    return cleaned
+
+
 def build_review(payload: Mapping, verdict: str, head_sha: str) -> dict:
     """The review to submit: the payload's body and inline comments under the chosen verdict."""
     if payload.get("commit_id") != head_sha:
@@ -178,23 +217,59 @@ def approval_refusal(*, pull: Mapping, login: str, requester_login: str, open_ow
     return None
 
 
+def _thread_work(
+    github: GitHub, replies: list[tuple[str, str]], resolve_ids: list[str], mine: Mapping[str, Mapping],
+) -> tuple[int, int, list[str]]:
+    """Post the replies, then resolve; a thread whose reply failed stays open."""
+    failed, unreplied = [], set()
+    replied = resolved = 0
+    for thread_id, body in replies:
+        try:
+            github.reply(thread_id, body)
+            replied += 1
+        except Exception:
+            failed.append(f"reply on {thread_id}")
+            unreplied.add(thread_id)
+    for thread_id in resolve_ids:
+        if mine[thread_id].get("isResolved"):
+            continue
+        if thread_id in unreplied:
+            failed.append(f"resolve {thread_id} (skipped: its reply failed)")
+            continue
+        try:
+            github.resolve(thread_id)
+            resolved += 1
+        except Exception:
+            failed.append(f"resolve {thread_id}")
+    return replied, resolved, failed
+
+
 def submit(
     github: GitHub, pr_url: str, payload: Mapping, verdict: str, resolve_ids: list[str],
     env: Mapping[str, str],
 ) -> str:
     login = self_login(env)
     owner, repo, number = admitted_pr(pr_url, env)
+    mode, pass_no = review_pass(env)
     pull = github.pull(owner, repo, number)
     if pull.get("state") != "open":
         raise ReviewPostError("the PR is no longer open")
     head_sha = pull["head"]["sha"]
     review = build_review(payload, verdict, head_sha)
+    if mode == "closeout" and (review.get("comments") or verdict == "request_changes"):
+        raise ReviewPostError("a close-out adds no findings; approve, or comment naming the threads still in dispute")
+    # Only the trailing marker is genuine; the model's text may quote one from the PR.
+    body = REVIEW_MARKER_RE.sub("", review["body"]).strip()
+    # A close-out that does not approve leaves the commits it flagged unreviewed, so it keeps the base.
+    marked_head = head_sha if mode != "closeout" or verdict == "approve" else env.get(REVIEW_BASE_ENV, "") or head_sha
+    review["body"] = f"{body}\n\n{review_marker(pass_no, mode, marked_head)}".lstrip()
+    replies = thread_replies(payload)
     resolve_ids = list(dict.fromkeys(resolve_ids))
 
     mine: dict[str, Mapping] = {}
-    if resolve_ids or verdict == "approve":
+    if resolve_ids or replies or verdict == "approve":
         mine = {thread["id"]: thread for thread in own_threads(github, owner, repo, number, login)}
-    unknown = [thread_id for thread_id in resolve_ids if thread_id not in mine]
+    unknown = [thread_id for thread_id in [*resolve_ids, *(tid for tid, _ in replies)] if thread_id not in mine]
     if unknown:
         raise ReviewPostError(f"not threads this agent started on this PR: {', '.join(unknown)}")
     if verdict == "approve":
@@ -205,23 +280,28 @@ def submit(
         )
         if refusal:
             raise ReviewPostError(refusal)
-        # The author may push while threads are read; approve only what was reviewed.
+        base = env.get(REVIEW_BASE_ENV, "")
+        if mode == "closeout" and (not base or github.compare_status(owner, repo, base, head_sha) not in ("ahead", "identical")):
+            raise ReviewPostError("the branch was rewritten since your last pass, so a close-out cannot approve it")
+
+    if verdict == "approve":
+        # The approval lands only after every reply and resolve it depends on has.
+        replied, resolved, failed = _thread_work(github, replies, resolve_ids, mine)
+        if failed:
+            raise ReviewPostError(f"approval not posted: {', '.join(failed)}")
         if github.pull(owner, repo, number)["head"]["sha"] != head_sha:
             raise ReviewPostError("the PR head moved during posting; review the current head")
-
-    result = github.submit(owner, repo, number, review)
-    resolved, failed = 0, []
-    for thread_id in resolve_ids:
-        if mine[thread_id].get("isResolved"):
-            continue
-        try:
-            github.resolve(thread_id)
-            resolved += 1
-        except ReviewPostError:
-            failed.append(thread_id)
-    message = f"{review['event']} review posted: {(result or {}).get('html_url', '')} (resolved {resolved} threads)"
+        result = github.submit(owner, repo, number, review)
+    else:
+        result = github.submit(owner, repo, number, review)
+        # The review is posted; from here a failure is reported, never raised as a refusal.
+        replied, resolved, failed = _thread_work(github, replies, resolve_ids, mine)
+    message = (
+        f"{review['event']} review posted for pass {pass_no} ({mode}): "
+        f"{(result or {}).get('html_url', '')} ({replied} replies, resolved {resolved} threads)"
+    )
     if failed:
-        message += f"; could not resolve {', '.join(failed)}"
+        message += f"; failed: {', '.join(failed)}"
     return message
 
 
