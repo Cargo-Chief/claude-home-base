@@ -45,6 +45,7 @@ from cargo_chief_safety import (
     peer_review_config,
     REVIEW_ONLY_DENY_RULES,
     review_turn_env,
+    review_only_write_denies,
     preflight_room,
     read_root_permissions,
     resolve_room_policy,
@@ -1058,6 +1059,7 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             "CARGO_CHIEF_REVIEW_ONLY": "1",
             "CARGO_CHIEF_REVIEW_SELF_LOGIN": "",
             "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN": "",
+            "CARGO_CHIEF_REVIEW_PR": "",
         }, env)
         self.assertIn("AWS_PROFILE", base, "the caller's mapping is not mutated")
 
@@ -1065,7 +1067,9 @@ class ReviewOnlyRoomTest(unittest.TestCase):
         env = review_turn_env(
             {"PATH": "/usr/bin", "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN": "spoofed", "CARGO_CHIEF_REVIEW_X": "x"},
             self_login="lisa-cargochief[bot]", requester_login="kfranzenCC",
+            pr="https://github.com/Cargo-Chief/c4/pull/1",
         )
+        self.assertEqual("https://github.com/Cargo-Chief/c4/pull/1", env["CARGO_CHIEF_REVIEW_PR"])
         self.assertEqual("lisa-cargochief[bot]", env["CARGO_CHIEF_REVIEW_SELF_LOGIN"])
         self.assertEqual("kfranzenCC", env["CARGO_CHIEF_REVIEW_REQUESTER_LOGIN"])
         self.assertNotIn("CARGO_CHIEF_REVIEW_X", env)
@@ -1077,18 +1081,24 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             root = Path(temp)
             self.assertNotIn("permissions", owner_settings(root, Path("/Users/agent")))
             settings = owner_settings(root, Path("/Users/agent"), review_only=True)
-            self.assertEqual(list(REVIEW_ONLY_DENY_RULES), settings["permissions"]["deny"])
+            writes = review_only_write_denies(root)
+            self.assertEqual([*REVIEW_ONLY_DENY_RULES, *writes], settings["permissions"]["deny"])
+            resolved = root.resolve()
+            for directory in ("claude-home-base", "docs", "agent-kit", "repos", "worktrees"):
+                self.assertIn(f"Edit(/{resolved / directory}/**)", writes)
+                self.assertIn(f"Write(/{resolved / directory}/**)", writes)
+            self.assertFalse(any("/work/" in rule for rule in writes))
             (root / ".claude").mkdir()
             (root / ".claude" / "settings.json").write_text(json.dumps({
                 "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(rm -rf /)"]},
             }))
             settings = owner_settings(root, Path("/Users/agent"), review_only=True)
-            self.assertEqual(["Bash(rm -rf /)", *REVIEW_ONLY_DENY_RULES], settings["permissions"]["deny"])
+            self.assertEqual(["Bash(rm -rf /)", *REVIEW_ONLY_DENY_RULES, *writes], settings["permissions"]["deny"])
             self.assertEqual(["Bash(ls)"], settings["permissions"]["allow"])
         for needle in (
             "git push", "gh pr merge", "gh pr ready", "gh pr close", "gh pr reopen", "gh pr edit",
             "--approve", "event=APPROVE", "deploy", "aws ", "jira_service.py",
-            "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS", "CARGO_CHIEF_REVIEW_", "github-app" + ".env",
+            "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS", "CARGO_CHIEF_REVIEW_ONLY", "CARGO_CHIEF_REVIEW_PR=", "github-app" + ".env",
             ".pem",
         ):
             self.assertTrue(any(needle in rule for rule in REVIEW_ONLY_DENY_RULES), needle)
@@ -1141,6 +1151,7 @@ class ReviewOnlyRoomTest(unittest.TestCase):
             wrap + "gh api graphql --input /root/work/run/q.json",
             "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN=kfranzenCC " + wrap + "python3 review_post.py submit x",
             "export CARGO_CHIEF_REVIEW_SELF_LOGIN=someone",
+            "export CARGO_CHIEF_REVIEW_PR=https://github.com/Cargo-Chief/c4/pull/9",
         ):
             with self.subTest(blocked=blocked):
                 self.assertNotEqual([], denied(blocked))
@@ -1206,7 +1217,9 @@ class ReviewOnlyRoomTest(unittest.TestCase):
         self.assertIn("--escalate", normal_text)
         self.assertIn("/venv/bin/python /home-base/bot.py --request-review <PR URL>", normal_text)
         deny = json.loads(review[review.index("--settings") + 1])["permissions"]["deny"]
-        self.assertEqual(list(REVIEW_ONLY_DENY_RULES), deny)
+        self.assertEqual(REVIEW_ONLY_DENY_RULES, tuple(deny[:len(REVIEW_ONLY_DENY_RULES)]))
+        self.assertTrue(all(rule.split("(")[0] in ("Edit", "Write", "NotebookEdit")
+                            for rule in deny[len(REVIEW_ONLY_DENY_RULES):]))
         normal = self.command(False)
         self.assertEqual("session-1", normal[normal.index("--resume") + 1])
         self.assertNotIn("permissions", json.loads(normal[normal.index("--settings") + 1]))

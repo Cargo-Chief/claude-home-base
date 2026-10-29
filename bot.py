@@ -840,6 +840,7 @@ def _spawn_claude_process(
     thread_ts: str = "",
     channel: str = "",
     review_policy: RoomPolicy | None = None,
+    review_pr: str = "",
 ) -> tuple[subprocess.Popen, ThreadWorkspace]:
     """Spawn a long-lived Claude CLI process with stream-json I/O.
 
@@ -900,7 +901,7 @@ def _spawn_claude_process(
         peer = peer_review_config(_load_model_config())
         proc_env = review_turn_env(
             proc_env, self_login=peer.self_github_login,
-            requester_login=peer.github_logins.get(user_id, ""),
+            requester_login=peer.github_logins.get(user_id, ""), pr=review_pr,
         )
     if thread_ts:
         proc_env["CLAUDE_THREAD_TS"] = thread_ts
@@ -1400,7 +1401,8 @@ def _reader_loop(session: LiveSession) -> None:
 
 
 def _get_or_create_live_session(
-    thread_ts: str, channel: str, user_id: str = "", review_policy: RoomPolicy | None = None
+    thread_ts: str, channel: str, user_id: str = "", review_policy: RoomPolicy | None = None,
+    review_pr: str = "",
 ) -> LiveSession:
     """Get an existing live session or create a new one.
 
@@ -1446,6 +1448,7 @@ def _get_or_create_live_session(
             thread_ts=thread_ts,
             channel=channel,
             review_policy=review_policy,
+            review_pr=review_pr,
         )
         session = LiveSession(
             proc=proc,
@@ -2549,7 +2552,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
         forwarded_from=original_thread,
         review_requester=review,
     )
-    text = f"{build_review_task(review_admission.pr)}\n\n{envelope}" if review else prefix + envelope
+    text = f"{build_review_task(review_admission.pr, room_policy.root)}\n\n{envelope}" if review else prefix + envelope
 
     if review and _review_turn_running(thread_ts):
         review_admission.refuse("refused_busy", BUSY_REPLY)
@@ -2637,6 +2640,7 @@ def process_message_async(event: dict, review_admission: ReviewAdmission | None 
                 session = _get_or_create_live_session(
                     thread_ts, channel, user_id=user_id,
                     review_policy=room_policy if review else None,
+                    review_pr=review_admission.pr if review else "",
                 )
                 # The cap is charged, and the request audited as accepted, only once its turn starts.
                 if review and not review_admission.start():

@@ -1,15 +1,15 @@
 """The one route a review-only turn has for writing to GitHub.
 
-Run under the GitHub App wrapper:
-    python3 docs/scripts/ops/with_github_app_token.py -- python3 claude-home-base/review_post.py threads <pr-url>
-    python3 docs/scripts/ops/with_github_app_token.py -- python3 claude-home-base/review_post.py submit <pr-url> \
-        --review <review.json> --verdict comment|request_changes|approve [--resolve <thread-id> ...]
+The review task gives the exact command lines. Subcommands:
+    threads <pr-url>    list this agent's review threads on the PR
+    submit <pr-url> --review <review.json> --verdict comment|request_changes|approve [--resolve <id>...]
 
 The room's permission rules deny the raw reviews and GraphQL endpoints because they cannot see a
-payload file; this script reads the payload and enforces the rules in code. It submits one review
-with its inline comments, resolves only threads this agent started, and approves only when the
-review has no findings, none of its own earlier threads are open, the reviewed commit is still the
-head, and the requester is a known GitHub login who did not write the PR.
+payload file; this script reads the payload and enforces the rules in code. It posts only to the
+PR the harness admitted, submits one review with its inline comments, then resolves only threads
+this agent started. It approves only an open, non-draft PR whose head is still the reviewed
+commit, with no findings attached, none of this agent's own threads left open, a requester with a
+mapped GitHub login, and a PR this agent did not write.
 """
 
 from __future__ import annotations
@@ -17,17 +17,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from typing import Callable, Mapping
 
-SELF_LOGIN_ENV = "CARGO_CHIEF_REVIEW_SELF_LOGIN"
-REQUESTER_LOGIN_ENV = "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN"
+from cargo_chief_safety import (
+    REVIEW_PR_ENV,
+    REVIEW_REQUESTER_LOGIN_ENV,
+    REVIEW_SELF_LOGIN_ENV,
+)
+from review_requests import normalize_login, single_pr_url
+
 VERDICTS = {"comment": "COMMENT", "request_changes": "REQUEST_CHANGES", "approve": "APPROVE"}
-COMMENT_KEYS = ("path", "line", "side", "start_line", "start_side", "body")
-_PR_URL_RE = re.compile(r"https://github\.com/(Cargo-Chief)/([A-Za-z0-9_.-]+)/pull/([0-9]+)")
-_THREAD_ID_RE = re.compile(r"[A-Za-z0-9_=-]+")
+SIDES = ("LEFT", "RIGHT")
 
 THREADS_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
@@ -37,7 +39,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved path line
-          comments(first: 1) { nodes { author { login } body } }
+          comments(first: 1) { nodes { author { __typename login } body } }
         }
       }
     }
@@ -51,19 +53,28 @@ class ReviewPostError(Exception):
     pass
 
 
-def normalize_login(login: str) -> str:
-    """GitHub spells an App as app/name, name[bot] or name depending on the API; compare bare names."""
-    login = login.strip().lower()
-    if login.startswith("app/"):
-        login = login[len("app/"):]
-    return login.removesuffix("[bot]")
+def admitted_pr(pr_url: str, env: Mapping[str, str]) -> tuple[str, str, int]:
+    """Owner, repo and number of the PR, which must be the one the harness admitted for this turn."""
+    admitted = env.get(REVIEW_PR_ENV, "")
+    if not admitted:
+        raise ReviewPostError(f"{REVIEW_PR_ENV} is not set; run this from a review turn")
+    canonical = single_pr_url(pr_url.strip())
+    if canonical is None or canonical != admitted:
+        raise ReviewPostError(f"this turn may post only to {admitted}")
+    _, _, _, owner, repo, _, number = canonical.split("/")
+    return owner, repo, int(number)
 
 
-def parse_pr_url(url: str) -> tuple[str, str, int]:
-    match = _PR_URL_RE.fullmatch(url.strip())
-    if not match:
-        raise ReviewPostError("the PR must be a https://github.com/Cargo-Chief/<repo>/pull/<n> URL")
-    return match.group(1), match.group(2), int(match.group(3))
+def self_login(env: Mapping[str, str]) -> str:
+    login = env.get(REVIEW_SELF_LOGIN_ENV, "")
+    if not login:
+        raise ReviewPostError(f"{REVIEW_SELF_LOGIN_ENV} is not set; run this from a review turn")
+    return login
+
+
+def is_this_app(author: Mapping, login: str) -> bool:
+    """A GraphQL author is this agent only when it is a Bot; a user may hold the App's bare name."""
+    return author.get("__typename") == "Bot" and normalize_login(author.get("login") or "") == normalize_login(login)
 
 
 class GitHub:
@@ -76,7 +87,7 @@ class GitHub:
             capture_output=True, text=True, check=False,
         )
         if result.returncode != 0:
-            raise ReviewPostError(f"gh {args[0]} {args[1] if len(args) > 1 else ''} failed: {result.stderr.strip()[:300]}")
+            raise ReviewPostError(f"gh {' '.join(args[:2])} failed: {result.stderr.strip()[:1000]}")
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def pull(self, owner: str, repo: str, number: int) -> Mapping:
@@ -100,15 +111,38 @@ class GitHub:
         return self._gh(["api", f"repos/{owner}/{repo}/pulls/{number}/reviews", "--input", "-"], review)
 
 
-def _thread_author(thread: Mapping) -> str:
+def _first_comment(thread: Mapping) -> Mapping:
     nodes = (thread.get("comments") or {}).get("nodes") or []
-    author = (nodes[0].get("author") or {}) if nodes else {}
-    return normalize_login(author.get("login") or "")
+    return nodes[0] if nodes else {}
 
 
-def own_threads(github: GitHub, owner: str, repo: str, number: int, self_login: str) -> list[Mapping]:
-    me = normalize_login(self_login)
-    return [thread for thread in github.threads(owner, repo, number) if _thread_author(thread) == me]
+def own_threads(github: GitHub, owner: str, repo: str, number: int, login: str) -> list[Mapping]:
+    return [
+        thread for thread in github.threads(owner, repo, number)
+        if is_this_app(_first_comment(thread).get("author") or {}, login)
+    ]
+
+
+def _clean_comment(comment: object) -> dict:
+    if not isinstance(comment, Mapping):
+        raise ReviewPostError("every inline comment must be an object")
+    path, body, line = comment.get("path"), comment.get("body"), comment.get("line")
+    if not isinstance(path, str) or not path or not isinstance(body, str) or not body.strip():
+        raise ReviewPostError("every inline comment needs a path and a body")
+    if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+        raise ReviewPostError(f"comment on {path} needs an integer line in the new file")
+    cleaned = {"path": path, "line": line, "side": comment.get("side", "RIGHT"), "body": body}
+    if cleaned["side"] not in SIDES:
+        raise ReviewPostError(f"comment on {path} has side {cleaned['side']!r}; use LEFT or RIGHT")
+    start = comment.get("start_line")
+    if start is not None:
+        if isinstance(start, bool) or not isinstance(start, int) or not 1 <= start < line:
+            raise ReviewPostError(f"comment on {path} needs start_line below line")
+        cleaned["start_line"] = start
+        cleaned["start_side"] = comment.get("start_side", cleaned["side"])
+        if cleaned["start_side"] not in SIDES:
+            raise ReviewPostError(f"comment on {path} has an invalid start_side")
+    return cleaned
 
 
 def build_review(payload: Mapping, verdict: str, head_sha: str) -> dict:
@@ -119,13 +153,9 @@ def build_review(payload: Mapping, verdict: str, head_sha: str) -> dict:
     comments = payload.get("comments") or []
     if not isinstance(body, str) or not isinstance(comments, list):
         raise ReviewPostError("review.json needs a string body and a list of comments")
-    cleaned = []
-    for comment in comments:
-        if not isinstance(comment, Mapping) or not comment.get("path") or not comment.get("body"):
-            raise ReviewPostError("every inline comment needs a path and a body")
-        cleaned.append({key: comment[key] for key in COMMENT_KEYS if key in comment})
-    if verdict == "request_changes" and not body.strip():
-        raise ReviewPostError("requesting changes needs a review body saying what to change")
+    cleaned = [_clean_comment(comment) for comment in comments]
+    if verdict != "approve" and not body.strip():
+        raise ReviewPostError("a comment or change request needs a review body")
     if verdict == "approve" and cleaned:
         raise ReviewPostError("an approval cannot carry findings; request changes or comment instead")
     review = {"commit_id": head_sha, "event": VERDICTS[verdict], "body": body}
@@ -134,15 +164,14 @@ def build_review(payload: Mapping, verdict: str, head_sha: str) -> dict:
     return review
 
 
-def approval_refusal(
-    *, pr_author: str, self_login: str, requester_login: str, open_own_threads: int,
-) -> str | None:
+def approval_refusal(*, pull: Mapping, login: str, requester_login: str, open_own_threads: int) -> str | None:
     """Why this review may not approve, or None."""
+    if pull.get("state") != "open" or pull.get("draft"):
+        return "only an open, ready-for-review PR can be approved"
     if not requester_login:
         return "the requester has no GitHub login in peer_review.github_logins, so this review cannot approve"
-    if normalize_login(pr_author) == normalize_login(requester_login):
-        return "the requester wrote this PR, so this review cannot approve it"
-    if normalize_login(pr_author) == normalize_login(self_login):
+    author = pull.get("user") or {}
+    if author.get("type") == "Bot" and normalize_login(author.get("login") or "") == normalize_login(login):
         return "this agent wrote this PR, so it cannot approve it"
     if open_own_threads:
         return f"{open_own_threads} of this agent's earlier threads are still open; resolve the fixed ones first"
@@ -153,42 +182,55 @@ def submit(
     github: GitHub, pr_url: str, payload: Mapping, verdict: str, resolve_ids: list[str],
     env: Mapping[str, str],
 ) -> str:
-    self_login = env.get(SELF_LOGIN_ENV, "")
-    if not self_login:
-        raise ReviewPostError(f"{SELF_LOGIN_ENV} is not set; run this from a review turn")
-    owner, repo, number = parse_pr_url(pr_url)
+    login = self_login(env)
+    owner, repo, number = admitted_pr(pr_url, env)
     pull = github.pull(owner, repo, number)
+    if pull.get("state") != "open":
+        raise ReviewPostError("the PR is no longer open")
     head_sha = pull["head"]["sha"]
     review = build_review(payload, verdict, head_sha)
+    resolve_ids = list(dict.fromkeys(resolve_ids))
 
-    mine = {thread["id"]: thread for thread in own_threads(github, owner, repo, number, self_login)}
-    for thread_id in resolve_ids:
-        if not _THREAD_ID_RE.fullmatch(thread_id) or thread_id not in mine:
-            raise ReviewPostError(f"thread {thread_id} is not one this agent started on this PR")
+    mine: dict[str, Mapping] = {}
+    if resolve_ids or verdict == "approve":
+        mine = {thread["id"]: thread for thread in own_threads(github, owner, repo, number, login)}
+    unknown = [thread_id for thread_id in resolve_ids if thread_id not in mine]
+    if unknown:
+        raise ReviewPostError(f"not threads this agent started on this PR: {', '.join(unknown)}")
     if verdict == "approve":
         still_open = sum(1 for tid, t in mine.items() if not t.get("isResolved") and tid not in resolve_ids)
         refusal = approval_refusal(
-            pr_author=pull["user"]["login"], self_login=self_login,
-            requester_login=env.get(REQUESTER_LOGIN_ENV, ""), open_own_threads=still_open,
+            pull=pull, login=login, requester_login=env.get(REVIEW_REQUESTER_LOGIN_ENV, ""),
+            open_own_threads=still_open,
         )
         if refusal:
             raise ReviewPostError(refusal)
+        # The author may push while threads are read; approve only what was reviewed.
+        if github.pull(owner, repo, number)["head"]["sha"] != head_sha:
+            raise ReviewPostError("the PR head moved during posting; review the current head")
 
-    for thread_id in resolve_ids:
-        if not mine[thread_id].get("isResolved"):
-            github.resolve(thread_id)
     result = github.submit(owner, repo, number, review)
-    return f"{review['event']} review posted: {result.get('html_url', '')} (resolved {len(resolve_ids)} threads)"
+    resolved, failed = 0, []
+    for thread_id in resolve_ids:
+        if mine[thread_id].get("isResolved"):
+            continue
+        try:
+            github.resolve(thread_id)
+            resolved += 1
+        except ReviewPostError:
+            failed.append(thread_id)
+    message = f"{review['event']} review posted: {(result or {}).get('html_url', '')} (resolved {resolved} threads)"
+    if failed:
+        message += f"; could not resolve {', '.join(failed)}"
+    return message
 
 
 def list_threads(github: GitHub, pr_url: str, env: Mapping[str, str]) -> str:
-    self_login = env.get(SELF_LOGIN_ENV, "")
-    if not self_login:
-        raise ReviewPostError(f"{SELF_LOGIN_ENV} is not set; run this from a review turn")
-    owner, repo, number = parse_pr_url(pr_url)
+    login = self_login(env)
+    owner, repo, number = admitted_pr(pr_url, env)
     rows = []
-    for thread in own_threads(github, owner, repo, number, self_login):
-        first = thread["comments"]["nodes"][0]["body"].splitlines()[0][:100] if thread["comments"]["nodes"] else ""
+    for thread in own_threads(github, owner, repo, number, login):
+        first = ((_first_comment(thread).get("body") or "").strip().splitlines() or [""])[0][:100]
         state = "resolved" if thread.get("isResolved") else "open"
         rows.append(json.dumps({"id": thread["id"], "state": state, "path": thread.get("path"),
                                 "line": thread.get("line"), "first_line": first}))
@@ -204,7 +246,7 @@ def main(argv: list[str] | None = None, github: GitHub | None = None, env: Mappi
     post.add_argument("pr_url")
     post.add_argument("--review", required=True, help="review.json: commit_id, body, comments")
     post.add_argument("--verdict", required=True, choices=sorted(VERDICTS))
-    post.add_argument("--resolve", nargs="*", default=[], help="IDs of this agent's threads now fixed")
+    post.add_argument("--resolve", nargs="+", action="extend", default=[], help="IDs of this agent's threads now fixed")
     args = parser.parse_args(argv)
     github = github or GitHub()
     env = os.environ if env is None else env
@@ -214,8 +256,10 @@ def main(argv: list[str] | None = None, github: GitHub | None = None, env: Mappi
         else:
             with open(args.review, encoding="utf-8") as handle:
                 payload = json.load(handle)
+            if not isinstance(payload, Mapping):
+                raise ReviewPostError("review.json must be an object")
             print(submit(github, args.pr_url, payload, args.verdict, args.resolve, env))
-    except (ReviewPostError, OSError, ValueError, KeyError, TypeError) as exc:
+    except (ReviewPostError, OSError, ValueError, KeyError, TypeError, IndexError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     return 0

@@ -183,6 +183,7 @@ class SpawnTest(unittest.TestCase):
         ):
             self.assertNotIn(key, child, key)
         self.assertEqual("1", child["CARGO_CHIEF_REVIEW_ONLY"])
+        self.assertEqual("", child["CARGO_CHIEF_REVIEW_PR"])
         self.assertIn(TOKEN_PERMISSIONS_ENV, child)
         self.assertEqual("keep", child["CLAUDE_CODE_OAUTH_TOKEN"])
         self.assertNotIn("bundle", str(kwargs["cwd"]))
@@ -248,12 +249,14 @@ class ProcessReviewTest(unittest.TestCase):
         self.closed = []
         self.created = []
         self.unauthorized = []
+        self.created_prs = []
         self.caps = ReviewCapStore(self.room.root / "caps.json")
         self.resolved = self.room.policy
         self.session = FakeSession()
 
-        def create(thread_ts, channel, user_id="", review_policy=None):
+        def create(thread_ts, channel, user_id="", review_policy=None, review_pr=""):
             self.created.append(review_policy)
+            self.created_prs.append(review_pr)
             return self.session
 
         self.ns = load(
@@ -286,7 +289,8 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual([self.room.policy], self.created)
         self.assertEqual(1, len(self.sent))
         task, envelope = self.sent[0].split("\n\n", 1)
-        self.assertEqual(build_review_task(PR), task)
+        self.assertEqual(build_review_task(PR, self.room.policy.root), task)
+        self.assertEqual([PR], self.created_prs)
         payload = json.loads(envelope.splitlines()[1])
         self.assertEqual("review_requester", payload["current_sender"]["authority"])
         self.assertEqual("review requester", payload["current_sender"]["display_name"])
