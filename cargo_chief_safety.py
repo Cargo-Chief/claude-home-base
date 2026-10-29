@@ -7,7 +7,7 @@ Claude process.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -218,6 +218,8 @@ class PeerReviewConfig:
     self_github_login: str
     peer_bot_user_ids: frozenset[str]
     max_reviews_per_pr: int = DEFAULT_MAX_REVIEWS_PER_PR
+    # Slack user ID -> GitHub login; a review may approve only for a requester listed here.
+    github_logins: Mapping[str, str] = field(default_factory=dict)
 
 
 def peer_review_config(config: object) -> PeerReviewConfig:
@@ -237,8 +239,16 @@ def peer_review_config(config: object) -> PeerReviewConfig:
     low, high = MAX_REVIEWS_PER_PR_BOUNDS
     if isinstance(cap, bool) or not isinstance(cap, int) or not low <= cap <= high:
         raise SafetyError(f"peer_review.max_reviews_per_pr must be an integer from {low} to {high}")
+    logins = raw.get("github_logins", {})
+    if not isinstance(logins, Mapping) or not all(
+        isinstance(user, str) and _SLACK_USER_RE.fullmatch(user)
+        and isinstance(github, str) and _GITHUB_LOGIN_RE.fullmatch(github)
+        for user, github in logins.items()
+    ):
+        raise SafetyError("peer_review.github_logins must map Slack user IDs to GitHub logins")
     return PeerReviewConfig(
         self_github_login=login, peer_bot_user_ids=frozenset(peers), max_reviews_per_pr=cap,
+        github_logins=dict(logins),
     )
 
 
@@ -1044,6 +1054,8 @@ def claude_owner_env(base: Mapping[str, str]) -> dict[str, str]:
 
 TOKEN_PERMISSIONS_ENV = "CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS"
 REVIEW_ONLY_ENV = "CARGO_CHIEF_REVIEW_ONLY"
+REVIEW_SELF_LOGIN_ENV = "CARGO_CHIEF_REVIEW_SELF_LOGIN"
+REVIEW_REQUESTER_LOGIN_ENV = "CARGO_CHIEF_REVIEW_REQUESTER_LOGIN"
 REVIEW_TOKEN_PERMISSIONS = {"contents": "read", "pull_requests": "write"}
 REVIEW_STRIPPED_ENV_KEYS = ("CC_AWS_PROFILE",)
 REVIEW_ONLY_DENY_RULES = (
@@ -1060,7 +1072,7 @@ REVIEW_ONLY_DENY_RULES = (
     "Bash(* aws *)",
     "Bash(*jira_service.py*)",
     "Bash(*CARGO_CHIEF_GITHUB_TOKEN_PERMISSIONS*)",
-    "Bash(*CARGO_CHIEF_REVIEW_ONLY*)",
+    "Bash(*CARGO_CHIEF_REVIEW_*)",
     "Bash(*github-app.env*)",
     "Bash(*.pem*)",
     "Bash(*env -i*)",
@@ -1093,11 +1105,22 @@ def _review_strips(key: str) -> bool:
     return key.startswith("SLACK_") and any(part in key for part in ("TOKEN", "SECRET", "KEY"))
 
 
-def review_turn_env(base: Mapping[str, str]) -> dict[str, str]:
-    """A review-only environment: a downscoped GitHub token request, no AWS identity, no Slack secrets."""
-    result = {key: value for key, value in base.items() if not _review_strips(key)}
+def review_turn_env(
+    base: Mapping[str, str], *, self_login: str = "", requester_login: str = "",
+) -> dict[str, str]:
+    """A review-only environment: a downscoped GitHub token request, no AWS identity, no Slack secrets.
+
+    The logins are what review_post.py checks an approval against; an empty requester login means
+    the review may not approve.
+    """
+    result = {
+        key: value for key, value in base.items()
+        if not _review_strips(key) and not key.startswith("CARGO_CHIEF_REVIEW_")
+    }
     result[TOKEN_PERMISSIONS_ENV] = json.dumps(REVIEW_TOKEN_PERMISSIONS, separators=(",", ":"))
     result[REVIEW_ONLY_ENV] = "1"
+    result[REVIEW_SELF_LOGIN_ENV] = self_login
+    result[REVIEW_REQUESTER_LOGIN_ENV] = requester_login
     return result
 
 

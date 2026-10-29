@@ -63,6 +63,7 @@ from cargo_chief_safety import (
     forward_refusal,
     github_wrapper_downscopes,
     is_review_only_room,
+    peer_review_config,
     preflight_room,
     RoomPolicy,
     resolve_room_policy,
@@ -896,7 +897,11 @@ def _spawn_claude_process(
 
     proc_env = claude_owner_env(os.environ)
     if policy.review_only:
-        proc_env = review_turn_env(proc_env)
+        peer = peer_review_config(_load_model_config())
+        proc_env = review_turn_env(
+            proc_env, self_login=peer.self_github_login,
+            requester_login=peer.github_logins.get(user_id, ""),
+        )
     if thread_ts:
         proc_env["CLAUDE_THREAD_TS"] = thread_ts
     if channel:
