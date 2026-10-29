@@ -46,5 +46,15 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   (`session_lifecycle.BackgroundAgents`); every other `result` is a pause. See README
 - A review turn writes to GitHub only through `review_post.py` (verdict, inline comments, resolving
   its own threads); approvals need the requester in `peer_review.github_logins`. See README
+- A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
+  and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
+  and cannot hand off again. The coupled pieces are:
+  - the refusal rules (`handoff_refusal`);
+  - the `_handoff_stops` mark set by `stop`;
+  - `turn_senders`;
+  - the Codex runner's discard on a stopped, failed or withheld turn;
+  - the `handoff_from` bypasses in `process_message_async`;
+  - the prompt text in `cargo_chief_safety.handoff_prompt`, which names the `handoff_from_thread`
+    envelope field.
 
-Keep this CLAUDE.md up-to-date with the latest changes / decisions made in the project.
+  Change them together.

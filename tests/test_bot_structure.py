@@ -220,7 +220,7 @@ class BotTurnStructureTest(unittest.TestCase):
     def test_review_turns_never_touch_reply_routes(self):
         process = ast.unparse(self._function("process_message_async"))
         self.assertIn("elif not authority.allows(user_id):", process)
-        self.assertLess(process.index("if not review:"), process.index("_reply_routes.claim("))
+        self.assertLess(process.index("if not review and (not handoff_from):"), process.index("_reply_routes.claim("))
         self.assertNotIn("_reply_routes.add", process)
         self.assertLess(process.index("raise _ReviewBusy()"), process.index("_send_to_claude(session, text)"))
 

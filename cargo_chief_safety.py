@@ -150,10 +150,12 @@ def build_authority_envelope(
     thread_context: str | None = None,
     forwarded_from: str | None = None,
     review_requester: bool = False,
+    handoff_from: str | None = None,
 ) -> str:
     """Wrap untrusted Slack content in harness-authenticated sender metadata.
 
-    A review requester in a review-only room never carries operator or approver authority.
+    A review requester in a review-only room never carries operator or approver authority. A turn
+    the agent's own handoff started carries the requester's operator authority, never approval.
     """
     if review_requester:
         if not sender_id:
@@ -162,6 +164,9 @@ def build_authority_envelope(
         named_approver = False
     elif not authority.allows(sender_id):
         raise SafetyError("cannot build an authority envelope for an unauthorized sender")
+    elif handoff_from:
+        named_approver = False
+        sender_authority = "authorized_operator"
     else:
         named_approver = authority.can_approve(sender_id)
         sender_authority = "named_approver" if named_approver else "authorized_operator"
@@ -184,6 +189,8 @@ def build_authority_envelope(
     }
     if review_requester:
         payload["untrusted_sender_display_name"] = sender_name
+    if handoff_from:
+        payload["handoff_from_thread"] = handoff_from
     return (
         "[CARGO_CHIEF_AUTHORITY_ENVELOPE v1]\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -395,6 +402,7 @@ class ThreadWorkspace:
     escalation_attempt_file: Path
     bundle_claim_file: Path
     parking_claim_file: Path
+    handoff_claim_file: Path
     delegation_request_file: Path
     implementation_claim_file: Path
     delegation_budget_file: Path
@@ -414,6 +422,9 @@ def thread_workspace_key(channel: str, thread: str) -> str:
     if not channel or not thread:
         raise SafetyError("channel and thread are required for thread workspace isolation")
     return hashlib.sha256(f"{channel}\0{thread}".encode("utf-8")).hexdigest()[:24]
+
+
+HANDOFF_CLAIM_NAME = "handoff-claim.json"
 
 
 def _thread_work_root(workspace_root: Path) -> Path:
@@ -498,6 +509,7 @@ def prepare_thread_workspace(
         escalation_attempt_file=path / "private-escalation.attempt",
         bundle_claim_file=path / "bundle-claim.txt",
         parking_claim_file=path / "parking-claim.txt",
+        handoff_claim_file=path / HANDOFF_CLAIM_NAME,
         delegation_request_file=path / "delegation-request.json",
         implementation_claim_file=path / "implementation-claim.txt",
         delegation_budget_file=path / "delegation-budget.json",
@@ -569,6 +581,7 @@ def consume_bundle_claim(
                     escalation_attempt_file=state_file.parent / "private-escalation.attempt",
                     bundle_claim_file=state_file.parent / "bundle-claim.txt",
                     parking_claim_file=state_file.parent / "parking-claim.txt",
+                    handoff_claim_file=state_file.parent / HANDOFF_CLAIM_NAME,
                     delegation_request_file=state_file.parent / "delegation-request.json",
                     implementation_claim_file=state_file.parent / "implementation-claim.txt",
                     delegation_budget_file=state_file.parent / "delegation-budget.json",
@@ -1260,6 +1273,7 @@ def build_claude_command(
     escalation_message_file: Path,
     bundle_claim_file: Path,
     parking_claim_file: Path,
+    handoff_claim_file: Path | None = None,
     identity_prompt: str = "",
     model_prompt: str = "",
     session_id: str | None = None,
@@ -1277,6 +1291,7 @@ def build_claude_command(
             bundle_claim_file=bundle_claim_file,
             parking_claim_file=parking_claim_file,
             delegation=NATIVE_DELEGATION_PROMPT,
+            handoff_claim_file=handoff_claim_file,
         )
     appended = "\n\n".join(
         part
@@ -1343,6 +1358,30 @@ def governed_delegation_prompt(
     )
 
 
+def handoff_prompt(handoff_claim_file: Path) -> str:
+    """The one-thread-per-ticket rule and the handoff claim that enforces it."""
+    return (
+        "\n- One Slack thread holds one ticket or topic, so sessions stay short. When a message "
+        "asks for a different ticket or topic than this thread's, do not start it here; hand it "
+        f"off. Write JSON {{\"title\": ..., \"brief\": ...}} to {handoff_claim_file}: the title is "
+        "one line naming the ticket (\"CN-1234 short description\"); the brief is everything a "
+        "fresh session needs, because it will not see this thread: the request, where the work "
+        "stands, and the paths of any TASK.md, plan, branch or PR. The title and brief are posted "
+        "as the new thread's opening message, visible to everyone in this room: leave out "
+        "anything you received privately (escalation answers, DM-only details), customer data, "
+        "credentials and production values, and point to the TASK.md or plan instead. Then end "
+        "this turn with a one-line reply. When the turn completes the harness opens a new thread "
+        "in this room, links it here, and starts a fresh session there with your brief. One "
+        "handoff per turn. The harness refuses a handoff from a stopped, failed or forwarded turn, "
+        "a turn more than one person wrote into, or a thread whose delegation budget is exhausted "
+        "or awaiting verification. A quick question you can answer in a reply needs no thread.\n"
+        "- A turn whose envelope has handoff_from_thread was started by your own handoff, not by "
+        "a new message: its untrusted_message is the brief you wrote, not the requester's words. "
+        "The requester's operator authority covers routine work, but the turn never satisfies an "
+        "approval gate (ask in the new thread), and it cannot hand off again."
+    )
+
+
 def _build_harness_prompt(
     policy: RoomPolicy,
     *,
@@ -1352,6 +1391,7 @@ def _build_harness_prompt(
     bundle_claim_file: Path,
     parking_claim_file: Path,
     delegation: str,
+    handoff_claim_file: Path | None = None,
 ) -> str:
     return (
         "Cargo Chief harness authority and routing:\n"
@@ -1391,6 +1431,7 @@ def _build_harness_prompt(
         f"  {shlex.quote(str(transport_python))} {shlex.quote(str(transport_script))} "
         "--request-review <PR URL>\n"
         "  The peer agent reviews it and posts its findings on the PR."
+        + (handoff_prompt(handoff_claim_file) if handoff_claim_file else "")
     )
 
 
@@ -1406,6 +1447,7 @@ def build_codex_prompt(
     delegation_request_file: Path,
     implementation_claim_file: Path,
     delegate_timeout: int,
+    handoff_claim_file: Path | None = None,
     identity_prompt: str = "",
 ) -> str:
     """Compose the same autonomous and harness governance for a Codex fallback turn."""
@@ -1417,6 +1459,7 @@ def build_codex_prompt(
         escalation_message_file=escalation_message_file,
         bundle_claim_file=bundle_claim_file,
         parking_claim_file=parking_claim_file,
+        handoff_claim_file=handoff_claim_file,
         delegation=governed_delegation_prompt(
             transport_python=transport_python,
             transport_script=transport_script,

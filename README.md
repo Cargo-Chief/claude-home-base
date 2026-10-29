@@ -62,6 +62,30 @@ takes only the URL, checks that the PR is open and authored by this agent's own 
 `<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
 A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (`max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
 
+One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
+writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. The
+harness takes the claim before the turn releases its lock, so the next turn in the thread can
+neither discard nor supply it. Once the turn has completed, the harness:
+1. opens a new top-level thread in the same room, with the title and brief as Slack-escaped text;
+2. starts a fresh session there with the brief as its first turn;
+3. links the new thread from the source thread.
+
+The new turn runs as the person whose message started the source turn, re-checked against the
+allowlist. Its envelope carries `handoff_from_thread` and never `named_approver`, so it can do
+routine work, but any approval gate needs a person's message in the new thread. A person's reply
+that reaches the new thread first takes over, and the brief is not steered into that turn.
+
+The harness refuses a claim from:
+- a review turn or a handoff turn;
+- a stopped, timed-out or failed turn;
+- a Codex turn that escalated or whose delegate result was withheld;
+- a forwarded reply;
+- a turn more than one person wrote into;
+- a thread whose delegation budget is exhausted or awaiting verification.
+
+The claim is read through one no-follow descriptor, capped at 16 KiB. Audit lines:
+`THREAD_HANDOFF` (opened), `HANDOFF_REFUSED`, and `HANDOFF_FAILED` (Slack refused the new thread).
+
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
 agent process. The one exception is a mention in a review-only room, which any member or listed
