@@ -12,12 +12,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from session_lifecycle import PendingTools, owner_stream_event_is_activity
+from session_lifecycle import BackgroundAgents, PendingTools, owner_stream_event_is_activity
 
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "_reader_loop", "_deliver_text", "_stop_unread_process", "_post_context_notice", "_track_context",
-    "_owner_turn_busy",
+    "_owner_turn_busy", "_finish_turn", "_take_review_marker", "_pause_review_turn", "_stop_review",
 )
 
 
@@ -59,7 +59,7 @@ def load_functions(**overrides):
     constants = [
         node for node in tree.body
         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id.startswith("CTX_")
+        and (node.targets[0].id.startswith("CTX_") or node.targets[0].id == "_REVIEW_DONE_LINE")
     ]
     namespace = {
         "LiveSession": object,
@@ -68,6 +68,8 @@ def load_functions(**overrides):
         "SOURCE_DIR": Path("."),
         "SafetyError": SafetyError,
         "json": json,
+        "re": re,
+        "threading": threading,
         "time": time,
         "sys": sys,
         "subprocess": subprocess,
@@ -91,6 +93,7 @@ def load_functions(**overrides):
         "slack_client": None,
         "stop_process_tree": _fake_stop_process_tree,
         "governed_delegate_active": lambda pid_file: False,
+        "REVIEW_DONE_MARKER": "REVIEW COMPLETE",
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=constants + wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -116,7 +119,19 @@ class FakeReporter:
         self.notes.append(note)
 
     def finish(self, **kwargs):
+        if self.active and kwargs.get("post_reply", True):
+            self.posted_tail = getattr(self, "posted_tail", []) + getattr(self, "tail", [])
+        self.tail = []
         self.finished.append(kwargs)
+
+    def text(self, text):
+        self.texts = getattr(self, "texts", []) + [text]
+        self.tail = getattr(self, "tail", []) + [text]
+
+    def tool_used(self):
+        """Like TurnReporter.tool_used: text before a tool call is narration, not the reply."""
+        self.tools = getattr(self, "tools", 0) + 1
+        self.tail = []
 
     def delivered(self):
         self.answered = True
@@ -155,6 +170,10 @@ class FakeSession:
         self.reporter = reporter
         self.delegation_tracker = FakeTracker()
         self.pending_tools = PendingTools()
+        self.review = False
+        self.review_done = False
+        self.background_agents = BackgroundAgents()
+        self.stop_done = None
         self.escalation_message_file = None
         self.escalation_receipt_file = None
         self.private_escalation_pending = False
@@ -177,6 +196,95 @@ def assistant_text(*texts):
 
 def result(sid="s-2"):
     return {"type": "result", "session_id": sid}
+
+
+def agent_started(task_id):
+    return {"type": "system", "subtype": "task_started", "task_id": task_id, "task_type": "local_agent"}
+
+
+def task_done(task_id):
+    return {"type": "system", "subtype": "task_notification", "task_id": task_id, "status": "completed"}
+
+
+class ReviewReaderTest(unittest.TestCase):
+    def review_session(self, events, posted=None):
+        session = FakeSession(events, on_text=(posted.append if posted is not None else lambda text: None),
+                              reporter=FakeReporter(active=True))
+        session.review = True
+        return session
+
+    def finished_by_result(self, session):
+        """reporter.finish calls other than the reader's own process-exit one."""
+        return [call for call in session.reporter.finished if call != {"state": "stopped"}]
+
+    def test_a_result_without_the_completion_line_pauses_and_folds_narration(self):
+        session = self.review_session([assistant_text("launched finders, waiting"), result()])
+        load_functions()["_reader_loop"](session)
+        self.assertEqual([], self.finished_by_result(session))
+        self.assertEqual(["launched finders, waiting"], session.reporter.texts)
+        self.assertEqual(1, session.reporter.tools, "narration is folded out of the reply tail")
+
+    def test_the_completion_line_ends_the_review_and_is_not_posted(self):
+        posted = []
+        session = self.review_session([
+            agent_started("a"), result(), task_done("a"),
+            assistant_text("Posted 3 findings on the PR.\nREVIEW COMPLETE"), result("s-5"),
+        ], posted)
+        load_functions()["_reader_loop"](session)
+        self.assertTrue(session.review_done)
+        self.assertEqual(["Posted 3 findings on the PR."], posted)
+        self.assertEqual([{"post_reply": True}], self.finished_by_result(session))
+
+    def test_a_summary_written_while_a_finder_runs_is_posted_not_folded(self):
+        posted = []
+        session = self.review_session([
+            agent_started("a"), assistant_text("Posted 3 findings.\nREVIEW COMPLETE"), result(),
+        ], posted)
+        load_functions()["_reader_loop"](session)
+        self.assertEqual(["Posted 3 findings."], posted)
+        self.assertEqual([], self.finished_by_result(session), "still paused while the finder runs")
+
+    def test_common_spellings_of_the_completion_line_count(self):
+        for line, left in [("REVIEW COMPLETE.", ""), ("_review complete_", ""), ("> **REVIEW COMPLETE**", ""),
+                           ("Findings posted. REVIEW COMPLETE", "Findings posted")]:
+            with self.subTest(line=line):
+                posted = []
+                session = self.review_session([assistant_text(line), result()], posted)
+                load_functions()["_reader_loop"](session)
+                self.assertTrue(session.review_done)
+                self.assertEqual([left] if left else [], posted)
+
+    def test_a_mention_of_the_words_mid_sentence_does_not_count(self):
+        session = self.review_session([assistant_text("I will write REVIEW COMPLETE when done, not yet."), result()])
+        load_functions()["_reader_loop"](session)
+        self.assertFalse(session.review_done)
+
+    def test_a_limit_notice_held_at_a_pause_still_reaches_the_turn(self):
+        posted = []
+        session = self.review_session([assistant_text("LIMIT"), result()], posted)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertEqual(["LIMIT"], posted)
+
+    def test_a_review_never_consumes_bundle_or_parking_claims(self):
+        consumed = []
+        session = self.review_session([assistant_text("REVIEW COMPLETE"), result()])
+        session.workspace = type("W", (), {
+            "bundle_claim_file": Path(__file__), "parking_claim_file": Path(__file__), "root": Path("."),
+        })()
+        load_functions(
+            consume_bundle_claim=lambda *args, **kwargs: consumed.append("bundle"),
+            consume_parking_claim=lambda *args, **kwargs: consumed.append("parking"),
+        )["_reader_loop"](session)
+        self.assertEqual([], consumed)
+
+    def test_stopping_a_review_kills_it_and_releases_the_request(self):
+        session = self.review_session([])
+        session.proc.alive = True
+        outcome = load_functions()["_stop_review"](session)
+        self.assertEqual("review stopped", outcome)
+        self.assertEqual(["stop_tree"], session.proc.calls)
+        self.assertTrue(session.stop_done.is_set())
+        self.assertTrue(session._turn_done.is_set())
 
 
 class HarnessTest(unittest.TestCase):
@@ -278,6 +386,16 @@ class OwnerTurnBusyTest(unittest.TestCase):
         session.pending_tools.observe({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}})
         self.assertTrue(busy(session))
         session.pending_tools.observe({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}})
+        self.assertFalse(busy(session))
+
+    def test_a_running_background_agent_keeps_only_a_review_busy(self):
+        busy = load_functions()["_owner_turn_busy"]
+        session = FakeSession([])
+        session.background_agents.observe(agent_started("a"))
+        self.assertFalse(busy(session))
+        session.review = True
+        self.assertTrue(busy(session))
+        session.background_agents.observe(task_done("a"))
         self.assertFalse(busy(session))
 
     def test_a_live_governed_delegate_keeps_the_turn_busy(self):

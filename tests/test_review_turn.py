@@ -92,7 +92,7 @@ def load(**overrides):
         "github_wrapper_downscopes": github_wrapper_downscopes,
         "BUSY_REPLY": BUSY_REPLY, "CONFIG_REPLY": CONFIG_REPLY, "ERROR_REPLY": ERROR_REPLY,
         "WRAPPER_REPLY": WRAPPER_REPLY, "PROVIDER_REPLY": "paused",
-        "BOT_USER_ID": "ULISA", "MAX_TURN_RUNTIME": 60, "CLAUDE_TIMEOUT": 60,
+        "BOT_USER_ID": "ULISA", "MAX_TURN_RUNTIME": 60, "CLAUDE_TIMEOUT": 60, "REVIEW_MAX_RUNTIME": 45,
         "STOP_WAIT_SECONDS": 1, "MAX_LIVE_SESSIONS": 2,
         "logger": logging.getLogger("test-review-turn"),
         "audit_logger": logging.getLogger("test-review-turn-audit"),
@@ -233,6 +233,7 @@ class FakeSession:
         self.session_id = None
         self.pending_reactions = []
         self.pending_tools = mock.MagicMock()
+        self.review_done = False
         self._turn_done = threading.Event()
         self.thread_ts = "1.1"
 
@@ -291,6 +292,39 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual("review requester", payload["current_sender"]["display_name"])
         self.assertEqual("Display Name", payload["untrusted_sender_display_name"])
         self.assertEqual(["accepted"], self.outcomes())
+        self.assertEqual([self.session], self.closed)
+
+    def test_a_review_turn_is_bounded_by_the_review_limit(self):
+        limits = []
+
+        def wait(*args, max_duration, **kwargs):
+            limits.append(max_duration)
+            return True
+
+        self.ns["wait_for_turn_completion"] = wait
+        self.run_turn(self.admission())
+        self.assertEqual(1, len(limits))
+        self.assertLessEqual(limits[0], 45)
+
+    def test_a_timed_out_review_asks_for_a_rerun_not_a_resume(self):
+        posted = []
+        self.ns["slack_client"].chat_postMessage.side_effect = lambda **kwargs: posted.append(kwargs["text"])
+        self.ns["stop_timed_out_session"] = lambda session, interrupt: "interrupted"
+        self.ns["wait_for_turn_completion"] = lambda *args, **kwargs: False
+        self.run_turn(self.admission())
+        self.assertEqual(1, len(posted))
+        self.assertIn("ask again to rerun it", posted[0])
+        self.assertNotIn("resume", posted[0])
+        self.assertEqual([self.session], self.closed)
+
+    def test_a_finished_review_that_times_out_posts_no_timeout_note(self):
+        posted = []
+        self.session.review_done = True
+        self.ns["slack_client"].chat_postMessage.side_effect = lambda **kwargs: posted.append(kwargs["text"])
+        self.ns["stop_timed_out_session"] = lambda session, interrupt: "review stopped"
+        self.ns["wait_for_turn_completion"] = lambda *args, **kwargs: False
+        self.run_turn(self.admission())
+        self.assertEqual([], posted)
         self.assertEqual([self.session], self.closed)
 
     def test_unauthorized_sender_is_still_refused_in_a_normal_room(self):

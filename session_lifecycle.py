@@ -139,6 +139,42 @@ class PendingTools:
             self._issued.clear()
 
 
+class BackgroundAgents:
+    """Background subagents the owner started and has not yet been notified about.
+
+    Only agent tasks count; a background shell or Monitor timer dies with the process rather than
+    holding it open. Tasks the turn awaits, and tasks owned by a subagent, finish inside a turn. An
+    agent stops counting after max_age, so a lost notification cannot hold the turn open.
+    """
+
+    MAX_AGE_SECONDS = 1800.0
+
+    def __init__(self, max_age: float = MAX_AGE_SECONDS, clock: Callable[[], float] = time.monotonic) -> None:
+        self._running: dict[str, float] = {}
+        self._max_age = max_age
+        self._clock = clock
+        self._lock = threading.Lock()
+
+    def observe(self, event: Mapping[str, Any]) -> None:
+        if event.get("type") != "system":
+            return
+        task_id = event.get("task_id")
+        if not isinstance(task_id, str):
+            return
+        with self._lock:
+            if event.get("subtype") == "task_started":
+                if (event.get("task_type") == "local_agent"
+                        and not (event.get("awaited") or event.get("owned_by_subagent") or event.get("ambient"))):
+                    self._running[task_id] = self._clock()
+            elif event.get("subtype") == "task_notification":
+                self._running.pop(task_id, None)
+
+    def running(self) -> bool:
+        now = self._clock()
+        with self._lock:
+            return any(now - started < self._max_age for started in self._running.values())
+
+
 def stop_timed_out_session(session: Any, interrupt) -> str:
     """Silence a timed-out turn before interrupting it.
 
