@@ -1054,6 +1054,19 @@ class ReviewOnlyRoomTest(unittest.TestCase):
                 permission_mode="auto", message="hi",
             )
 
+    def test_envelope_marks_a_review_notice_without_authority(self):
+        policy = AuthorityPolicy.from_env({"AUTHORIZED_USERS": "UKIRK", "CARGO_CHIEF_APPROVERS": "UKIRK"})
+        envelope = build_authority_envelope(
+            policy, sender_id="UNED", sender_name="Ned", channel_id="CWORK",
+            permission_mode="auto", message="Your peer agent's review has ended.",
+            review_notice="https://github.com/Cargo-Chief/c4/pull/1",
+        )
+        payload = json.loads(envelope.splitlines()[1])
+        current = payload["current_sender"]
+        self.assertEqual(("review_notice", False, "peer review notice"),
+                         (current["authority"], current["named_approver"], current["display_name"]))
+        self.assertEqual("https://github.com/Cargo-Chief/c4/pull/1", payload["review_notice_pr"])
+
     def test_review_env_downscopes_github_and_strips_aws(self):
         base = {
             "PATH": "/usr/bin", "AWS_PROFILE": "kirk", "AWS_DEFAULT_PROFILE": "kirk",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import fcntl
 import json
 import logging
 import os
@@ -228,6 +229,22 @@ def lookup_pr(
     return PullRequestInfo(author=author, state=state.upper(), reviews=reviews)
 
 
+def _write_json_atomically(path: Path, data: object, prefix: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=prefix, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class ReviewCapStore:
     """Accepted review turns per PR in a rolling window, persisted with atomic writes.
 
@@ -256,19 +273,7 @@ class ReviewCapStore:
         return value
 
     def _save(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".review-requests.", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(data, handle)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _write_json_atomically(self.path, data, ".review-requests.")
 
     def _pruned(self, data: dict) -> dict:
         cutoff = self.clock() - self.window
@@ -304,6 +309,78 @@ class ReviewCapStore:
                 data.pop(pr_url)
             self._save(data)
             return outcome
+
+
+NOTICE_WINDOW_SECONDS = 7 * 24 * 3600
+_SLACK_LINK_RE = re.compile(r"<(https?://[^>|]+)(?:\|[^>]*)?>")
+
+
+def review_ended_text(requester_id: str, pr: str) -> str:
+    """The reviewer's fixed hand-back to a peer bot that asked for a review."""
+    return (f"<@{requester_id}> my review turn on {pr} has ended. "
+            "Any verdict is on the PR; if there is none, the review stopped early.")
+
+
+def is_review_ended(text: str, requester_id: str, pr: str) -> bool:
+    """Exactly the fixed hand-back for this agent and PR, allowing Slack's <url|label> links."""
+    return _SLACK_LINK_RE.sub(r"\1", (text or "").strip()) == review_ended_text(requester_id, pr)
+
+
+class NoticeStoreError(RuntimeError):
+    """The notice record cannot be read; nothing is reset."""
+
+
+class ReviewNoticeStore:
+    """Review requests this agent sent, keyed by the request message, so the peer's hand-back
+    reaches the thread that asked. The CLI writes and the server reads, so access is file-locked;
+    each entry is taken once. An unreadable record raises rather than being reset."""
+
+    def __init__(self, path: Path, *, window: int = NOTICE_WINDOW_SECONDS, clock: Callable = time.time):
+        self.path = path
+        self.window = window
+        self.clock = clock
+
+    def _locked(self, update: Callable[[dict], tuple[object, bool]]) -> object:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = self._pruned(self._load())
+            result, changed = update(data)
+            if changed:
+                _write_json_atomically(self.path, data, ".review-notices.")
+            return result
+
+    def _load(self) -> dict:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise NoticeStoreError(f"review notice record is unreadable: {type(exc).__name__}") from exc
+        if not isinstance(value, dict):
+            raise NoticeStoreError("review notice record is corrupt")
+        return value
+
+    def _pruned(self, data: dict) -> dict:
+        cutoff = self.clock() - self.window
+        return {
+            key: entry for key, entry in data.items()
+            if isinstance(entry, dict) and isinstance(entry.get("at"), (int, float)) and entry["at"] > cutoff
+        }
+
+    def add(self, request_ts: str, *, pr: str, channel: str, thread: str) -> None:
+        entry = {"pr": pr, "channel": channel, "thread": thread, "at": self.clock()}
+        self._locked(lambda data: (data.__setitem__(request_ts, entry), True))
+
+    def take(self, request_ts: str, pr: str) -> dict | None:
+        """The entry for that request and PR, removed; None if there is none."""
+        def pop(data: dict) -> tuple[dict | None, bool]:
+            entry = data.get(request_ts)
+            if not entry or entry.get("pr") != pr:
+                return None, False
+            return data.pop(request_ts), True
+        return self._locked(pop)
 
 
 class ThreadClaims:
@@ -543,7 +620,7 @@ class ReviewRequestHandler:
     throttle: RequestThrottle
     recent: RecentMentions
     load_config: Callable[[], dict]
-    post: Callable[[str, str, str], None]
+    post: Callable[[str, str, str], object]
     audit: Callable[[str], None]
     is_authorized: Callable[[str], bool]
     run_control_command: Callable[[dict], bool]
@@ -554,6 +631,8 @@ class ReviewRequestHandler:
     start_turn: Callable[[ReviewAdmission], None]
     spawn: Callable[..., None]
     wrapper_ready: Callable[[Path], bool] = github_wrapper_downscopes
+    notices: "ReviewNoticeStore | None" = None
+    start_notice: Callable[[dict, dict], None] | None = None
 
     def _audit(self, event: dict, pr: str | None, outcome: str) -> None:
         self.audit(format_review_audit(
@@ -590,6 +669,10 @@ class ReviewRequestHandler:
             self._refuse(event, None, "refused_config", CONFIG_REPLY if human else None)
             return
         pr = single_pr_url(event.get("text", ""))
+        if kind == PEER_BOT and pr and is_review_ended(event.get("text", ""), self.bot_user_id, pr):
+            # Never a request, matched or not: a missed hand-back must not become an own-PR refusal.
+            self._hand_back(event, pr)
+            return
         if pr is None:
             self._refuse(event, None, "refused_no_pr", USAGE_HINT if human else None)
             return
@@ -614,6 +697,27 @@ class ReviewRequestHandler:
             self.claims.release(thread)
             self.claims.release(_pr_claim(pr))
             raise
+
+    def _hand_back(self, event: dict, pr: str) -> None:
+        """The peer's fixed hand-back in the thread of a request this agent sent: wake that thread."""
+        request_ts = event.get("thread_ts") or ""
+        entry = None
+        if request_ts and request_ts != event.get("ts") and self.notices and self.start_notice:
+            try:
+                entry = self.notices.take(request_ts, pr)
+            except Exception as exc:
+                logger.error(f"Review notice record unusable: {type(exc).__name__}")
+        self._audit(event, pr, "review_ended" if entry else "review_ended_unmatched")
+        if entry is None:
+            return
+        try:
+            self.spawn(self.start_notice, entry, event)
+        except Exception as exc:
+            logger.error(f"Could not wake {entry.get('thread')}: {type(exc).__name__}")
+            try:
+                self.notices.add(request_ts, pr=pr, channel=entry["channel"], thread=entry["thread"])
+            except Exception:
+                pass
 
     def _guard(self, event: dict, pr: str, peer: PeerReviewConfig) -> tuple[RoomPolicy, ReviewPlan] | None:
         """Every check before the turn; refuses (audit and reply) and returns None on failure."""
@@ -659,6 +763,7 @@ class ReviewRequestHandler:
     def admit(self, event: dict, pr: str, peer: PeerReviewConfig) -> None:
         """The slow part: guards, then the turn. Releases the admission slot and thread claim."""
         thread = _thread(event)
+        hand_back = False
         try:
             try:
                 guarded = self._guard(event, pr, peer)
@@ -676,9 +781,15 @@ class ReviewRequestHandler:
             finally:
                 # Every admitted request ends in exactly one audit line.
                 admission.refuse("refused_error", ERROR_REPLY)
+            hand_back = admission.started and event.get("user", "") in peer.peer_bot_user_ids
         finally:
             self.claims.release(thread)
             self.claims.release(_pr_claim(pr))
+        if hand_back:
+            try:
+                self.post(event.get("channel", ""), thread, review_ended_text(event.get("user", ""), pr))
+            except Exception as exc:
+                logger.warning(f"Could not hand the review of {pr} back: {type(exc).__name__}")
 
 
 class PeerRequestError(RuntimeError):
@@ -699,13 +810,16 @@ def request_peer_review(
     config: Mapping,
     env: Mapping[str, str],
     lookup: Callable[[str, Path], PullRequestInfo],
-    post: Callable[[str, str], None],
+    post: Callable[[str, str], object],
     audit: Callable[[str], None],
     sent: "ReviewCapStore | None" = None,
+    notices: "ReviewNoticeStore | None" = None,
 ) -> str:
     """Ask the configured peer to review this agent's own open PR in the review-only room.
 
     The caller supplies only the URL; the room and the mention come from config. Returns the room ID.
+    With `notices`, the request is recorded against the asking thread (`CLAUDE_CHANNEL_ID`,
+    `CLAUDE_THREAD_TS`) so the peer's hand-back wakes it.
     """
     pr: str | None = None
     try:
@@ -750,11 +864,25 @@ def request_peer_review(
             except CapStoreError as exc:
                 raise PeerRequestError("refused_cap_store", "the sent-request record is unreadable") from exc
         try:
-            post(room, f"<@{peer_id}> please review {pr}")
+            request_ts = post(room, f"<@{peer_id}> please review {pr}")
         except Exception as exc:
             raise PeerRequestError("refused_post", f"Slack refused the post: {type(exc).__name__}") from exc
+        # The request is posted: record the asking thread, then charge the cap. A failed charge is
+        # reported as posted-but-uncharged so a retry loop stops instead of flooding the room.
+        origin = (env.get("CLAUDE_CHANNEL_ID", ""), env.get("CLAUDE_THREAD_TS", ""))
+        if notices is not None and isinstance(request_ts, str) and request_ts and all(origin):
+            try:
+                notices.add(request_ts, pr=pr, channel=origin[0], thread=origin[1])
+            except Exception as exc:
+                logger.error(f"Review request sent but its hand-back was not recorded: {type(exc).__name__}")
         if sent is not None:
-            sent.admit(pr, daily_review_limit(peer))
+            try:
+                sent.admit(pr, daily_review_limit(peer))
+            except (CapStoreError, OSError) as exc:
+                raise PeerRequestError(
+                    "sent_uncharged",
+                    f"it was not charged against the daily cap ({type(exc).__name__}); do not request again",
+                ) from exc
     except PeerRequestError as exc:
         audit(format_sent_audit(pr=pr, outcome=exc.outcome))
         raise

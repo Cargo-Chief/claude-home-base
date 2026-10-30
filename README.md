@@ -24,7 +24,8 @@ Before the turn the harness refuses the agent's own PRs (`peer_review.self_githu
 are not open, PRs it cannot look up, a GitHub wrapper too old to downscope its token, an unreadable
 cap record, and PRs past twice `peer_review.max_reviews_per_pr` (default 3, range 1–10) started
 turns in 24 hours. At most two requests are admitted at once and each requester may make ten an hour; a
-redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line. A
+redelivered mention is handled once. Each request writes one `REVIEW_REQUEST` audit line; a peer's
+hand-back writes one with outcome `review_ended` or `review_ended_unmatched` instead. A
 review-only room without a valid `peer_review.self_github_login` is refused.
 
 Each request for the same PR is the next pass. `review_post.py` stamps every review body with a
@@ -79,6 +80,24 @@ The sending side is `bot.py --request-review <PR URL>`, which normal turns are t
 takes only the URL, checks that the PR is open and authored by this agent's own App, and posts
 `<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
 A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (twice `max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
+
+When the review ends, the asking thread is woken. The sender records the request message against
+the thread that ran it (`review-notices.json` in the state directory, file-locked, kept 7 days; an
+unreadable record raises rather than being reset). After a review turn that a peer bot requested
+and that started, the reviewer's harness posts, once its claims are released, exactly
+`<@requester> my review turn on <URL> has ended. Any verdict is on the PR; if there is none, the
+review stopped early.` in the request's thread. The requester's intake treats only that exact text
+from the peer bot as a hand-back, never as a request; a matched one is taken once (audited
+`review_ended`, else `review_ended_unmatched`). The thread is woken only while its own session is
+live in that channel, so a forged origin cannot start a turn elsewhere: home-base posts a note
+there and steers in a turn whose sender is the peer bot with `review_notice` authority (no operator
+or approver authority, no reply routes, no handoff; steered into a running turn it counts as a
+second sender, so that turn cannot hand off either). It never spawns a process, never runs on the
+Codex fallback (at the start or after a mid-turn credit limit), and never takes a stopping or
+review session: in each of those cases a configured work room (a non-review `channels` entry) gets
+only a "tell me to continue" note. A failure before the thread hears anything puts the record
+back. Each outcome writes a `REVIEW_NOTICE` audit line. If charging the sender cap fails after the
+request posts, the CLI still reports it requested, with a warning not to request again.
 
 One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
 writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. The

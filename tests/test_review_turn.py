@@ -53,7 +53,7 @@ BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "process_message_async", "_spawn_claude_process", "_get_or_create_live_session", "_clear_eyes",
 )
-CLASSES = ("_ReviewBusy",)
+CLASSES = ("_ReviewBusy", "_NoLiveSession")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
 ENV = {"AUTHORIZED_USERS": "UKIRK", "CARGO_CHIEF_APPROVERS": "UKIRK"}
 
@@ -259,7 +259,8 @@ class ProcessReviewTest(unittest.TestCase):
         self.resolved = self.room.policy
         self.session = FakeSession()
 
-        def create(thread_ts, channel, user_id="", review_policy=None, review_pr="", review_plan=None):
+        def create(thread_ts, channel, user_id="", review_policy=None, review_pr="", review_plan=None,
+                   existing_only=False):
             self.created_plans.append(review_plan)
             self.created.append(review_policy)
             self.created_prs.append(review_pr)
