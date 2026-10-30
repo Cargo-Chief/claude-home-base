@@ -8,8 +8,9 @@ import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
-from cargo_chief_safety import SafetyError
+from cargo_chief_safety import BUNDLE_NAME, SafetyError
 
 MAX_CLAIM_BYTES = 16384
 MAX_TITLE_CHARS = 120
@@ -20,6 +21,7 @@ MAX_BRIEF_CHARS = 6000
 class HandoffRequest:
     title: str
     brief: str
+    bundle: str | None = None
 
 
 def _read_claim_bytes(claim: Path) -> bytes:
@@ -45,8 +47,8 @@ def read_handoff_claim(claim: Path) -> HandoffRequest:
         data = json.loads(_read_claim_bytes(claim).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SafetyError("handoff claim must be a JSON object") from exc
-    if not isinstance(data, dict) or set(data) != {"title", "brief"}:
-        raise SafetyError('handoff claim must be exactly {"title": ..., "brief": ...}')
+    if not isinstance(data, dict) or set(data) not in ({"title", "brief"}, {"title", "brief", "bundle"}):
+        raise SafetyError('handoff claim must be {"title": ..., "brief": ...} with an optional "bundle"')
     title, brief = data["title"], data["brief"]
     if not isinstance(title, str) or not isinstance(brief, str):
         raise SafetyError("handoff title and brief must be strings")
@@ -56,7 +58,10 @@ def read_handoff_claim(claim: Path) -> HandoffRequest:
         raise SafetyError(f"handoff title must be one line of 1-{MAX_TITLE_CHARS} characters")
     if not brief or len(brief) > MAX_BRIEF_CHARS:
         raise SafetyError(f"handoff brief must be 1-{MAX_BRIEF_CHARS} characters")
-    return HandoffRequest(title=title, brief=brief)
+    bundle = data.get("bundle")
+    if bundle is not None and (not isinstance(bundle, str) or not BUNDLE_NAME.fullmatch(bundle)):
+        raise SafetyError("handoff bundle must be a CN-####-lowercase-slug worktree bundle name")
+    return HandoffRequest(title=title, brief=brief, bundle=bundle)
 
 
 def consume_handoff_claim(claim: Path) -> HandoffRequest | None:
@@ -105,6 +110,26 @@ def handoff_refusal(
         return "more than one person wrote into this turn; ask for the handoff in a new message"
     if delegation_blocked:
         return "this thread's delegation budget is exhausted or awaiting verification; a named approver must reset it first"
+    return None
+
+
+def new_thread_refusal(
+    *, send: bool, send_result: bool, channel: bool, thread: str | None, forward_to: str | None,
+    with_votes: bool = False, env: Mapping[str, str],
+) -> str | None:
+    """Why a thread session may not open a new Slack thread from the CLI, or None when it may.
+
+    A reply in an existing thread, and a DM whose reply is forwarded back to this session's own
+    thread, stay allowed.
+    """
+    if not env.get("CARGO_CHIEF_THREAD_WORK_DIR") or thread:
+        return None
+    forwarded_home = bool(forward_to) and forward_to == env.get("CLAUDE_THREAD_TS") and not with_votes
+    if channel or send_result or (send and not forwarded_home):
+        return (
+            "a thread session opens new work only through its handoff claim, which starts the new "
+            "thread's session and moves its bundle"
+        )
     return None
 
 

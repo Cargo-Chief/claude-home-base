@@ -100,12 +100,18 @@ back. Each outcome writes a `REVIEW_NOTICE` audit line. If charging the sender c
 request posts, the CLI still reports it requested, with a warning not to request again.
 
 One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
-writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. The
+writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn,
+adding `"bundle": "CN-####-slug"` when it already created that work's worktree bundle. The
 harness takes the claim before the turn releases its lock, so the next turn in the thread can
 neither discard nor supply it. Once the turn has completed, the harness:
 1. opens a new top-level thread in the same room, with the title and brief as Slack-escaped text;
-2. starts a fresh session there with the brief as its first turn;
-3. links the new thread from the source thread.
+2. moves the named bundle's mapping to the new thread, releasing it from the source thread and
+   closing the source's idle process so its next turn resumes outside the bundle (a source mid-turn
+   is marked and replaced on its next turn). If the move
+   fails, the new thread still starts and both its first message and its first turn say why the
+   bundle stayed behind;
+3. starts a fresh session there with the brief as its first turn;
+4. links the new thread from the source thread.
 
 The new turn runs as the person whose message started the source turn, re-checked against the
 allowlist. Its envelope carries `handoff_from_thread` and never `named_approver`, so it can do
@@ -118,10 +124,21 @@ The harness refuses a claim from:
 - a Codex turn that escalated or whose delegate result was withheld;
 - a forwarded reply;
 - a turn more than one person wrote into;
-- a thread whose delegation budget is exhausted or awaiting verification.
+- a thread whose delegation budget is exhausted or awaiting verification;
+- a claim naming a bundle it cannot move: owned by another thread, over the live cap, invalid, or
+  for a ticket the title does not name.
+
+`bot.py` refuses `--send`, `--send-result` and `--channel` from a thread session (one with
+`CARGO_CHIEF_THREAD_WORK_DIR` set, on either provider) unless the message replies in an existing
+thread (`--thread`) or forwards its reply back to the session's own thread (`--forward-to` equal to
+`CLAUDE_THREAD_TS`, without `--with-votes`): a thread opened that way starts no
+session and strands the bundle in the source thread.
 
 The claim is read through one no-follow descriptor, capped at 16 KiB. Audit lines:
-`THREAD_HANDOFF` (opened), `HANDOFF_REFUSED`, and `HANDOFF_FAILED` (Slack refused the new thread).
+`THREAD_HANDOFF` (opened), `HANDOFF_REFUSED`, `HANDOFF_FAILED` (Slack refused the new thread), and
+`BUNDLE_BOUND` or `BUNDLE_REFUSED` with `VIA:handoff` for the bundle move. Every bundle binding
+runs under one lock, and a move releases the source before binding the target, restoring it if the
+second write fails.
 
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live
@@ -326,7 +343,10 @@ never be marked mutating.
 When a thread creates a standard `worktrees/CN-####-slug/` bundle, it can claim that bundle through
 its private one-shot claim file. Home-base accepts only a direct, non-symlinked child of
 `$CARGO_CHIEF_ROOT/worktrees/` with a regular `TASK.md`, refuses a bundle already owned by another
-thread, and caps live mappings at `MAX_LIVE_BUNDLES` (default 3, maximum 5). The mapping lives in
+thread, refuses a `CN-####` bundle in a thread whose opening message names other tickets but not
+that one (so new ticket work is handed off rather than started in place; an opening message with no
+ticket key, or one Slack cannot return, does not restrict it), and caps live mappings at
+`MAX_LIVE_BUNDLES` (default 3, maximum 5). The mapping lives in
 the thread's private state and survives daemon/session restart; a resumed process starts in the
 validated bundle. A removed or invalid bundle safely falls back to the thread scratch directory.
 

@@ -79,6 +79,7 @@ def load_functions(**overrides):
         "contains_private_escalation_action": lambda *args: False,
         "private_escalation_status": lambda **kwargs: "escalated",
         "consume_bundle_claim": lambda *args, **kwargs: None,
+        "_thread_ticket_keys": lambda *args: frozenset(),
         "consume_parking_claim": lambda *args, **kwargs: None,
         "prepare_thread_workspace": lambda *args, **kwargs: None,
         "_save_session": lambda thread_ts, sid: None,

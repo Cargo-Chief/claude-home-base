@@ -55,6 +55,7 @@ from cargo_chief_safety import (
     channel_message_action,
     claude_owner_env,
     cleanup_thread_workspaces,
+    check_bundle_handoff,
     consume_bundle_claim,
     consume_parking_claim,
     find_workspace_root,
@@ -70,6 +71,8 @@ from cargo_chief_safety import (
     review_turn_env,
     room_channel_ids,
     prepare_thread_workspace,
+    ticket_keys,
+    transfer_bundle,
     private_escalation_status,
     resolve_thread_bundle,
     ThreadWorkspace,
@@ -99,7 +102,9 @@ from thread_handoff import (
     discard_handoff_claim,
     handoff_refusal,
     handoff_turn_message,
+    new_thread_refusal,
     new_thread_text,
+    slack_escape,
     source_thread_text,
 )
 from process_control import close_process_tree, stop_process_tree
@@ -693,6 +698,8 @@ class LiveSession:
     # Serializes the full send→wait cycle so only one message at a time
     # is being actively processed. Other messages queue in our Python code.
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Set when a handoff moved this thread's bundle away while a turn ran; its next turn respawns.
+    bundle_moved: bool = False
     # Callback for posting text blocks to Slack
     _on_text: callable = field(default=None, repr=False)
     # Event that signals when a turn (result) is complete
@@ -1354,6 +1361,7 @@ def _reader_loop(session: LiveSession) -> None:
                         bundle = consume_bundle_claim(
                             session.workspace,
                             max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+                            thread_tickets=lambda: _thread_ticket_keys(session.channel, session.thread_ts),
                         )
                     except SafetyError as exc:
                         audit_logger.warning(
@@ -1432,6 +1440,17 @@ def _get_or_create_live_session(
     ``existing_only`` raises _NoLiveSession instead of spawning.
     """
     fresh = review_policy is not None
+    with _live_sessions_lock:
+        moved = _live_sessions.get(thread_ts)
+        if moved and moved.bundle_moved and not moved.turn_lock.locked():
+            _live_sessions.pop(thread_ts, None)
+        else:
+            moved = None
+    if moved:
+        try:
+            close_process_tree(moved.proc, moved.proc.stdin.close, wait=10)
+        except Exception as e:
+            logger.warning(f"Could not stop pid={moved.proc.pid} after its bundle moved: {e}")
     if fresh:
         with _live_sessions_lock:
             replaced = _live_sessions.get(thread_ts)
@@ -2236,7 +2255,9 @@ def _run_openai_fallback(
     if workspace.bundle_claim_file.exists():
         try:
             claimed = consume_bundle_claim(
-                workspace, max_live_bundles=RUNTIME_POLICY.max_live_bundles
+                workspace,
+                max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+                thread_tickets=lambda: _thread_ticket_keys(channel, thread_ts),
             )
         except SafetyError as exc:
             audit_logger.warning(
@@ -2668,6 +2689,7 @@ def process_message_async(
     turn_admitted = False
     session = None
     handoff_request = None
+    handoff_source = None
 
     try:
         if use_openai:
@@ -2686,6 +2708,7 @@ def process_message_async(
                     fallback_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
                     review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
                 )
+                handoff_source = fallback_workspace
             session = None
         else:
             # Preserve same-thread steering while a turn is active. A request for
@@ -2876,6 +2899,7 @@ def process_message_async(
                         review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
                         stopped=stopped, senders=len(session.turn_senders),
                     )
+                    handoff_source = handoff_workspace
 
     except _ReviewBusy:
         _clear_eyes(reaction_channel, reaction_msg_ts)
@@ -2928,7 +2952,7 @@ def process_message_async(
     if handoff_request:
         _start_handoff(
             handoff_request, user_id=user_id, channel=channel, channel_type=channel_type,
-            source_thread=thread_ts,
+            source_thread=thread_ts, source_workspace=handoff_source,
         )
 
 
@@ -2958,6 +2982,11 @@ def _take_handoff(
         refusal = handoff_refusal(delegation_blocked=_delegation_blocked(workspace), **conditions)
         if refusal:
             raise SafetyError(refusal)
+        if request.bundle:
+            check_bundle_handoff(
+                workspace, request.bundle, title=request.title,
+                max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+            )
     except SafetyError as exc:
         audit_logger.warning(
             "HANDOFF_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
@@ -2978,8 +3007,62 @@ def _thread_link(channel: str, ts: str, fallback: str) -> str:
         return fallback
 
 
+def _thread_ticket_keys(channel: str, thread_ts: str) -> frozenset[str]:
+    """Ticket keys named by the thread's opening message; empty when Slack cannot say."""
+    try:
+        messages = slack_client.conversations_replies(channel=channel, ts=thread_ts, limit=1)["messages"]
+        return ticket_keys(messages[0].get("text", "")) if messages else frozenset()
+    except Exception as exc:
+        logger.warning(f"Could not read the opening message of {thread_ts}: {type(exc).__name__}")
+        return frozenset()
+
+
+def _move_handoff_bundle(
+    request: HandoffRequest, source: ThreadWorkspace, *, user_id: str, channel: str,
+    source_thread: str, new_ts: str,
+) -> str | None:
+    """Move the handoff's bundle to the new thread; the reason it stayed behind, or None."""
+    try:
+        target = prepare_thread_workspace(source.root, channel=channel, thread=new_ts)
+        released = resolve_thread_bundle(source) is not None and resolve_thread_bundle(source).name == request.bundle
+        bundle = transfer_bundle(
+            source, target, request.bundle, title=request.title,
+            max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+        )
+    except (SafetyError, OSError, ValueError) as exc:
+        audit_logger.warning(
+            "BUNDLE_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | VIA:handoff | REASON:%s",
+            user_id, channel, new_ts, str(exc),
+        )
+        return str(exc) if isinstance(exc, SafetyError) else type(exc).__name__
+    audit_logger.info(
+        "BUNDLE_BOUND | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s | VIA:handoff",
+        user_id, channel, new_ts, bundle.name,
+    )
+    if released:
+        _retire_source_session(source_thread)
+    return None
+
+
+def _retire_source_session(thread_ts: str) -> None:
+    """Close an idle source process still rooted in the moved bundle; its next turn resumes outside it."""
+    with _live_sessions_lock:
+        session = _live_sessions.get(thread_ts)
+        if session is None:
+            return
+        if session.turn_lock.locked():
+            session.bundle_moved = True
+            return
+        _live_sessions.pop(thread_ts, None)
+    try:
+        close_process_tree(session.proc, session.proc.stdin.close, wait=10)
+    except Exception as exc:
+        logger.warning(f"Could not stop source pid={session.proc.pid} after a bundle move: {exc}")
+
+
 def _start_handoff(
-    request: HandoffRequest, *, user_id: str, channel: str, channel_type: str, source_thread: str
+    request: HandoffRequest, *, user_id: str, channel: str, channel_type: str, source_thread: str,
+    source_workspace: ThreadWorkspace | None = None,
 ) -> None:
     """Open the new thread, start its first turn as the requester, then link it from the source."""
     source_link = _thread_link(channel, source_thread, "an earlier thread")
@@ -3003,13 +3086,27 @@ def _start_handoff(
     audit_logger.info(
         "THREAD_HANDOFF | USER:%s | CHANNEL:%s | FROM:%s | TO:%s", user_id, channel, source_thread, new_ts,
     )
+    stranded = None
+    if request.bundle and source_workspace is not None:
+        stranded = _move_handoff_bundle(
+            request, source_workspace, user_id=user_id, channel=channel,
+            source_thread=source_thread, new_ts=new_ts,
+        )
+    turn_text = handoff_turn_message(request)
+    if stranded:
+        note = f"The bundle {request.bundle} stayed with the earlier thread: {stranded}."
+        turn_text += f"\n\nHarness note: {note}"
+        try:
+            slack_client.chat_postMessage(channel=channel, thread_ts=new_ts, text=slack_escape(note))
+        except Exception as exc:
+            logger.warning(f"Could not report the stranded bundle in {new_ts}: {exc}")
     event = {
         "type": "handoff",
         "user": user_id,
         "channel": channel,
         "channel_type": channel_type,
         "ts": new_ts,
-        "text": handoff_turn_message(request),
+        "text": turn_text,
     }
     threading.Thread(
         target=process_message_async, args=(event,), kwargs={"handoff_from": source_thread}, daemon=True,
@@ -3873,6 +3970,12 @@ def main():
             raise SystemExit(f"review request refused: {exc}") from exc
         print(f"review requested in {room}")
         return
+    refusal = new_thread_refusal(
+        send=bool(args.send), send_result=bool(args.send_result), channel=bool(args.channel),
+        thread=args.thread, forward_to=args.forward_to, with_votes=bool(args.with_votes), env=os.environ,
+    )
+    if refusal:
+        raise SystemExit(f"refused: {refusal}")
     if args.forward_to:
         refusal = review_route_refusal(_load_model_config(), os.environ)
         if refusal:

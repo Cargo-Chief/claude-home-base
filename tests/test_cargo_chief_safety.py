@@ -24,7 +24,11 @@ from cargo_chief_safety import (
     RuntimePolicy,
     SafetyError,
     cleanup_thread_workspaces,
+    check_bundle_handoff,
     consume_bundle_claim,
+    handoff_prompt,
+    ticket_keys,
+    transfer_bundle,
     consume_parking_claim,
     validate_parking_claim,
     prepare_thread_workspace,
@@ -533,6 +537,103 @@ class RuntimePolicyTest(unittest.TestCase):
         second.bundle_claim_file.write_text("../../escape")
         with self.assertRaisesRegex(SafetyError, "bundle name"):
             consume_bundle_claim(second, max_live_bundles=3)
+
+    def test_ticket_keys_reads_whole_cn_keys_only(self):
+        self.assertEqual(frozenset({"CN-9532", "CN-12"}), ticket_keys("*CN-9532 — x* see CN-12, not XCN-5 or CN-"))
+        self.assertEqual(frozenset(), ticket_keys(""))
+
+    def test_bundle_claim_must_match_a_ticket_the_thread_was_opened_for(self):
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="ticketed")
+        self._make_bundle("CN-9546-rotate")
+        workspace.bundle_claim_file.write_text("CN-9546-rotate")
+        with self.assertRaisesRegex(SafetyError, "opening message names CN-9532, not CN-9546; hand CN-9546 off.*CN-9546-rotate"):
+            consume_bundle_claim(workspace, max_live_bundles=3, thread_tickets=lambda: frozenset({"CN-9532"}))
+        self.assertIsNone(resolve_thread_bundle(workspace))
+        self.assertFalse(workspace.bundle_claim_file.exists())
+        for tickets in (frozenset({"CN-9532", "CN-9546"}), frozenset()):
+            workspace.bundle_claim_file.write_text("CN-9546-rotate")
+            self.assertIsNotNone(consume_bundle_claim(workspace, max_live_bundles=3, thread_tickets=lambda: tickets))
+
+    def test_the_opening_message_is_read_only_for_an_otherwise_valid_claim(self):
+        workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="lazy")
+        calls = []
+        workspace.bundle_claim_file.write_text("CN-1-missing")
+        with self.assertRaises(SafetyError):
+            consume_bundle_claim(workspace, max_live_bundles=3, thread_tickets=lambda: calls.append(1) or frozenset())
+        self.assertEqual([], calls)
+
+    def test_transfer_moves_a_bound_bundle_and_binds_an_unbound_one(self):
+        source = prepare_thread_workspace(self.workspace, channel="C1", thread="source")
+        target = prepare_thread_workspace(self.workspace, channel="C1", thread="target")
+        bundle = self._make_bundle("CN-7-moved")
+        source.bundle_claim_file.write_text("CN-7-moved")
+        consume_bundle_claim(source, max_live_bundles=1)
+        check_bundle_handoff(source, "CN-7-moved", title="CN-7 moved", max_live_bundles=1)
+        self.assertEqual(bundle, transfer_bundle(source, target, "CN-7-moved", title="CN-7 moved", max_live_bundles=1))
+        self.assertEqual(bundle, resolve_thread_bundle(target))
+        self.assertIsNone(resolve_thread_bundle(source))
+        self.assertNotIn("bundle", json.loads(source.state_file.read_text()))
+
+        fresh = prepare_thread_workspace(self.workspace, channel="C1", thread="fresh")
+        unbound = self._make_bundle("CN-8-unbound")
+        self.assertEqual(unbound, transfer_bundle(source, fresh, "CN-8-unbound", title="CN-8 x", max_live_bundles=2))
+        self.assertEqual(unbound, resolve_thread_bundle(fresh))
+
+    def test_a_source_keeping_its_own_bundle_still_counts_toward_the_cap(self):
+        source = prepare_thread_workspace(self.workspace, channel="C1", thread="source")
+        target = prepare_thread_workspace(self.workspace, channel="C1", thread="target")
+        self._make_bundle("CN-1-kept")
+        self._make_bundle("CN-2-new")
+        source.bundle_claim_file.write_text("CN-1-kept")
+        consume_bundle_claim(source, max_live_bundles=1)
+        with self.assertRaisesRegex(SafetyError, "cap reached"):
+            check_bundle_handoff(source, "CN-2-new", title="CN-2 new", max_live_bundles=1)
+        with self.assertRaisesRegex(SafetyError, "cap reached"):
+            transfer_bundle(source, target, "CN-2-new", title="CN-2 new", max_live_bundles=1)
+        self.assertIsNone(resolve_thread_bundle(target))
+
+    def test_transfer_refuses_a_bundle_bound_elsewhere_or_a_title_for_another_ticket(self):
+        owner = prepare_thread_workspace(self.workspace, channel="C1", thread="owner")
+        source = prepare_thread_workspace(self.workspace, channel="C1", thread="source")
+        target = prepare_thread_workspace(self.workspace, channel="C1", thread="target")
+        self._make_bundle("CN-1-owned")
+        self._make_bundle("CN-2-mine")
+        owner.bundle_claim_file.write_text("CN-1-owned")
+        consume_bundle_claim(owner, max_live_bundles=3)
+        with self.assertRaisesRegex(SafetyError, "already bound"):
+            check_bundle_handoff(source, "CN-1-owned", title="CN-1 x", max_live_bundles=3)
+        with self.assertRaisesRegex(SafetyError, "already bound"):
+            transfer_bundle(source, target, "CN-1-owned", title="CN-1 x", max_live_bundles=3)
+        for title in ("CN-2000 other work", "no ticket here"):
+            with self.assertRaisesRegex(SafetyError, "title must name CN-2 to carry CN-2-mine"):
+                check_bundle_handoff(source, "CN-2-mine", title=title, max_live_bundles=3)
+            with self.assertRaisesRegex(SafetyError, "title must name CN-2"):
+                transfer_bundle(source, target, "CN-2-mine", title=title, max_live_bundles=3)
+
+    def test_a_failed_target_write_restores_the_source_binding(self):
+        source = prepare_thread_workspace(self.workspace, channel="C1", thread="source")
+        target = prepare_thread_workspace(self.workspace, channel="C1", thread="target")
+        bundle = self._make_bundle("CN-3-kept")
+        source.bundle_claim_file.write_text("CN-3-kept")
+        consume_bundle_claim(source, max_live_bundles=3)
+        real = cargo_chief_safety._write_bundle
+
+        def failing(workspace, name):
+            if workspace.key == target.key:
+                raise OSError("disk full")
+            real(workspace, name)
+
+        with mock.patch("cargo_chief_safety._write_bundle", side_effect=failing):
+            with self.assertRaises(OSError):
+                transfer_bundle(source, target, "CN-3-kept", title="CN-3 kept", max_live_bundles=3)
+        self.assertEqual(bundle, resolve_thread_bundle(source))
+        self.assertIsNone(resolve_thread_bundle(target))
+
+    def test_handoff_prompt_names_the_bundle_field_and_forbids_opening_threads_directly(self):
+        prompt = handoff_prompt(Path("/w/handoff-claim.json"))
+        self.assertIn('"bundle": "CN-####-slug"', prompt)
+        self.assertIn("bot.py refuses a new DM or channel thread", prompt)
+        self.assertIn("The title must name the bundle's ticket", prompt)
 
     def test_missing_bound_bundle_falls_back_to_thread_workspace(self):
         workspace = prepare_thread_workspace(self.workspace, channel="C1", thread="gone")
