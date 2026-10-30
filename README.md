@@ -91,10 +91,13 @@ from the peer bot as a hand-back, never as a request; a matched one is taken onc
 `review_ended`, else `review_ended_unmatched`). The thread is woken only while its own session is
 live in that channel, so a forged origin cannot start a turn elsewhere: home-base posts a note
 there and steers in a turn whose sender is the peer bot with `review_notice` authority (no operator
-or approver authority, no reply routes, no handoff, not added to the turn's senders). With no live
-session, or on the Codex fallback, a configured room gets only a "tell me to continue" note. Each
-outcome writes a `REVIEW_NOTICE` audit line. If charging the sender cap fails after the request
-posts, the CLI says it was posted but not charged, so a retry loop stops.
+or approver authority, no reply routes, no handoff; steered into a running turn it counts as a
+second sender, so that turn cannot hand off either). It never spawns a process, never runs on the
+Codex fallback (at the start or after a mid-turn credit limit), and never takes a stopping or
+review session: in each of those cases a configured work room (a non-review `channels` entry) gets
+only a "tell me to continue" note. A failure before the thread hears anything puts the record
+back. Each outcome writes a `REVIEW_NOTICE` audit line. If charging the sender cap fails after the
+request posts, the CLI still reports it requested, with a warning not to request again.
 
 One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
 writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. The

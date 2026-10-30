@@ -782,7 +782,7 @@ class PeerRequestTest(unittest.TestCase):
                 post=lambda channel, message: "9.1", audit=self.audits.append, sent=BrokenCaps(),
             )
         self.assertEqual("sent_uncharged", caught.exception.outcome)
-        self.assertIn("posted but not charged", str(caught.exception))
+        self.assertIn("not charged against the daily cap", str(caught.exception))
 
 
 class PlanReviewPassTest(unittest.TestCase):

@@ -232,11 +232,15 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("review_notice=review_notice['pr'] if review_notice else None", process)
         self.assertEqual(2, process.count("from_handoff=bool(handoff_from or review_notice)"))
         self.assertLess(process.index("if review_notice and use_openai:"), process.index("_run_openai_fallback("))
-        self.assertLess(process.index("if review_notice and session is None:"),
-                        process.index("session = _get_or_create_live_session("))
-        self.assertIn("if not review_notice:\n                session.turn_senders.add(user_id)", process)
+        self.assertLess(process.index("elif fallback_requested and review_notice:"),
+                        process.index("elif fallback_requested:"))
+        self.assertIn("existing_only=bool(review_notice)", process)
+        self.assertIn("except _NoLiveSession:", process)
+        factory = ast.unparse(self._function("_get_or_create_live_session"))
+        self.assertLess(factory.index("raise _NoLiveSession()"), factory.index("_spawn_claude_process("))
         start = ast.unparse(self._function("_start_review_notice"))
         self.assertLess(start.index("session = _live_session_for(thread, channel)"), start.index("chat_postMessage("))
+        self.assertIn("restore(f'failed_{type(exc).__name__}')", start)
         self.assertIn("review_notice={'pr': pr, 'room_user': session.user_id}", start)
 
     def test_escalation_and_forwarding_refuse_review_only_rooms_server_side(self):

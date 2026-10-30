@@ -881,7 +881,7 @@ def request_peer_review(
             except (CapStoreError, OSError) as exc:
                 raise PeerRequestError(
                     "sent_uncharged",
-                    f"the request was posted but not charged ({type(exc).__name__}); do not request again",
+                    f"it was not charged against the daily cap ({type(exc).__name__}); do not request again",
                 ) from exc
     except PeerRequestError as exc:
         audit(format_sent_audit(pr=pr, outcome=exc.outcome))

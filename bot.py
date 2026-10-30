@@ -1423,11 +1423,12 @@ def _reader_loop(session: LiveSession) -> None:
 
 def _get_or_create_live_session(
     thread_ts: str, channel: str, user_id: str = "", review_policy: RoomPolicy | None = None,
-    review_pr: str = "", review_plan: ReviewPlan | None = None,
+    review_pr: str = "", review_plan: ReviewPlan | None = None, existing_only: bool = False,
 ) -> LiveSession:
     """Get an existing live session or create a new one.
 
     A review (``review_policy`` set) always gets a fresh, unresumed process under that pinned policy.
+    ``existing_only`` raises _NoLiveSession instead of spawning.
     """
     fresh = review_policy is not None
     if fresh:
@@ -1447,6 +1448,8 @@ def _get_or_create_live_session(
         if not fresh and session and session.proc.poll() is None and not session.stop_done:
             session.last_activity = time.time()
             return session
+        if existing_only:
+            raise _NoLiveSession()
 
         # Evict oldest idle session if at capacity
         if len(_live_sessions) >= MAX_LIVE_SESSIONS:
@@ -2356,6 +2359,10 @@ def _clear_eyes(channel: str, ts: str) -> None:
         pass
 
 
+class _NoLiveSession(Exception):
+    """A review notice found no live session to wake; it never spawns one."""
+
+
 class _ReviewBusy(Exception):
     """A review found a turn already running in its thread."""
 
@@ -2712,6 +2719,7 @@ def process_message_async(
                     review_policy=room_policy if review else None,
                     review_pr=review_admission.pr if review else "",
                     review_plan=review_admission.plan if review else None,
+                    existing_only=bool(review_notice),
                 )
                 # The cap is charged, and the request audited as accepted, only once its turn starts.
                 if review and not review_admission.start():
@@ -2732,8 +2740,7 @@ def process_message_async(
                 # A person already started a turn in the new thread; the brief is its opening message.
                 _clear_eyes(reaction_channel, reaction_msg_ts)
                 return
-            if not review_notice:
-                session.turn_senders.add(user_id)
+            session.turn_senders.add(user_id)
             _send_to_claude(session, text)
             session.pending_reactions.append((reaction_channel, reaction_msg_ts))
             audit_interaction(event, "(steered into running turn)", 0.0, session.session_id)
@@ -2820,6 +2827,9 @@ def process_message_async(
                     # The Codex fallback carries none of the review-only controls.
                     all_texts.append(PROVIDER_REPLY)
                     post_response(channel, PROVIDER_REPLY, thread_ts=thread_ts)
+                elif fallback_requested and review_notice:
+                    # A Codex turn would run as the peer bot.
+                    post_response(channel, REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]), thread_ts=thread_ts)
                 elif fallback_requested:
                     fallback_context = _fetch_thread_context(channel, thread_ts, msg_ts)
                     fallback_prompt = text
@@ -2867,6 +2877,12 @@ def process_message_async(
     except _ReviewBusy:
         _clear_eyes(reaction_channel, reaction_msg_ts)
         review_admission.refuse("refused_busy", BUSY_REPLY)
+        return
+    except _NoLiveSession:
+        _clear_eyes(reaction_channel, reaction_msg_ts)
+        slack_client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
+        )
         return
     except Exception as e:
         try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
@@ -3377,38 +3393,59 @@ REVIEW_NOTICE_IDLE = "The peer review of {pr} has ended. Tell me to continue whe
 
 
 def _live_session_for(thread: str, channel: str) -> "LiveSession | None":
+    """The thread's own idle-or-working Claude session in that channel, if it can take a turn."""
     with _live_sessions_lock:
         session = _live_sessions.get(thread)
-    if session and session.channel == channel and session.proc.poll() is None:
-        return session
-    return None
+    if (not session or session.channel != channel or session.review or session.stop_done
+            or session.proc.poll() is not None):
+        return None
+    if use_openai_provider(_get_provider_override(thread), limit_paused=_limit_paused(),
+                           has_openai_session=_get_openai_session(thread) is not None):
+        return None
+    return session
+
+
+def _notice_room(channel: str) -> bool:
+    """A configured, non-review work room: the only place an idle note may go."""
+    config = _load_model_config()
+    entry = (config.get("channels") or {}).get(channel) if isinstance(config, dict) else None
+    return isinstance(entry, dict) and not entry.get("review_only")
 
 
 def _start_review_notice(entry: dict, event: dict) -> None:
     """Wake the thread that asked for a review, only while its own session is live.
 
     The recorded origin comes from the agent's environment, so a turn starts only in a thread with
-    a live session in that channel; otherwise a configured room gets a note and nothing else.
+    a live session in that channel; otherwise a configured work room gets a note and nothing else.
+    A failure before the thread hears anything puts the record back.
     """
     channel, thread, pr = entry["channel"], entry["thread"], entry["pr"]
-    session = _live_session_for(thread, channel)
-    if session is None:
-        if channel in room_channel_ids(_load_model_config()):
-            try:
-                slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=REVIEW_NOTICE_IDLE.format(pr=pr))
-            except Exception:
-                pass
-        audit_logger.info("REVIEW_NOTICE | CHANNEL:%s | THREAD:%s | PR:%s | OUTCOME:idle", channel, thread, pr)
-        return
+    request_ts = event.get("thread_ts", "")
+
+    def audit(outcome: str) -> None:
+        audit_logger.info("REVIEW_NOTICE | CHANNEL:%s | THREAD:%s | PR:%s | OUTCOME:%s", channel, thread, pr, outcome)
+
+    def restore(outcome: str) -> None:
+        audit(outcome)
+        try:
+            _review_notices.add(request_ts, pr=pr, channel=channel, thread=thread)
+        except Exception:
+            pass
+
     try:
+        session = _live_session_for(thread, channel)
+        if session is None:
+            if _notice_room(channel):
+                slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=REVIEW_NOTICE_IDLE.format(pr=pr))
+            audit("idle")
+            return
         note_ts = slack_client.chat_postMessage(
             channel=channel, thread_ts=thread, text=f"The peer review of {pr} has ended; picking it up.",
         )["ts"]
     except Exception as exc:
-        audit_logger.warning("REVIEW_NOTICE | CHANNEL:%s | THREAD:%s | PR:%s | OUTCOME:failed_%s",
-                             channel, thread, pr, type(exc).__name__)
+        restore(f"failed_{type(exc).__name__}")
         return
-    audit_logger.info("REVIEW_NOTICE | CHANNEL:%s | THREAD:%s | PR:%s | OUTCOME:woken", channel, thread, pr)
+    audit("woken")
     notice = {
         "type": "review_notice",
         "user": event.get("user", ""),
@@ -3821,7 +3858,8 @@ def main():
             )
         except PeerRequestError as exc:
             if exc.outcome == "sent_uncharged":
-                raise SystemExit(f"review requested, but {exc}") from exc
+                print(f"review requested; warning: {exc}")
+                return
             raise SystemExit(f"review request refused: {exc}") from exc
         print(f"review requested in {room}")
         return
