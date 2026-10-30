@@ -697,6 +697,8 @@ class LiveSession:
     # Serializes the full send→wait cycle so only one message at a time
     # is being actively processed. Other messages queue in our Python code.
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Set when a handoff moved this thread's bundle away while a turn ran; its next turn respawns.
+    bundle_moved: bool = False
     # Callback for posting text blocks to Slack
     _on_text: callable = field(default=None, repr=False)
     # Event that signals when a turn (result) is complete
@@ -1435,6 +1437,17 @@ def _get_or_create_live_session(
     A review (``review_policy`` set) always gets a fresh, unresumed process under that pinned policy.
     """
     fresh = review_policy is not None
+    with _live_sessions_lock:
+        moved = _live_sessions.get(thread_ts)
+        if moved and moved.bundle_moved and not moved.turn_lock.locked():
+            _live_sessions.pop(thread_ts, None)
+        else:
+            moved = None
+    if moved:
+        try:
+            close_process_tree(moved.proc, moved.proc.stdin.close, wait=10)
+        except Exception as e:
+            logger.warning(f"Could not stop pid={moved.proc.pid} after its bundle moved: {e}")
     if fresh:
         with _live_sessions_lock:
             replaced = _live_sessions.get(thread_ts)
@@ -2959,6 +2972,7 @@ def _move_handoff_bundle(
     """Move the handoff's bundle to the new thread; the reason it stayed behind, or None."""
     try:
         target = prepare_thread_workspace(source.root, channel=channel, thread=new_ts)
+        released = resolve_thread_bundle(source) is not None and resolve_thread_bundle(source).name == request.bundle
         bundle = transfer_bundle(
             source, target, request.bundle, title=request.title,
             max_live_bundles=RUNTIME_POLICY.max_live_bundles,
@@ -2973,7 +2987,8 @@ def _move_handoff_bundle(
         "BUNDLE_BOUND | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s | VIA:handoff",
         user_id, channel, new_ts, bundle.name,
     )
-    _retire_source_session(source_thread)
+    if released:
+        _retire_source_session(source_thread)
     return None
 
 
@@ -2981,7 +2996,10 @@ def _retire_source_session(thread_ts: str) -> None:
     """Close an idle source process still rooted in the moved bundle; its next turn resumes outside it."""
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
-        if session is None or session.turn_lock.locked():
+        if session is None:
+            return
+        if session.turn_lock.locked():
+            session.bundle_moved = True
             return
         _live_sessions.pop(thread_ts, None)
     try:
@@ -3818,7 +3836,7 @@ def main():
         return
     refusal = new_thread_refusal(
         send=bool(args.send), send_result=bool(args.send_result), channel=bool(args.channel),
-        thread=args.thread, forward_to=args.forward_to, env=os.environ,
+        thread=args.thread, forward_to=args.forward_to, with_votes=bool(args.with_votes), env=os.environ,
     )
     if refusal:
         raise SystemExit(f"refused: {refusal}")

@@ -87,7 +87,8 @@ harness takes the claim before the turn releases its lock, so the next turn in t
 neither discard nor supply it. Once the turn has completed, the harness:
 1. opens a new top-level thread in the same room, with the title and brief as Slack-escaped text;
 2. moves the named bundle's mapping to the new thread, releasing it from the source thread and
-   closing the source's idle process so its next turn resumes outside the bundle. If the move
+   closing the source's idle process so its next turn resumes outside the bundle (a source mid-turn
+   is marked and replaced on its next turn). If the move
    fails, the new thread still starts and both its first message and its first turn say why the
    bundle stayed behind;
 3. starts a fresh session there with the brief as its first turn;
@@ -110,7 +111,8 @@ The harness refuses a claim from:
 
 `bot.py` refuses `--send`, `--send-result` and `--channel` from a thread session (one with
 `CARGO_CHIEF_THREAD_WORK_DIR` set, on either provider) unless the message replies in an existing
-thread (`--thread`) or forwards its reply back (`--forward-to`): a thread opened that way starts no
+thread (`--thread`) or forwards its reply back to the session's own thread (`--forward-to` equal to
+`CLAUDE_THREAD_TS`, without `--with-votes`): a thread opened that way starts no
 session and strands the bundle in the source thread.
 
 The claim is read through one no-follow descriptor, capped at 16 KiB. Audit lines:

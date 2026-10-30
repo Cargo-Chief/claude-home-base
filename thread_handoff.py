@@ -115,15 +115,17 @@ def handoff_refusal(
 
 def new_thread_refusal(
     *, send: bool, send_result: bool, channel: bool, thread: str | None, forward_to: str | None,
-    env: Mapping[str, str],
+    with_votes: bool = False, env: Mapping[str, str],
 ) -> str | None:
     """Why a thread session may not open a new Slack thread from the CLI, or None when it may.
 
-    A reply in an existing thread, and a DM whose reply is forwarded back to this thread, stay allowed.
+    A reply in an existing thread, and a DM whose reply is forwarded back to this session's own
+    thread, stay allowed.
     """
     if not env.get("CARGO_CHIEF_THREAD_WORK_DIR") or thread:
         return None
-    if channel or send_result or (send and not forward_to):
+    forwarded_home = bool(forward_to) and forward_to == env.get("CLAUDE_THREAD_TS") and not with_votes
+    if channel or send_result or (send and not forwarded_home):
         return (
             "a thread session opens new work only through its handoff claim, which starts the new "
             "thread's session and moves its bundle"

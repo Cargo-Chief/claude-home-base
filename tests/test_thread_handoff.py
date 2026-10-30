@@ -412,6 +412,7 @@ class HandoffBundleTest(unittest.TestCase):
             "slack_escape": thread_handoff.slack_escape,
             "transfer_bundle": transfer_bundle,
             "prepare_thread_workspace": prepare_thread_workspace,
+            "resolve_thread_bundle": resolve_thread_bundle,
             "RUNTIME_POLICY": type("RuntimePolicy", (), {"max_live_bundles": 3}),
             "audit_logger": audit_logger,
             "logger": logging.getLogger("test-handoff-bundle-log"),
@@ -445,6 +446,17 @@ class HandoffBundleTest(unittest.TestCase):
         self.assertTrue(any(line.startswith("BUNDLE_BOUND") and "VIA:handoff" in line for line in self.audit.lines))
         self.assertEqual(["1.0"], self.retired)
 
+    def test_a_move_of_a_bundle_the_source_never_held_leaves_its_session_alone(self):
+        fresh = self.root / "worktrees" / "CN-3-fresh"
+        fresh.mkdir()
+        (fresh / "TASK.md").write_text("task\n")
+        self.namespace["_start_handoff"](
+            HandoffRequest("CN-3 fresh", "b", "CN-3-fresh"), user_id="U1", channel="C1", channel_type="im",
+            source_thread="1.0", source_workspace=self.source,
+        )
+        self.assertEqual([], self.retired)
+        self.assertEqual((self.root / "worktrees" / "CN-2-next").resolve(), resolve_thread_bundle(self.source))
+
     def test_a_failed_move_is_reported_in_the_new_thread_and_its_first_turn(self):
         other = prepare_thread_workspace(self.root, channel="C1", thread="2.0")
         self.namespace["_start_handoff"](
@@ -474,10 +486,14 @@ class HandoffBundleTest(unittest.TestCase):
 class NewThreadRefusalTest(unittest.TestCase):
     def refusal(self, env=None, **flags):
         args = {"send": False, "send_result": False, "channel": False, "thread": None, "forward_to": None, **flags}
-        return thread_handoff.new_thread_refusal(env={"CARGO_CHIEF_THREAD_WORK_DIR": "/w"} if env is None else env, **args)
+        session = {"CARGO_CHIEF_THREAD_WORK_DIR": "/w", "CLAUDE_THREAD_TS": "1.0"} if env is None else env
+        return thread_handoff.new_thread_refusal(env=session, **args)
 
     def test_a_thread_session_cannot_open_a_new_thread(self):
-        for flags in ({"send": True}, {"send_result": True}, {"channel": True}):
+        for flags in (
+            {"send": True}, {"send_result": True}, {"channel": True},
+            {"send": True, "forward_to": "7.0"}, {"send": True, "forward_to": "1.0", "with_votes": True},
+        ):
             self.assertIn("handoff claim", self.refusal(**flags), flags)
 
     def test_replies_forwarded_dms_and_non_thread_callers_stay_allowed(self):
@@ -486,6 +502,43 @@ class NewThreadRefusalTest(unittest.TestCase):
         self.assertIsNone(self.refusal(send=True, forward_to="1.0"))
         self.assertIsNone(self.refusal(send=True, env={}))
         self.assertIsNone(self.refusal())
+
+
+class RetireSourceTest(unittest.TestCase):
+    def setUp(self):
+        import threading as real_threading
+        self.closed = []
+        self.sessions = {}
+        namespace = _compile(("_retire_source_session",), {
+            "_live_sessions_lock": real_threading.Lock(),
+            "_live_sessions": self.sessions,
+            "close_process_tree": lambda proc, close, wait: self.closed.append(proc),
+            "logger": logging.getLogger("test-retire"),
+        })
+        self.retire = namespace["_retire_source_session"]
+        self.lock = real_threading.Lock
+
+    def session(self):
+        proc = type("Proc", (), {"pid": 1, "stdin": type("In", (), {"close": lambda self: None})()})()
+        return type("Session", (), {"proc": proc, "turn_lock": self.lock(), "bundle_moved": False})()
+
+    def test_an_idle_source_is_closed_and_a_busy_one_is_marked(self):
+        idle = self.session()
+        self.sessions["1.0"] = idle
+        self.retire("1.0")
+        self.assertEqual([idle.proc], self.closed)
+        self.assertNotIn("1.0", self.sessions)
+        busy = self.session()
+        busy.turn_lock.acquire()
+        self.sessions["2.0"] = busy
+        self.retire("2.0")
+        self.assertTrue(busy.bundle_moved)
+        self.assertIs(busy, self.sessions["2.0"])
+
+    def test_a_marked_session_is_replaced_on_its_next_turn(self):
+        create = ast.unparse(_bot_function("_get_or_create_live_session"))
+        self.assertIn("moved.bundle_moved and (not moved.turn_lock.locked())", create)
+        self.assertLess(create.index("moved.bundle_moved"), create.index("session.proc.poll() is None"))
 
 
 class WiringTest(unittest.TestCase):

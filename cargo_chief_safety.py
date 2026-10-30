@@ -475,31 +475,33 @@ def prepare_thread_workspace(
         directory.chmod(0o700)
 
     state_file = path / "state.json"
-    created_at = now if now is not None else time.time()
-    bundle = None
-    try:
-        prior = json.loads(state_file.read_text(encoding="utf-8"))
-        if prior.get("channel") != channel or prior.get("thread") != thread:
-            raise SafetyError("thread workspace metadata does not match its routing key")
-        created_at = prior.get("created_at", created_at)
-        bundle = prior.get("bundle")
-    except FileNotFoundError:
-        pass
-    except json.JSONDecodeError as exc:
-        raise SafetyError("thread workspace metadata is invalid") from exc
+    # Same lock as bundle binding, so this rewrite cannot restore a bundle a handoff just moved.
+    with _BUNDLE_LOCK:
+        created_at = now if now is not None else time.time()
+        bundle = None
+        try:
+            prior = json.loads(state_file.read_text(encoding="utf-8"))
+            if prior.get("channel") != channel or prior.get("thread") != thread:
+                raise SafetyError("thread workspace metadata does not match its routing key")
+            created_at = prior.get("created_at", created_at)
+            bundle = prior.get("bundle")
+        except FileNotFoundError:
+            pass
+        except json.JSONDecodeError as exc:
+            raise SafetyError("thread workspace metadata is invalid") from exc
 
-    updated_at = now if now is not None else time.time()
-    state = {
-        "version": 1,
-        "channel": channel,
-        "thread": thread,
-        "session_id": session_id,
-        "created_at": created_at,
-        "updated_at": updated_at,
-    }
-    if bundle is not None:
-        state["bundle"] = bundle
-    write_private_json(state_file, state)
+        updated_at = now if now is not None else time.time()
+        state = {
+            "version": 1,
+            "channel": channel,
+            "thread": thread,
+            "session_id": session_id,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        if bundle is not None:
+            state["bundle"] = bundle
+        write_private_json(state_file, state)
     return ThreadWorkspace(
         key=key,
         root=workspace_root.resolve(),
@@ -637,11 +639,12 @@ def consume_bundle_claim(
         bundle = claim.read_text(encoding="utf-8").strip()
         if "\n" in bundle:
             raise SafetyError("bundle claim must contain exactly one bundle name")
+        _validated_bundle_path(workspace.root, bundle)
+        _require_ticket(bundle, thread_tickets(), "this thread's opening message")
         with _BUNDLE_LOCK:
             candidate = _check_bundle_binding(
                 workspace.root, bundle, max_live_bundles=max_live_bundles, replacing=workspace.key,
             )
-            _require_ticket(bundle, thread_tickets(), "this thread's opening message")
             _write_bundle(workspace, bundle)
         return candidate
     finally:
