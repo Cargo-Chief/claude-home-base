@@ -63,6 +63,7 @@ preflight. Keep broadly useful transport improvements separable so they can be p
     envelope field.
 
   Change them together.
-- The headless browser is `mcp/playwright/` (pinned, `npm ci` per principal) wired in by
-  `cargo_chief_safety.browser_mcp_config`. Bump the pin with a regenerated lockfile, and re-check
-  the tool list for new tools that need a `BROWSER_DENY_RULES` entry. See README
+- The headless browser is `mcp/playwright/` (pinned, `npm ci` per checkout) wired in by
+  `cargo_chief_safety.browser_mcp_config`, `BROWSER_DENY_RULES` and the `browser_guard.py` hook.
+  A pin bump changes `BROWSER_MCP_REVIEWED_VERSION` with the regenerated lockfile, after
+  re-checking the new tool list for tools that run code or take files. See README

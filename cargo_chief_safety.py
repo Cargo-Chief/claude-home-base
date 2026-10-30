@@ -8,6 +8,7 @@ Claude process.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import functools
 import hashlib
 import json
 import os
@@ -1021,11 +1022,9 @@ def preflight_room(policy: RoomPolicy) -> list[str]:
         read_root_permissions(root)
     except SafetyError as exc:
         warnings.append(f"{exc}; thread sessions start without the root permission rules")
-    if browser_mcp_config(root) is None:
-        warnings.append(
-            f"headless browser not installed ({BROWSER_MCP_CLI} or node missing); "
-            "thread sessions start without it"
-        )
+    browser_reason = None if policy.review_only else browser_unavailable_reason()
+    if browser_reason is not None:
+        warnings.append(f"headless browser unavailable ({browser_reason}); thread sessions start without it")
     return warnings
 
 
@@ -1265,35 +1264,83 @@ def owner_settings(root: Path, home: Path | None = None, *, review_only: bool = 
 
 
 BROWSER_MCP_DIR = Path(__file__).resolve().parent / "mcp" / "playwright"
-BROWSER_MCP_CLI = BROWSER_MCP_DIR / "node_modules" / "@playwright" / "mcp" / "cli.js"
+BROWSER_MCP_PACKAGE = BROWSER_MCP_DIR / "node_modules" / "@playwright" / "mcp"
+BROWSER_MCP_CLI = BROWSER_MCP_PACKAGE / "cli.js"
+# The deny rules and the guard were reviewed against this version's tool list; a bump repeats that.
+BROWSER_MCP_REVIEWED_VERSION = "0.0.83"
+BROWSER_MIN_NODE_MAJOR = 20
 # run_code_unsafe executes arbitrary JavaScript in the server process, outside the Bash rails;
-# file_upload sends a local file to whatever page is open.
+# file_upload and drop send local files to whatever page is open.
 BROWSER_DENY_RULES = (
     "mcp__playwright__browser_run_code_unsafe",
     "mcp__playwright__browser_file_upload",
+    "mcp__playwright__browser_drop",
 )
+BROWSER_TOOL_MATCHER = "mcp__playwright__.*"
 BROWSER_PROMPT = (
     "- A headless browser is available as the `playwright` MCP server, for checking dev and local "
-    "UIs. Its profile is in memory and discarded when the turn ends. Never type a credential into "
-    "it and never open a production UI with it."
+    "UIs. Its profile is in memory and discarded when the turn ends. Let it name its own output "
+    "files: calls that pass a file name or path are refused. Never type a credential into it and "
+    "never open a production UI with it."
 )
 
 
-def browser_mcp_config(root: Path, cli: Path = BROWSER_MCP_CLI) -> dict | None:
-    """The pinned headless Playwright MCP server, or None when it is not installed."""
+@functools.lru_cache(maxsize=4)
+def _node_major(node: str) -> int | None:
+    try:
+        result = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10)
+        return int(result.stdout.strip().lstrip("v").split(".")[0])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _installed_browser_version(cli: Path) -> str | None:
+    try:
+        return json.loads((cli.parent / "package.json").read_text(encoding="utf-8")).get("version")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def browser_unavailable_reason(cli: Path = BROWSER_MCP_CLI) -> str | None:
+    """Why the pinned browser cannot run here, or None when it can."""
+    if not cli.is_file():
+        return f"{cli} is missing; install it in {cli.parents[2]}"
+    version = _installed_browser_version(cli)
+    if version != BROWSER_MCP_REVIEWED_VERSION:
+        return f"installed @playwright/mcp {version} is not the reviewed {BROWSER_MCP_REVIEWED_VERSION}"
     node = shutil.which("node")
-    if node is None or not cli.is_file():
+    if node is None:
+        return "node is not on PATH"
+    major = _node_major(node)
+    if major is None or major < BROWSER_MIN_NODE_MAJOR:
+        return f"{node} is not node {BROWSER_MIN_NODE_MAJOR} or later"
+    return None
+
+
+def browser_mcp_config(output_dir: Path, cli: Path = BROWSER_MCP_CLI) -> dict | None:
+    """The pinned headless Playwright MCP server writing to output_dir, or None when unavailable."""
+    if browser_unavailable_reason(cli) is not None:
         return None
     return {
         "mcpServers": {
             "playwright": {
-                "command": node,
+                "command": shutil.which("node"),
                 "args": [
-                    str(cli), "--headless", "--isolated",
-                    "--output-dir", str(root / "work" / "playwright-mcp"),
+                    str(cli), "--headless", "--isolated", "--no-webmcp",
+                    "--output-dir", str(output_dir),
                 ],
             },
         },
+    }
+
+
+def browser_guard_hooks(transport_python: Path, guard_script: Path) -> dict:
+    """PreToolUse hook refusing browser calls that name a file, which resolve against the cwd."""
+    command = f"{shlex.quote(str(transport_python))} {shlex.quote(str(guard_script))}"
+    return {
+        "PreToolUse": [
+            {"matcher": BROWSER_TOOL_MATCHER, "hooks": [{"type": "command", "command": command}]},
+        ],
     }
 
 
@@ -1326,14 +1373,20 @@ def build_claude_command(
     model_prompt: str = "",
     session_id: str | None = None,
     home: Path | None = None,
+    browser_output_dir: Path | None = None,
     browser_cli: Path = BROWSER_MCP_CLI,
 ) -> list[str]:
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
-    browser = None if policy.review_only else browser_mcp_config(policy.root, browser_cli)
+    browser = None
+    if browser_output_dir is not None and not policy.review_only:
+        browser = browser_mcp_config(browser_output_dir, browser_cli)
     settings = owner_settings(policy.root, home, review_only=policy.review_only)
     if browser is not None:
         permissions = settings.setdefault("permissions", {})
         permissions["deny"] = [*permissions.get("deny", []), *BROWSER_DENY_RULES]
+        settings["hooks"] = browser_guard_hooks(
+            transport_python, transport_script.parent / "browser_guard.py"
+        )
     if policy.review_only:
         harness_prompt = REVIEW_HARNESS_PROMPT
     else:
@@ -1350,7 +1403,7 @@ def build_claude_command(
     appended = "\n\n".join(
         part
         for part in (
-            overlay, harness_prompt, BROWSER_PROMPT if browser else "", SLACK_REPORTING_PROMPT,
+            overlay, harness_prompt, BROWSER_PROMPT if browser is not None else "", SLACK_REPORTING_PROMPT,
             identity_prompt.strip(), model_prompt.strip(),
         )
         if part

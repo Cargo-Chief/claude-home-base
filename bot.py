@@ -906,6 +906,7 @@ def _spawn_claude_process(
         identity_prompt=_identity_prompt(),
         model_prompt=model_prompt,
         session_id=session_id,
+        browser_output_dir=workspace.path / "browser",
     )
 
     stderr_tmp = tempfile.NamedTemporaryFile(
