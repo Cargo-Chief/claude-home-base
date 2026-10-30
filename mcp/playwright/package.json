@@ -1,0 +1,8 @@
+{
+  "name": "cargo-chief-home-base-browser",
+  "private": true,
+  "description": "Pinned headless browser MCP server for agent thread sessions; install with npm ci",
+  "dependencies": {
+    "@playwright/mcp": "0.0.83"
+  }
+}

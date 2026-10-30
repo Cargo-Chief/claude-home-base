@@ -129,6 +129,26 @@ at startup, and refuses file transfer or transcript search. Additional Slack thr
 the two active turns and start automatically when capacity is available; requests are not
 discarded at the session cap.
 
+Thread sessions get a headless browser when it is installed: the harness passes the
+`@playwright/mcp` server pinned in `mcp/playwright/` with `--mcp-config`, headless, with an
+in-memory profile and WebMCP off. Unnamed snapshots and screenshots go to the thread's own
+`browser/` directory under its workspace, which the stale-workspace cleanup removes. It drives the
+system Google Chrome, needs no display or logged-in desktop, and avoids the keychain (Playwright
+launches Chrome with `--use-mock-keychain`). It needs node 20 or later on the service's PATH and
+the installed package at the reviewed version (`BROWSER_MCP_REVIEWED_VERSION`); install it once in
+each principal's checkout, as that user, with `npm ci` in `mcp/playwright/`. Until then preflight
+warns with the reason and sessions start without it. Review-only turns never get it.
+
+Playwright resolves a named file against the session cwd (the bundle or thread workspace), outside
+the Edit/Write rails, and its `file:` block checks only a URL's outer scheme (`view-source:file://`
+gets through), so a PreToolUse hook (`browser_guard.py`) refuses any browser call whose arguments,
+at any depth, name a file or path or give a URL other than `http`, `https` or `about:blank`. The
+hook refuses on any failure of its own, since only its refusal exit code blocks the call. `browser_run_code_unsafe` (arbitrary JavaScript in the server
+process), `browser_file_upload` and `browser_drop` (local files to the page) are denied. Every owner
+command carries `--strict-mcp-config`, so an MCP server the agent registers itself never loads.
+"Never open a production UI" is a prompt rule: the profile holds no credentials, and Playwright's
+origin lists are not a security boundary.
+
 Lifecycle reporting is optional and installation-specific. During setup, create or select the
 Slack channel you want to use, invite the app, and put its stable channel ID in
 `AGENT_STATUS_CHANNEL_ID`. Home-base then posts fixed, privacy-safe ready and fatal-runtime notices;

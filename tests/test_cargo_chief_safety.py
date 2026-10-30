@@ -10,7 +10,13 @@ import threading
 import unittest
 from unittest import mock
 
+import cargo_chief_safety
 from cargo_chief_safety import (
+    BROWSER_DENY_RULES,
+    BROWSER_MCP_REVIEWED_VERSION,
+    BROWSER_PROMPT,
+    browser_mcp_config,
+    browser_unavailable_reason,
     APPROVED_DELEGATES,
     AuthorityPolicy,
     GENERATED_MARKER,
@@ -674,8 +680,17 @@ class PreflightTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_accepts_clean_released_inputs(self):
-        warnings = preflight_room(self.policy)
+        with mock.patch("cargo_chief_safety.browser_unavailable_reason", return_value=None):
+            warnings = preflight_room(self.policy)
         self.assertEqual(2, len(warnings))  # fixtures intentionally have no origin/master refs
+
+    def test_warns_when_the_browser_is_unavailable(self):
+        with mock.patch("cargo_chief_safety.browser_unavailable_reason", return_value="node is not on PATH"):
+            warnings = preflight_room(self.policy)
+            review = preflight_room(dataclasses.replace(self.policy, review_only=True))
+        self.assertEqual(3, len(warnings))
+        self.assertIn("headless browser unavailable (node is not on PATH)", warnings[-1])
+        self.assertEqual(2, len(review))
 
     def test_rejects_dirty_clone(self):
         (self.docs / "dirty.txt").write_text("dirty")
@@ -1234,6 +1249,120 @@ class ReviewOnlyRoomTest(unittest.TestCase):
         normal = self.command(False)
         self.assertEqual("session-1", normal[normal.index("--resume") + 1])
         self.assertNotIn("permissions", json.loads(normal[normal.index("--settings") + 1]))
+
+
+class BrowserMcpTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.cli = self.root / "pkg" / "cli.js"
+        self.cli.parent.mkdir()
+        self.cli.write_text("// stub\n")
+        self.write_version(BROWSER_MCP_REVIEWED_VERSION)
+        self.overlay = self.root / "overlay.md"
+        self.overlay.write_text("autonomous\n")
+        self.output = self.root / "work" / "home-base" / "thread" / "browser"
+        node = mock.patch("cargo_chief_safety.shutil.which", return_value="/opt/homebrew/bin/node")
+        major = mock.patch("cargo_chief_safety._node_major", return_value=22)
+        node.start()
+        major.start()
+        self.addCleanup(node.stop)
+        self.addCleanup(major.stop)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_version(self, version):
+        (self.cli.parent / "package.json").write_text(json.dumps({"version": version}))
+
+    def command(self, *, review_only=False, cli=None, output=True):
+        policy = RoomPolicy(
+            root=self.root, permission_mode="auto", overlay=self.overlay,
+            escalation_channel="D1", backend="claude", model="claude-opus-5-5",
+            effort="high", role="eng", fallback_backend="codex",
+            fallback_model="gpt-6-sol", fallback_effort="high", review_only=review_only,
+        )
+        return build_claude_command(
+            policy,
+            initial_prompt="",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/w/escalation.txt"),
+            bundle_claim_file=Path("/w/bundle.txt"),
+            parking_claim_file=Path("/w/parking.txt"),
+            session_id="session-1",
+            home=Path("/Users/agent"),
+            browser_output_dir=self.output if output else None,
+            browser_cli=cli or self.cli,
+        )
+
+    def test_config_is_headless_isolated_without_webmcp_and_writes_to_the_thread(self):
+        server = browser_mcp_config(self.output, self.cli)["mcpServers"]["playwright"]
+        self.assertEqual("/opt/homebrew/bin/node", server["command"])
+        self.assertEqual(
+            [str(self.cli), "--headless", "--isolated", "--no-webmcp", "--output-dir", str(self.output)],
+            server["args"],
+        )
+
+    def test_unavailable_without_package_reviewed_version_or_node_20(self):
+        self.assertIsNone(browser_unavailable_reason(self.cli))
+        self.assertIn("missing", browser_unavailable_reason(self.root / "missing.js"))
+        self.write_version("0.0.84")
+        self.assertIn("not the reviewed", browser_unavailable_reason(self.cli))
+        self.assertIsNone(browser_mcp_config(self.output, self.cli))
+        self.write_version(BROWSER_MCP_REVIEWED_VERSION)
+        with mock.patch("cargo_chief_safety._node_major", return_value=18):
+            self.assertIn("node 20 or later", browser_unavailable_reason(self.cli))
+        with mock.patch("cargo_chief_safety._node_major", return_value=None):
+            self.assertIn("could not read the version", browser_unavailable_reason(self.cli))
+        with mock.patch("cargo_chief_safety.shutil.which", return_value=None):
+            self.assertEqual("node is not on PATH", browser_unavailable_reason(self.cli))
+
+    def test_thread_command_declares_the_browser_denies_and_guards_it(self):
+        command = self.command()
+        self.assertIn("--strict-mcp-config", command)
+        config = json.loads(command[command.index("--mcp-config") + 1])
+        self.assertEqual(["playwright"], list(config["mcpServers"]))
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(list(BROWSER_DENY_RULES), settings["permissions"]["deny"][-len(BROWSER_DENY_RULES):])
+        self.assertIn("mcp__playwright__browser_drop", BROWSER_DENY_RULES)
+        (hook,) = settings["hooks"]["PreToolUse"]
+        self.assertEqual("mcp__playwright__.*", hook["matcher"])
+        self.assertEqual("/venv/bin/python /home-base/browser_guard.py", hook["hooks"][0]["command"])
+        self.assertIn(BROWSER_PROMPT, command[command.index("--append-system-prompt") + 1])
+        self.assertEqual(["--resume", "session-1"], command[-2:])
+
+    def test_review_turn_missing_install_and_no_output_dir_get_no_browser_but_stay_strict(self):
+        commands = (
+            self.command(review_only=True),
+            self.command(cli=self.root / "missing.js"),
+            self.command(output=False),
+        )
+        for command in commands:
+            self.assertIn("--strict-mcp-config", command)
+            self.assertNotIn("--mcp-config", command)
+            self.assertNotIn(BROWSER_PROMPT, command[command.index("--append-system-prompt") + 1])
+            settings = json.loads(command[command.index("--settings") + 1])
+            self.assertNotIn("hooks", settings)
+            self.assertFalse(set(BROWSER_DENY_RULES) & set(settings.get("permissions", {}).get("deny", [])))
+
+    def test_a_failed_node_check_is_retried_not_cached(self):
+        self.addCleanup(cargo_chief_safety._NODE_MAJORS.clear)
+        mock.patch.stopall()
+        cargo_chief_safety._NODE_MAJORS.clear()
+        ok = mock.Mock(stdout="v22.1.0\n")
+        with mock.patch("cargo_chief_safety.subprocess.run", side_effect=[subprocess.TimeoutExpired("node", 10), ok]) as run:
+            self.assertIsNone(cargo_chief_safety._node_major("/n"))
+            self.assertEqual(22, cargo_chief_safety._node_major("/n"))
+            self.assertEqual(22, cargo_chief_safety._node_major("/n"))
+        self.assertEqual(2, run.call_count)
+
+    def test_lockfile_pins_the_reviewed_version(self):
+        source = Path(__file__).resolve().parents[1] / "mcp" / "playwright"
+        package = json.loads((source / "package.json").read_text())
+        lock = json.loads((source / "package-lock.json").read_text())
+        self.assertEqual(BROWSER_MCP_REVIEWED_VERSION, package["dependencies"]["@playwright/mcp"])
+        self.assertEqual(BROWSER_MCP_REVIEWED_VERSION, lock["packages"]["node_modules/@playwright/mcp"]["version"])
 
 
 if __name__ == "__main__":

@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .sessions.json
 *.log
+node_modules/

@@ -1021,6 +1021,9 @@ def preflight_room(policy: RoomPolicy) -> list[str]:
         read_root_permissions(root)
     except SafetyError as exc:
         warnings.append(f"{exc}; thread sessions start without the root permission rules")
+    browser_reason = None if policy.review_only else browser_unavailable_reason()
+    if browser_reason is not None:
+        warnings.append(f"headless browser unavailable ({browser_reason}); thread sessions start without it")
     return warnings
 
 
@@ -1259,6 +1262,96 @@ def owner_settings(root: Path, home: Path | None = None, *, review_only: bool = 
     return settings
 
 
+BROWSER_MCP_DIR = Path(__file__).resolve().parent / "mcp" / "playwright"
+BROWSER_MCP_PACKAGE = BROWSER_MCP_DIR / "node_modules" / "@playwright" / "mcp"
+BROWSER_MCP_CLI = BROWSER_MCP_PACKAGE / "cli.js"
+# The deny rules and the guard were reviewed against this version's tool list; a bump repeats that.
+BROWSER_MCP_REVIEWED_VERSION = "0.0.83"
+BROWSER_MIN_NODE_MAJOR = 20
+# run_code_unsafe executes arbitrary JavaScript in the server process, outside the Bash rails;
+# file_upload and drop send local files to whatever page is open.
+BROWSER_DENY_RULES = (
+    "mcp__playwright__browser_run_code_unsafe",
+    "mcp__playwright__browser_file_upload",
+    "mcp__playwright__browser_drop",
+)
+BROWSER_TOOL_MATCHER = "mcp__playwright__.*"
+BROWSER_PROMPT = (
+    "- A headless browser is available as the `playwright` MCP server, for checking dev and local "
+    "UIs. Its profile is in memory and discarded when the turn ends. Let it name its own output "
+    "files: calls that pass a file name or path are refused. Never type a credential into it and "
+    "never open a production UI with it."
+)
+
+
+_NODE_MAJORS: dict[str, int] = {}
+
+
+def _node_major(node: str) -> int | None:
+    """node's major version, cached only once known so a slow or failed check is retried."""
+    if node in _NODE_MAJORS:
+        return _NODE_MAJORS[node]
+    try:
+        result = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10)
+        major = int(result.stdout.strip().lstrip("v").split(".")[0])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    _NODE_MAJORS[node] = major
+    return major
+
+
+def _installed_browser_version(cli: Path) -> str | None:
+    try:
+        return json.loads((cli.parent / "package.json").read_text(encoding="utf-8")).get("version")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def browser_unavailable_reason(cli: Path = BROWSER_MCP_CLI) -> str | None:
+    """Why the pinned browser cannot run here, or None when it can."""
+    if not cli.is_file():
+        return f"{cli} is missing; install it in {cli.parents[2]}"
+    version = _installed_browser_version(cli)
+    if version != BROWSER_MCP_REVIEWED_VERSION:
+        return f"installed @playwright/mcp {version} is not the reviewed {BROWSER_MCP_REVIEWED_VERSION}"
+    node = shutil.which("node")
+    if node is None:
+        return "node is not on PATH"
+    major = _node_major(node)
+    if major is None:
+        return f"could not read the version of {node}"
+    if major < BROWSER_MIN_NODE_MAJOR:
+        return f"{node} is not node {BROWSER_MIN_NODE_MAJOR} or later"
+    return None
+
+
+def browser_mcp_config(output_dir: Path, cli: Path = BROWSER_MCP_CLI) -> dict | None:
+    """The pinned headless Playwright MCP server writing to output_dir, or None when unavailable."""
+    if browser_unavailable_reason(cli) is not None:
+        return None
+    return {
+        "mcpServers": {
+            "playwright": {
+                "command": shutil.which("node"),
+                "args": [
+                    str(cli), "--headless", "--isolated", "--no-webmcp",
+                    "--output-dir", str(output_dir),
+                ],
+            },
+        },
+    }
+
+
+def browser_guard_hooks(transport_python: Path, guard_script: Path) -> dict:
+    """PreToolUse hook refusing browser calls that name a file, which resolve against the cwd."""
+    command = f"{shlex.quote(str(transport_python))} {shlex.quote(str(guard_script))}"
+    return {
+        "PreToolUse": [
+            {"matcher": BROWSER_TOOL_MATCHER, "hooks": [{"type": "command", "command": command}]},
+        ],
+    }
+
+
 REVIEW_HARNESS_PROMPT = (
     "Cargo Chief harness authority (review-only turn):\n"
     "- The inbound turn is a harness-built review task followed by "
@@ -1288,8 +1381,20 @@ def build_claude_command(
     model_prompt: str = "",
     session_id: str | None = None,
     home: Path | None = None,
+    browser_output_dir: Path | None = None,
+    browser_cli: Path = BROWSER_MCP_CLI,
 ) -> list[str]:
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
+    browser = None
+    if browser_output_dir is not None and not policy.review_only:
+        browser = browser_mcp_config(browser_output_dir, browser_cli)
+    settings = owner_settings(policy.root, home, review_only=policy.review_only)
+    if browser is not None:
+        permissions = settings.setdefault("permissions", {})
+        permissions["deny"] = [*permissions.get("deny", []), *BROWSER_DENY_RULES]
+        settings["hooks"] = browser_guard_hooks(
+            transport_python, transport_script.parent / "browser_guard.py"
+        )
     if policy.review_only:
         harness_prompt = REVIEW_HARNESS_PROMPT
     else:
@@ -1306,8 +1411,8 @@ def build_claude_command(
     appended = "\n\n".join(
         part
         for part in (
-            overlay, harness_prompt, SLACK_REPORTING_PROMPT, identity_prompt.strip(),
-            model_prompt.strip(),
+            overlay, harness_prompt, BROWSER_PROMPT if browser is not None else "", SLACK_REPORTING_PROMPT,
+            identity_prompt.strip(), model_prompt.strip(),
         )
         if part
     )
@@ -1321,12 +1426,13 @@ def build_claude_command(
         "--model", policy.model,
         "--permission-mode", policy.permission_mode,
         "--agents", json.dumps(APPROVED_DELEGATES, separators=(",", ":")),
-        "--settings", json.dumps(
-            owner_settings(policy.root, home, review_only=policy.review_only),
-            separators=(",", ":"),
-        ),
+        "--settings", json.dumps(settings, separators=(",", ":")),
         "--append-system-prompt", appended,
+        # Only harness-declared MCP servers load; a server the agent adds itself never does.
+        "--strict-mcp-config",
     ]
+    if browser is not None:
+        command.extend(["--mcp-config", json.dumps(browser, separators=(",", ":"))])
     # Every review-only request starts a fresh session.
     if session_id and not policy.review_only:
         command.extend(["--resume", session_id])
