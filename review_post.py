@@ -146,12 +146,13 @@ def has_answered(thread: Mapping, login: str) -> bool:
 
 
 # GitHub's answer when a token may not resolve; anything else (5xx, rate limit) stays a failure.
-_REFUSAL_MARKERS = ("resource not accessible", "forbidden", "must have", "permission")
+_REFUSAL_MARKERS = ("resource not accessible", "does not have permission", "forbidden")
+_RETRYABLE_MARKERS = ("rate limit", "abuse", "try again")
 
 
 def _refused(exc: Exception) -> bool:
     text = str(exc).lower()
-    return any(marker in text for marker in _REFUSAL_MARKERS)
+    return any(m in text for m in _REFUSAL_MARKERS) and not any(m in text for m in _RETRYABLE_MARKERS)
 
 
 def _reason(exc: Exception) -> str:
@@ -246,7 +247,7 @@ class ThreadWork(NamedTuple):
     replied: int
     resolved: int
     failed: list[str]
-    refused: list[str]  # resolves refused for lack of permission; the caller decides if settled
+    refused: list[tuple[str, str]]  # (thread id, GitHub's text) for resolves refused for lack of permission
 
 
 def _thread_work(
@@ -273,22 +274,31 @@ def _thread_work(
             resolved += 1
         except Exception as exc:
             if _refused(exc):
-                refused.append(thread_id)
+                refused.append((thread_id, _reason(exc)))
             else:
                 failed.append(f"resolve {thread_id}: {_reason(exc)}")
     return ThreadWork(replied, resolved, failed, refused)
 
 
 def _settle_refused(
-    github: GitHub, owner: str, repo: str, number: int, login: str, refused: list[str],
+    github: GitHub, owner: str, repo: str, number: int, login: str, work: ThreadWork,
 ) -> tuple[list[str], list[str]]:
-    """Refused resolves, read fresh: threads this agent has answered, and failures for the rest."""
-    if not refused:
+    """Refused resolves, read fresh: (threads this agent has answered, failures for the rest)."""
+    if not work.refused:
         return [], []
-    fresh = {thread["id"]: thread for thread in own_threads(github, owner, repo, number, login)}
-    answered = [tid for tid in refused if tid in fresh and has_answered(fresh[tid], login)]
-    unanswered = [f"resolve {tid}: refused, and your reply is not the thread's latest comment"
-                  for tid in refused if tid not in answered]
+    try:
+        fresh = {thread["id"]: thread for thread in own_threads(github, owner, repo, number, login)}
+    except Exception as exc:
+        raise ReviewPostError(
+            f"could not re-read the threads after posting {work.replied} replies (they are posted; "
+            f"do not post them again): {_reason(exc)}"
+        ) from exc
+    answered, unanswered = [], []
+    for tid, reason in work.refused:
+        if tid in fresh and has_answered(fresh[tid], login):
+            answered.append(tid)
+        else:
+            unanswered.append(f"resolve {tid}: {reason}; your reply is not the thread's latest comment")
     return answered, unanswered
 
 
@@ -335,7 +345,7 @@ def submit(
     if verdict == "approve":
         # The approval lands only after every reply and resolve it depends on has.
         work = _thread_work(github, replies, resolve_ids, mine)
-        left, unanswered = _settle_refused(github, owner, repo, number, login, work.refused)
+        left, unanswered = _settle_refused(github, owner, repo, number, login, work)
         failed = [*work.failed, *unanswered]
         if failed:
             raise ReviewPostError(f"approval not posted: {', '.join(failed)}")
@@ -349,7 +359,11 @@ def submit(
         result = github.submit(owner, repo, number, review)
         # The review is posted; from here a failure is reported, never raised as a refusal.
         work = _thread_work(github, replies, resolve_ids, mine)
-        left, failed = [], [*work.failed, *(f"resolve {tid}: refused" for tid in work.refused)]
+        try:
+            left, unanswered = _settle_refused(github, owner, repo, number, login, work)
+        except ReviewPostError as exc:
+            left, unanswered = [], [str(exc)]
+        failed = [*work.failed, *unanswered]
     message = (
         f"{review['event']} review posted for pass {pass_no} ({mode}): "
         f"{(result or {}).get('html_url', '')} ({work.replied} replies, resolved {work.resolved} threads)"
@@ -357,13 +371,16 @@ def submit(
     if failed:
         message += f"; failed: {', '.join(failed)}"
     if left:
-        message += f"; answered but GitHub refused the resolve, so the author must resolve: {', '.join(left)}"
+        reasons = dict(work.refused)
+        message += ("; answered but GitHub refused the resolve, so the author must resolve: "
+                    + ", ".join(f"{tid} ({reasons[tid]})" for tid in left))
     return message
 
 
 def _left_note(left: list[str], mine: Mapping[str, Mapping]) -> str:
     """The note an approval carries for threads it answered but could not resolve."""
-    where = [f"`{mine[tid].get('path')}:{mine[tid].get('line')}`" for tid in left]
+    where = [f"`{mine[tid].get('path')}" + (f":{mine[tid]['line']}`" if mine[tid].get("line") else "` (outdated)")
+             for tid in left]
     return (f"{len(left)} of my threads are settled but GitHub would not let this review resolve them; "
             f"please resolve: {', '.join(where)}.")
 

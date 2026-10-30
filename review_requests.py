@@ -422,10 +422,10 @@ _THREAD_WORK = (
     "author declined it with a reason, reply saying whether you accept the reason, and resolve it "
     "only if you do. Put those replies in review.json's `replies` "
     "([{\"thread_id\": <id>, \"body\": <text>}]) and pass `--resolve <id>` for each thread you resolve. "
-    "A thread listed as `answered` already has your reply as its latest comment: pass its "
-    "`--resolve` without replying again. If GitHub refuses a resolve on a thread whose latest "
-    "comment is your reply, the thread still counts as settled and the approval asks the author "
-    "to resolve it; say so in your summary."
+    "A thread listed as `answered` ends with your own reply: if that reply accepted the fix or "
+    "the reason, pass its `--resolve` without replying again; if it disputed them, the thread is "
+    "not settled, so do not resolve it. If GitHub refuses a resolve on a thread you accept, it "
+    "still counts as settled and an approval asks the author to resolve it; say so in your summary."
 )
 
 

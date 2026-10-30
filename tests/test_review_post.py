@@ -51,7 +51,8 @@ def thread(tid, login="lisa-cargochief", typename="Bot", resolved=False, body="f
 
 class FakeGitHub:
     def __init__(self, pull=None, threads=(), heads=None, fail_resolve=(), fail_submit=False,
-                 compare="ahead", reply_error=None, refuse_resolve=(), interject=()):
+                 compare="ahead", reply_error=None, refuse_resolve=(), interject=(), resolve_error=None,
+                 threads_error_after=None):
         self.compare = compare
         self.reply_error = reply_error
         self._pull = {**OPEN, **(pull or {})}
@@ -60,6 +61,8 @@ class FakeGitHub:
         self.fail_resolve = set(fail_resolve)
         self.refuse_resolve = set(refuse_resolve)
         self.interject = set(interject)
+        self.resolve_error = resolve_error
+        self.threads_error_after = threads_error_after
         self.fail_submit = fail_submit
         self.calls = []
 
@@ -70,6 +73,8 @@ class FakeGitHub:
 
     def threads(self, owner, repo, number):
         self.calls.append(("threads",))
+        if self.threads_error_after is not None and self.calls.count(("threads",)) > self.threads_error_after:
+            raise ReviewPostError("gh api graphql failed: HTTP 502")
         return self._threads
 
     def compare_status(self, owner, repo, base, head):
@@ -98,6 +103,8 @@ class FakeGitHub:
             self._comment(thread_id, AUTHOR)
         if thread_id in self.refuse_resolve:
             raise ReviewPostError("gh api graphql failed: Resource not accessible by integration")
+        if self.resolve_error:
+            raise self.resolve_error
 
     def submit(self, owner, repo, number, review):
         self.calls.append(("submit", review["event"]))
@@ -363,18 +370,18 @@ class RefusedResolveTest(unittest.TestCase):
 
     def test_a_bare_finding_is_not_an_answer(self):
         github = FakeGitHub(threads=[thread("T1")], refuse_resolve={"T1"})
-        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: refused"):
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: Resource not accessible by integration; your reply is not"):
             submit(github, PR, payload(), "approve", ["T1"], ENV)
         self.assertNotIn("submit", github.names())
 
     def test_a_refused_resolve_blocks_when_the_author_spoke_last(self):
         github = FakeGitHub(threads=[thread("T1", replies=[SELF, AUTHOR])], refuse_resolve={"T1"})
-        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: refused"):
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: Resource not accessible by integration; your reply is not"):
             submit(github, PR, payload(), "approve", ["T1"], ENV)
 
     def test_an_author_reply_during_posting_is_seen(self):
         github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR, SELF])], refuse_resolve={"T1"}, interject={"T1"})
-        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: refused"):
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: Resource not accessible by integration; your reply is not"):
             submit(github, PR, payload(), "approve", ["T1"], ENV)
 
     def test_a_failure_that_is_not_a_refusal_still_blocks(self):
@@ -386,7 +393,27 @@ class RefusedResolveTest(unittest.TestCase):
         github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR])], refuse_resolve={"T1"})
         body = {**payload(), "replies": [{"thread_id": "T1", "body": "Accepted."}]}
         out = submit(github, PR, body, "comment", ["T1"], ENV)
-        self.assertIn("(1 replies, resolved 0 threads); failed: resolve T1: refused", out)
+        self.assertIn("(1 replies, resolved 0 threads); answered but GitHub refused the resolve, so the author "
+                      "must resolve: T1 (Resource not accessible by integration)", out)
+
+    def test_a_rate_limit_403_is_not_a_refusal(self):
+        error = ReviewPostError("gh api graphql failed: HTTP 403: Forbidden, you have exceeded a secondary rate limit")
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR, SELF])], resolve_error=error)
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: HTTP 403"):
+            submit(github, PR, payload(), "approve", ["T1"], ENV)
+
+    def test_a_failed_reread_says_the_replies_are_posted(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR])], refuse_resolve={"T1"}, threads_error_after=1)
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed."}]}
+        with self.assertRaisesRegex(ReviewPostError, "after posting 1 replies .*do not post them again"):
+            submit(github, PR, body, "approve", ["T1"], ENV)
+        self.assertNotIn("submit", github.names())
+
+    def test_the_note_names_an_outdated_thread_without_a_line(self):
+        outdated = {**thread("T1", replies=[AUTHOR, SELF]), "line": None}
+        github = FakeGitHub(threads=[outdated], refuse_resolve={"T1"})
+        submit(github, PR, payload(), "approve", ["T1"], ENV)
+        self.assertIn("please resolve: `a.py` (outdated).", github.submitted["body"])
 
     def test_every_reply_is_counted(self):
         github = FakeGitHub(threads=[thread("T1")])
