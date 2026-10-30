@@ -60,6 +60,8 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   - the Codex runner's discard on a stopped, failed or withheld turn;
   - the `handoff_from` bypasses in `process_message_async`;
   - the prompt text in `cargo_chief_safety.handoff_prompt`, which names the `handoff_from_thread`
-    envelope field.
+    envelope field and the claim's optional `bundle`;
+  - the bundle move (`check_bundle_handoff` in `_take_handoff`, `transfer_bundle` in
+    `_start_handoff`), the ticket check in `consume_bundle_claim`, and `THREAD_DENY_RULES`.
 
   Change them together.

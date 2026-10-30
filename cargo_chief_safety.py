@@ -548,12 +548,86 @@ def resolve_thread_bundle(workspace: ThreadWorkspace) -> Path | None:
         return None
 
 
+TICKET_KEY = re.compile(r"\bCN-\d+\b")
+
+
+def ticket_keys(text: str) -> frozenset[str]:
+    """The CN ticket keys a message names."""
+    return frozenset(TICKET_KEY.findall(text or ""))
+
+
+def _bound_bundles(workspace: ThreadWorkspace) -> dict[str, str]:
+    """Every thread workspace key with a valid bound bundle, mapped to that bundle's name."""
+    bound: dict[str, str] = {}
+    for state_file in _thread_work_root(workspace.root).glob("*/state.json"):
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            other_bundle = state.get("bundle")
+            other_key = state_file.parent.name
+            other_workspace = ThreadWorkspace(
+                key=other_key,
+                root=workspace.root,
+                path=state_file.parent,
+                state_file=state_file,
+                escalation_message_file=state_file.parent / "private-escalation.txt",
+                escalation_receipt_file=state_file.parent / "private-escalation.receipt",
+                escalation_attempt_file=state_file.parent / "private-escalation.attempt",
+                bundle_claim_file=state_file.parent / "bundle-claim.txt",
+                parking_claim_file=state_file.parent / "parking-claim.txt",
+                handoff_claim_file=state_file.parent / HANDOFF_CLAIM_NAME,
+                delegation_request_file=state_file.parent / "delegation-request.json",
+                implementation_claim_file=state_file.parent / "implementation-claim.txt",
+                delegation_budget_file=state_file.parent / "delegation-budget.json",
+                delegate_pid_file=state_file.parent / "delegate.pid",
+                delegate_verification_file=state_file.parent / "delegate-verification.json",
+            )
+            _validated_bundle_path(other_workspace, other_bundle)
+        except (OSError, json.JSONDecodeError, SafetyError):
+            continue
+        bound[other_key] = str(other_bundle)
+    return bound
+
+
+def _bundle_ticket(bundle: str) -> str:
+    return "-".join(bundle.split("-", 2)[:2])
+
+
+def _check_bundle_binding(
+    workspace: ThreadWorkspace, bundle: str, *, max_live_bundles: int, releasing: str | None = None,
+) -> Path:
+    """Validate binding bundle to workspace; releasing is a thread that gives it up in the same step."""
+    candidate = _validated_bundle_path(workspace, bundle)
+    bound = _bound_bundles(workspace)
+    others = {key: name for key, name in bound.items() if key not in (workspace.key, releasing)}
+    if bundle in others.values():
+        raise SafetyError("claimed worktree bundle is already bound to another thread")
+    live = set(others.values())
+    if bound.get(workspace.key) != bundle and bundle not in bound.values() and len(live) >= max_live_bundles:
+        raise SafetyError("live worktree bundle cap reached")
+    return candidate
+
+
+def _write_bundle(workspace: ThreadWorkspace, bundle: str | None) -> None:
+    state = json.loads(workspace.state_file.read_text(encoding="utf-8"))
+    if bundle is None:
+        state.pop("bundle", None)
+    else:
+        state["bundle"] = bundle
+    state["updated_at"] = time.time()
+    write_private_json(workspace.state_file, state)
+
+
 def consume_bundle_claim(
     workspace: ThreadWorkspace,
     *,
     max_live_bundles: int,
+    thread_tickets: frozenset[str] = frozenset(),
 ) -> Path | None:
-    """Validate and persist a one-shot bundle claim for this Slack thread."""
+    """Validate and persist a one-shot bundle claim for this Slack thread.
+
+    thread_tickets are the ticket keys the thread's opening message names; a bundle for any other
+    ticket belongs in its own thread.
+    """
     claim = workspace.bundle_claim_file
     if not claim.exists():
         return None
@@ -563,53 +637,38 @@ def consume_bundle_claim(
         bundle = claim.read_text(encoding="utf-8").strip()
         if "\n" in bundle:
             raise SafetyError("bundle claim must contain exactly one bundle name")
-        candidate = _validated_bundle_path(workspace, bundle)
-
-        active: dict[str, str] = {}
-        for state_file in _thread_work_root(workspace.root).glob("*/state.json"):
-            try:
-                state = json.loads(state_file.read_text(encoding="utf-8"))
-                other_bundle = state.get("bundle")
-                other_key = state_file.parent.name
-                other_workspace = ThreadWorkspace(
-                    key=other_key,
-                    root=workspace.root,
-                    path=state_file.parent,
-                    state_file=state_file,
-                    escalation_message_file=state_file.parent / "private-escalation.txt",
-                    escalation_receipt_file=state_file.parent / "private-escalation.receipt",
-                    escalation_attempt_file=state_file.parent / "private-escalation.attempt",
-                    bundle_claim_file=state_file.parent / "bundle-claim.txt",
-                    parking_claim_file=state_file.parent / "parking-claim.txt",
-                    handoff_claim_file=state_file.parent / HANDOFF_CLAIM_NAME,
-                    delegation_request_file=state_file.parent / "delegation-request.json",
-                    implementation_claim_file=state_file.parent / "implementation-claim.txt",
-                    delegation_budget_file=state_file.parent / "delegation-budget.json",
-                    delegate_pid_file=state_file.parent / "delegate.pid",
-                    delegate_verification_file=state_file.parent / "delegate-verification.json",
-                )
-                _validated_bundle_path(other_workspace, other_bundle)
-            except (OSError, json.JSONDecodeError, SafetyError):
-                continue
-            if other_key != workspace.key:
-                active[other_key] = str(other_bundle)
-
-        if bundle in active.values():
-            raise SafetyError("claimed worktree bundle is already bound to another thread")
-        current = resolve_thread_bundle(workspace)
-        if current != candidate and len(set(active.values())) >= max_live_bundles:
-            raise SafetyError("live worktree bundle cap reached")
-
-        state = json.loads(workspace.state_file.read_text(encoding="utf-8"))
-        state["bundle"] = bundle
-        state["updated_at"] = time.time()
-        write_private_json(workspace.state_file, state)
+        candidate = _check_bundle_binding(workspace, bundle, max_live_bundles=max_live_bundles)
+        ticket = _bundle_ticket(bundle)
+        if thread_tickets and ticket not in thread_tickets:
+            raise SafetyError(
+                f"this thread was opened for {', '.join(sorted(thread_tickets))}, not {ticket}; "
+                f"hand {ticket} off to its own thread and name {bundle} in the handoff claim"
+            )
+        _write_bundle(workspace, bundle)
         return candidate
     finally:
         try:
             claim.unlink()
         except FileNotFoundError:
             pass
+
+
+def check_bundle_handoff(source: ThreadWorkspace, bundle: str, *, max_live_bundles: int) -> None:
+    """Refuse a handoff whose bundle is bound to a thread other than the one handing it off."""
+    _check_bundle_binding(source, bundle, max_live_bundles=max_live_bundles)
+
+
+def transfer_bundle(
+    source: ThreadWorkspace, target: ThreadWorkspace, bundle: str, *, max_live_bundles: int,
+) -> Path:
+    """Bind bundle to the handoff's new thread and release it from the thread that handed it off."""
+    candidate = _check_bundle_binding(
+        target, bundle, max_live_bundles=max_live_bundles, releasing=source.key,
+    )
+    _write_bundle(target, bundle)
+    if resolve_thread_bundle(source) == candidate:
+        _write_bundle(source, None)
+    return candidate
 
 
 def _read_parking_target(path: Path) -> str:
@@ -1075,6 +1134,8 @@ REVIEW_PASS_ENV = "CARGO_CHIEF_REVIEW_PASS"
 REVIEW_BASE_ENV = "CARGO_CHIEF_REVIEW_BASE"
 REVIEW_TOKEN_PERMISSIONS = {"contents": "read", "pull_requests": "write"}
 REVIEW_STRIPPED_ENV_KEYS = ("CC_AWS_PROFILE",)
+# A thread opens another thread only through the handoff claim, which starts its session and moves its bundle.
+THREAD_DENY_RULES = ("Bash(*bot.py*--send*)",)
 REVIEW_ONLY_DENY_RULES = (
     "Bash(*git push*)",
     "Bash(*gh pr merge*)",
@@ -1254,6 +1315,8 @@ def owner_settings(root: Path, home: Path | None = None, *, review_only: bool = 
         permissions["deny"] = [
             *permissions.get("deny", []), *REVIEW_ONLY_DENY_RULES, *review_only_write_denies(root),
         ]
+    else:
+        permissions["deny"] = [*permissions.get("deny", []), *THREAD_DENY_RULES]
     if permissions:
         settings["permissions"] = permissions
     return settings
@@ -1373,7 +1436,9 @@ def handoff_prompt(handoff_claim_file: Path) -> str:
     return (
         "\n- One Slack thread holds one ticket or topic, so sessions stay short. When a message "
         "asks for a different ticket or topic than this thread's, do not start it here; hand it "
-        f"off. Write JSON {{\"title\": ..., \"brief\": ...}} to {handoff_claim_file}: the title is "
+        f"off. Write JSON {{\"title\": ..., \"brief\": ...}} to {handoff_claim_file}, adding "
+        "\"bundle\": \"CN-####-slug\" when you already created that work's worktree bundle so the "
+        "harness moves it to the new thread. The title is "
         "one line naming the ticket (\"CN-1234 short description\"); the brief is everything a "
         "fresh session needs, because it will not see this thread: the request, where the work "
         "stands, and the paths of any TASK.md, plan, branch or PR. The title and brief are posted "
@@ -1384,7 +1449,10 @@ def handoff_prompt(handoff_claim_file: Path) -> str:
         "in this room, links it here, and starts a fresh session there with your brief. One "
         "handoff per turn. The harness refuses a handoff from a stopped, failed or forwarded turn, "
         "a turn more than one person wrote into, or a thread whose delegation budget is exhausted "
-        "or awaiting verification. A quick question you can answer in a reply needs no thread.\n"
+        "or awaiting verification. A quick question you can answer in a reply needs no thread. "
+        "Never open a thread for new work yourself (bot.py --send or a top-level post): it starts no "
+        "session and strands the bundle. A thread whose opening message names a ticket refuses a "
+        "bundle for any other ticket.\n"
         "- A turn whose envelope has handoff_from_thread was started by your own handoff, not by "
         "a new message: its untrusted_message is the brief you wrote, not the requester's words. "
         "The requester's operator authority covers routine work, but the turn never satisfies an "

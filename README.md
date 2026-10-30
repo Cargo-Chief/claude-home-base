@@ -81,12 +81,14 @@ takes only the URL, checks that the PR is open and authored by this agent's own 
 A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (twice `max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
 
 One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
-writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. The
+writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn,
+adding `"bundle": "CN-####-slug"` when it already created that work's worktree bundle. The
 harness takes the claim before the turn releases its lock, so the next turn in the thread can
 neither discard nor supply it. Once the turn has completed, the harness:
 1. opens a new top-level thread in the same room, with the title and brief as Slack-escaped text;
-2. starts a fresh session there with the brief as its first turn;
-3. links the new thread from the source thread.
+2. moves the named bundle's mapping to the new thread, releasing it from the source thread;
+3. starts a fresh session there with the brief as its first turn;
+4. links the new thread from the source thread.
 
 The new turn runs as the person whose message started the source turn, re-checked against the
 allowlist. Its envelope carries `handoff_from_thread` and never `named_approver`, so it can do
@@ -99,7 +101,11 @@ The harness refuses a claim from:
 - a Codex turn that escalated or whose delegate result was withheld;
 - a forwarded reply;
 - a turn more than one person wrote into;
-- a thread whose delegation budget is exhausted or awaiting verification.
+- a thread whose delegation budget is exhausted or awaiting verification;
+- a claim naming a bundle that another thread owns.
+
+Thread turns are denied `bot.py --send` (`THREAD_DENY_RULES`): a thread opened that way starts no
+session and strands the bundle in the source thread.
 
 The claim is read through one no-follow descriptor, capped at 16 KiB. Audit lines:
 `THREAD_HANDOFF` (opened), `HANDOFF_REFUSED`, and `HANDOFF_FAILED` (Slack refused the new thread).
@@ -287,7 +293,10 @@ never be marked mutating.
 When a thread creates a standard `worktrees/CN-####-slug/` bundle, it can claim that bundle through
 its private one-shot claim file. Home-base accepts only a direct, non-symlinked child of
 `$CARGO_CHIEF_ROOT/worktrees/` with a regular `TASK.md`, refuses a bundle already owned by another
-thread, and caps live mappings at `MAX_LIVE_BUNDLES` (default 3, maximum 5). The mapping lives in
+thread, refuses a `CN-####` bundle in a thread whose opening message names other tickets but not
+that one (so new ticket work is handed off rather than started in place; an opening message with no
+ticket key, or one Slack cannot return, does not restrict it), and caps live mappings at
+`MAX_LIVE_BUNDLES` (default 3, maximum 5). The mapping lives in
 the thread's private state and survives daemon/session restart; a resumed process starts in the
 validated bundle. A removed or invalid bundle safely falls back to the thread scratch directory.
 

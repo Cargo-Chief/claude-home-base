@@ -12,6 +12,11 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import thread_handoff
 from cargo_chief_safety import (
     HANDOFF_CLAIM_NAME,
+    check_bundle_handoff,
+    consume_bundle_claim,
+    resolve_thread_bundle,
+    ticket_keys,
+    transfer_bundle,
     AuthorityPolicy,
     SafetyError,
     ThreadWorkspace,
@@ -54,6 +59,17 @@ class ClaimTest(unittest.TestCase):
 
     def write(self, data):
         self.claim.write_text(json.dumps(data) if not isinstance(data, str) else data, encoding="utf-8")
+
+    def test_a_claim_may_name_a_well_formed_bundle(self):
+        self.write({"title": "CN-9546 rotate", "brief": "b", "bundle": "CN-9546-rotate-key"})
+        self.assertEqual(HandoffRequest("CN-9546 rotate", "b", "CN-9546-rotate-key"), consume_handoff_claim(self.claim))
+        for bundle in ("../escape", "CN-9546", 7, "cn-1-x"):
+            self.write({"title": "t", "brief": "b", "bundle": bundle})
+            with self.assertRaisesRegex(SafetyError, "handoff bundle"):
+                read_handoff_claim(self.claim)
+        self.write({"title": "t", "brief": "b", "extra": "x"})
+        with self.assertRaisesRegex(SafetyError, "optional"):
+            read_handoff_claim(self.claim)
 
     def test_a_valid_claim_is_read_trimmed_and_consumed(self):
         self.write({"title": "  CN-1234 rotate keys ", "brief": " do the thing \n"})
@@ -338,6 +354,103 @@ class StartHandoffTest(unittest.TestCase):
         self.start()
         self.assertEqual(1, len(FakeThread.started))
         self.assertTrue(self.audit.lines[0].startswith("THREAD_HANDOFF"))
+
+
+class FakeReplies:
+    def __init__(self, text=None, fail=False):
+        self.text, self.fail = text, fail
+
+    def conversations_replies(self, channel, ts, limit):
+        if self.fail:
+            raise ConnectionError("slack refused")
+        return {"messages": [] if self.text is None else [{"text": self.text}]}
+
+
+class ThreadTicketKeysTest(unittest.TestCase):
+    def keys(self, slack):
+        namespace = _compile(("_thread_ticket_keys",), {
+            "slack_client": slack, "ticket_keys": ticket_keys,
+            "logger": logging.getLogger("test-ticket-keys"),
+        })
+        return namespace["_thread_ticket_keys"]("C1", "1.0")
+
+    def test_reads_the_opening_message_and_fails_open(self):
+        self.assertEqual(frozenset({"CN-9532"}), self.keys(FakeReplies("*CN-9532 — confirm endpoint*")))
+        self.assertEqual(frozenset(), self.keys(FakeReplies(None)))
+        self.assertEqual(frozenset(), self.keys(FakeReplies(fail=True)))
+
+
+class HandoffBundleTest(unittest.TestCase):
+    def setUp(self):
+        FakeThread.started = []
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        bundle = self.root / "worktrees" / "CN-2-next"
+        bundle.mkdir(parents=True)
+        (bundle / "TASK.md").write_text("task\n")
+        self.source = prepare_thread_workspace(self.root, channel="C1", thread="1.0")
+        self.source.bundle_claim_file.write_text("CN-2-next")
+        consume_bundle_claim(self.source, max_live_bundles=3)
+        self.slack = FakeSlack()
+        self.audit = RecordingLog()
+        audit_logger = logging.getLogger("test-handoff-bundle")
+        audit_logger.addHandler(self.audit)
+        audit_logger.propagate = False
+        audit_logger.setLevel(logging.INFO)
+        self.namespace = _compile(("_delegation_blocked", "_take_handoff", "_thread_link", "_move_handoff_bundle", "_start_handoff"), {
+            "ThreadWorkspace": ThreadWorkspace,
+            "HandoffRequest": HandoffRequest,
+            "SafetyError": SafetyError,
+            "DelegationError": DelegationError,
+            "budget_status": budget_status,
+            "delegation_verification_status": delegation_verification_status,
+            "consume_handoff_claim": consume_handoff_claim,
+            "handoff_refusal": handoff_refusal,
+            "check_bundle_handoff": check_bundle_handoff,
+            "transfer_bundle": transfer_bundle,
+            "prepare_thread_workspace": prepare_thread_workspace,
+            "RUNTIME_POLICY": type("RuntimePolicy", (), {"max_live_bundles": 3}),
+            "audit_logger": audit_logger,
+            "logger": logging.getLogger("test-handoff-bundle-log"),
+            "slack_client": self.slack,
+            "threading": type("threading", (), {"Thread": FakeThread}),
+            "process_message_async": "process_message_async",
+            "new_thread_text": new_thread_text,
+            "source_thread_text": source_thread_text,
+            "handoff_turn_message": thread_handoff.handoff_turn_message,
+        })
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_bundle_moves_to_the_new_thread_before_its_session_starts(self):
+        request = HandoffRequest("CN-2 next", "b", "CN-2-next")
+        bound_at_start = []
+        original_start = FakeThread.start
+        FakeThread.start = lambda thread: bound_at_start.append(
+            resolve_thread_bundle(prepare_thread_workspace(self.root, channel="C1", thread="9.0"))
+        )
+        try:
+            self.namespace["_start_handoff"](
+                request, user_id="U1", channel="C1", channel_type="im", source_thread="1.0",
+                source_workspace=self.source,
+            )
+        finally:
+            FakeThread.start = original_start
+        self.assertEqual([(self.root / "worktrees" / "CN-2-next").resolve()], bound_at_start)
+        self.assertIsNone(resolve_thread_bundle(self.source))
+        self.assertTrue(any(line.startswith("BUNDLE_BOUND") and "VIA:handoff" in line for line in self.audit.lines))
+
+    def test_a_claim_naming_a_bundle_bound_elsewhere_is_refused_before_anything_posts(self):
+        other = prepare_thread_workspace(self.root, channel="C1", thread="2.0")
+        other.handoff_claim_file.write_text(json.dumps({"title": "CN-2 next", "brief": "b", "bundle": "CN-2-next"}))
+        taken = self.namespace["_take_handoff"](
+            other, user_id="U1", channel="C1", thread_ts="2.0", review=False, from_handoff=False,
+        )
+        self.assertIsNone(taken)
+        ((thread, text),) = self.slack.posts
+        self.assertEqual("2.0", thread)
+        self.assertIn("already bound to another thread", text)
 
 
 class WiringTest(unittest.TestCase):

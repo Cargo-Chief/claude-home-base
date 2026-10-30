@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import unicodedata
 from dataclasses import dataclass
@@ -14,12 +15,14 @@ from cargo_chief_safety import SafetyError
 MAX_CLAIM_BYTES = 16384
 MAX_TITLE_CHARS = 120
 MAX_BRIEF_CHARS = 6000
+BUNDLE_NAME = re.compile(r"CN-\d+-[a-z0-9][a-z0-9-]*")
 
 
 @dataclass(frozen=True)
 class HandoffRequest:
     title: str
     brief: str
+    bundle: str | None = None
 
 
 def _read_claim_bytes(claim: Path) -> bytes:
@@ -45,8 +48,8 @@ def read_handoff_claim(claim: Path) -> HandoffRequest:
         data = json.loads(_read_claim_bytes(claim).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SafetyError("handoff claim must be a JSON object") from exc
-    if not isinstance(data, dict) or set(data) != {"title", "brief"}:
-        raise SafetyError('handoff claim must be exactly {"title": ..., "brief": ...}')
+    if not isinstance(data, dict) or set(data) not in ({"title", "brief"}, {"title", "brief", "bundle"}):
+        raise SafetyError('handoff claim must be {"title": ..., "brief": ...} with an optional "bundle"')
     title, brief = data["title"], data["brief"]
     if not isinstance(title, str) or not isinstance(brief, str):
         raise SafetyError("handoff title and brief must be strings")
@@ -56,7 +59,10 @@ def read_handoff_claim(claim: Path) -> HandoffRequest:
         raise SafetyError(f"handoff title must be one line of 1-{MAX_TITLE_CHARS} characters")
     if not brief or len(brief) > MAX_BRIEF_CHARS:
         raise SafetyError(f"handoff brief must be 1-{MAX_BRIEF_CHARS} characters")
-    return HandoffRequest(title=title, brief=brief)
+    bundle = data.get("bundle")
+    if bundle is not None and (not isinstance(bundle, str) or not BUNDLE_NAME.fullmatch(bundle)):
+        raise SafetyError("handoff bundle must be a CN-####-lowercase-slug worktree bundle name")
+    return HandoffRequest(title=title, brief=brief, bundle=bundle)
 
 
 def consume_handoff_claim(claim: Path) -> HandoffRequest | None:

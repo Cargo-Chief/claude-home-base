@@ -55,6 +55,7 @@ from cargo_chief_safety import (
     channel_message_action,
     claude_owner_env,
     cleanup_thread_workspaces,
+    check_bundle_handoff,
     consume_bundle_claim,
     consume_parking_claim,
     find_workspace_root,
@@ -70,6 +71,8 @@ from cargo_chief_safety import (
     review_turn_env,
     room_channel_ids,
     prepare_thread_workspace,
+    ticket_keys,
+    transfer_bundle,
     private_escalation_status,
     resolve_thread_bundle,
     ThreadWorkspace,
@@ -1352,6 +1355,7 @@ def _reader_loop(session: LiveSession) -> None:
                         bundle = consume_bundle_claim(
                             session.workspace,
                             max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+                            thread_tickets=_thread_ticket_keys(session.channel, session.thread_ts),
                         )
                     except SafetyError as exc:
                         audit_logger.warning(
@@ -2231,7 +2235,9 @@ def _run_openai_fallback(
     if workspace.bundle_claim_file.exists():
         try:
             claimed = consume_bundle_claim(
-                workspace, max_live_bundles=RUNTIME_POLICY.max_live_bundles
+                workspace,
+                max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+                thread_tickets=_thread_ticket_keys(channel, thread_ts),
             )
         except SafetyError as exc:
             audit_logger.warning(
@@ -2638,6 +2644,7 @@ def process_message_async(
     turn_admitted = False
     session = None
     handoff_request = None
+    handoff_source = None
 
     try:
         if use_openai:
@@ -2656,6 +2663,7 @@ def process_message_async(
                     fallback_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
                     review=review, from_handoff=bool(handoff_from), forwarded=bool(forward),
                 )
+                handoff_source = fallback_workspace
             session = None
         else:
             # Preserve same-thread steering while a turn is active. A request for
@@ -2833,6 +2841,7 @@ def process_message_async(
                         review=review, from_handoff=bool(handoff_from), forwarded=bool(forward),
                         stopped=stopped, senders=len(session.turn_senders),
                     )
+                    handoff_source = handoff_workspace
 
     except _ReviewBusy:
         _clear_eyes(reaction_channel, reaction_msg_ts)
@@ -2876,7 +2885,7 @@ def process_message_async(
     if handoff_request:
         _start_handoff(
             handoff_request, user_id=user_id, channel=channel, channel_type=channel_type,
-            source_thread=thread_ts,
+            source_thread=thread_ts, source_workspace=handoff_source,
         )
 
 
@@ -2906,6 +2915,8 @@ def _take_handoff(
         refusal = handoff_refusal(delegation_blocked=_delegation_blocked(workspace), **conditions)
         if refusal:
             raise SafetyError(refusal)
+        if request.bundle:
+            check_bundle_handoff(workspace, request.bundle, max_live_bundles=RUNTIME_POLICY.max_live_bundles)
     except SafetyError as exc:
         audit_logger.warning(
             "HANDOFF_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
@@ -2926,8 +2937,40 @@ def _thread_link(channel: str, ts: str, fallback: str) -> str:
         return fallback
 
 
+def _thread_ticket_keys(channel: str, thread_ts: str) -> frozenset[str]:
+    """Ticket keys named by the thread's opening message; empty when Slack cannot say."""
+    try:
+        messages = slack_client.conversations_replies(channel=channel, ts=thread_ts, limit=1)["messages"]
+        return ticket_keys(messages[0].get("text", "")) if messages else frozenset()
+    except Exception as exc:
+        logger.warning(f"Could not read the opening message of {thread_ts}: {type(exc).__name__}")
+        return frozenset()
+
+
+def _move_handoff_bundle(
+    request: HandoffRequest, source: ThreadWorkspace, *, user_id: str, channel: str, new_ts: str,
+) -> None:
+    """Bind the handoff's bundle to the new thread and release it from the source thread."""
+    try:
+        target = prepare_thread_workspace(source.root, channel=channel, thread=new_ts)
+        bundle = transfer_bundle(
+            source, target, request.bundle, max_live_bundles=RUNTIME_POLICY.max_live_bundles,
+        )
+    except (SafetyError, OSError) as exc:
+        audit_logger.warning(
+            "BUNDLE_REFUSED | USER:%s | CHANNEL:%s | THREAD:%s | VIA:handoff | REASON:%s",
+            user_id, channel, new_ts, str(exc),
+        )
+        return
+    audit_logger.info(
+        "BUNDLE_BOUND | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s | VIA:handoff",
+        user_id, channel, new_ts, bundle.name,
+    )
+
+
 def _start_handoff(
-    request: HandoffRequest, *, user_id: str, channel: str, channel_type: str, source_thread: str
+    request: HandoffRequest, *, user_id: str, channel: str, channel_type: str, source_thread: str,
+    source_workspace: ThreadWorkspace | None = None,
 ) -> None:
     """Open the new thread, start its first turn as the requester, then link it from the source."""
     source_link = _thread_link(channel, source_thread, "an earlier thread")
@@ -2951,6 +2994,8 @@ def _start_handoff(
     audit_logger.info(
         "THREAD_HANDOFF | USER:%s | CHANNEL:%s | FROM:%s | TO:%s", user_id, channel, source_thread, new_ts,
     )
+    if request.bundle and source_workspace is not None:
+        _move_handoff_bundle(request, source_workspace, user_id=user_id, channel=channel, new_ts=new_ts)
     event = {
         "type": "handoff",
         "user": user_id,
