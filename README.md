@@ -129,6 +129,17 @@ at startup, and refuses file transfer or transcript search. Additional Slack thr
 the two active turns and start automatically when capacity is available; requests are not
 discarded at the session cap.
 
+Thread sessions get a headless browser when it is installed: the harness passes the
+`@playwright/mcp` server pinned in `mcp/playwright/` with `--mcp-config`, headless, with an
+in-memory profile, writing snapshots and screenshots to `<root>/work/playwright-mcp/`. It drives
+the system Google Chrome, needs no display or logged-in desktop, and avoids the keychain
+(Playwright launches Chrome with `--use-mock-keychain`). Install it once per principal, as that
+user, with `npm ci` in `mcp/playwright/`; until then preflight warns and sessions start without it.
+Review-only turns never get it. Two of its tools are denied: `browser_run_code_unsafe`, which runs
+arbitrary JavaScript in the server process outside the Bash rails, and `browser_file_upload`.
+Every owner command carries `--strict-mcp-config`, so an MCP server the agent registers itself
+never loads.
+
 Lifecycle reporting is optional and installation-specific. During setup, create or select the
 Slack channel you want to use, invite the app, and put its stable channel ID in
 `AGENT_STATUS_CHANNEL_ID`. Home-base then posts fixed, privacy-safe ready and fatal-runtime notices;

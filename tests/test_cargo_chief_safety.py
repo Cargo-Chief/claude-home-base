@@ -11,6 +11,9 @@ import unittest
 from unittest import mock
 
 from cargo_chief_safety import (
+    BROWSER_DENY_RULES,
+    BROWSER_PROMPT,
+    browser_mcp_config,
     APPROVED_DELEGATES,
     AuthorityPolicy,
     GENERATED_MARKER,
@@ -674,8 +677,15 @@ class PreflightTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_accepts_clean_released_inputs(self):
-        warnings = preflight_room(self.policy)
+        with mock.patch("cargo_chief_safety.browser_mcp_config", return_value={}):
+            warnings = preflight_room(self.policy)
         self.assertEqual(2, len(warnings))  # fixtures intentionally have no origin/master refs
+
+    def test_warns_when_the_browser_is_not_installed(self):
+        with mock.patch("cargo_chief_safety.browser_mcp_config", return_value=None):
+            warnings = preflight_room(self.policy)
+        self.assertEqual(3, len(warnings))
+        self.assertIn("headless browser not installed", warnings[-1])
 
     def test_rejects_dirty_clone(self):
         (self.docs / "dirty.txt").write_text("dirty")
@@ -1234,6 +1244,80 @@ class ReviewOnlyRoomTest(unittest.TestCase):
         normal = self.command(False)
         self.assertEqual("session-1", normal[normal.index("--resume") + 1])
         self.assertNotIn("permissions", json.loads(normal[normal.index("--settings") + 1]))
+
+
+class BrowserMcpTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.cli = self.root / "cli.js"
+        self.cli.write_text("// stub\n")
+        self.overlay = self.root / "overlay.md"
+        self.overlay.write_text("autonomous\n")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def command(self, *, review_only=False, cli=None):
+        policy = RoomPolicy(
+            root=self.root, permission_mode="auto", overlay=self.overlay,
+            escalation_channel="D1", backend="claude", model="claude-opus-5-5",
+            effort="high", role="eng", fallback_backend="codex",
+            fallback_model="gpt-6-sol", fallback_effort="high", review_only=review_only,
+        )
+        return build_claude_command(
+            policy,
+            initial_prompt="",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/w/escalation.txt"),
+            bundle_claim_file=Path("/w/bundle.txt"),
+            parking_claim_file=Path("/w/parking.txt"),
+            session_id="session-1",
+            home=Path("/Users/agent"),
+            browser_cli=cli or self.cli,
+        )
+
+    def test_config_is_headless_isolated_and_writes_under_work(self):
+        with mock.patch("cargo_chief_safety.shutil.which", return_value="/opt/homebrew/bin/node"):
+            config = browser_mcp_config(self.root, self.cli)
+        server = config["mcpServers"]["playwright"]
+        self.assertEqual("/opt/homebrew/bin/node", server["command"])
+        self.assertEqual(
+            [str(self.cli), "--headless", "--isolated",
+             "--output-dir", str(self.root / "work" / "playwright-mcp")],
+            server["args"],
+        )
+
+    def test_config_is_absent_without_the_package_or_node(self):
+        with mock.patch("cargo_chief_safety.shutil.which", return_value="/opt/homebrew/bin/node"):
+            self.assertIsNone(browser_mcp_config(self.root, self.root / "missing.js"))
+        with mock.patch("cargo_chief_safety.shutil.which", return_value=None):
+            self.assertIsNone(browser_mcp_config(self.root, self.cli))
+
+    def test_thread_command_declares_the_browser_and_denies_its_unsafe_tools(self):
+        with mock.patch("cargo_chief_safety.shutil.which", return_value="/opt/homebrew/bin/node"):
+            command = self.command()
+        self.assertIn("--strict-mcp-config", command)
+        config = json.loads(command[command.index("--mcp-config") + 1])
+        self.assertEqual(["playwright"], list(config["mcpServers"]))
+        deny = json.loads(command[command.index("--settings") + 1])["permissions"]["deny"]
+        self.assertEqual(list(BROWSER_DENY_RULES), deny[-len(BROWSER_DENY_RULES):])
+        self.assertIn(BROWSER_PROMPT, command[command.index("--append-system-prompt") + 1])
+        self.assertEqual(["--resume", "session-1"], command[-2:])
+
+    def test_review_turn_and_missing_install_get_no_browser_but_stay_strict(self):
+        with mock.patch("cargo_chief_safety.shutil.which", return_value="/opt/homebrew/bin/node"):
+            review = self.command(review_only=True)
+            missing = self.command(cli=self.root / "missing.js")
+        for command in (review, missing):
+            self.assertIn("--strict-mcp-config", command)
+            self.assertNotIn("--mcp-config", command)
+            self.assertNotIn(BROWSER_PROMPT, command[command.index("--append-system-prompt") + 1])
+        settings = json.loads(missing[missing.index("--settings") + 1])
+        self.assertNotIn("permissions", settings)
+        review_deny = json.loads(review[review.index("--settings") + 1])["permissions"]["deny"]
+        self.assertFalse(set(BROWSER_DENY_RULES) & set(review_deny))
 
 
 if __name__ == "__main__":
