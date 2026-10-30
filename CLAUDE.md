@@ -50,7 +50,7 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   agent answered and could not resolve, asking the author to resolve it. See README
 - Review passes are counted from the agent's own marked reviews on the PR (`plan_review_pass`), not
   from local state; the 24-hour cap store is only a rate limit. After the last pass a request runs a
-  close-out, which can still approve. See README
+  close-out, which reviews only what goes beyond the fixes and can still approve. See README
 - A peer's review ending wakes the thread that asked (`ReviewNoticeStore`, `_start_review_notice`),
   but only a live session in that channel: a notice never spawns a process or runs on the Codex
   fallback, because either would run as the peer bot (`existing_only` in

@@ -523,12 +523,16 @@ def build_review_task(pr_url: str, root: Path, plan: ReviewPlan) -> str:
         )
     else:
         work = (
-            f"All {plan.max_passes} passes are used, so this is a close-out: do not run "
-            "cc-code-review and add no new findings. Read the commits since your last pass "
-            f"(`git diff {plan.base}..<head>`) to check the fixes. " + _THREAD_WORK + " Approve only "
-            "if every one of your threads is resolved or settled and those commits do nothing beyond "
-            "addressing them. Otherwise post a `comment` verdict whose body names what is still in dispute or "
-            "unreviewed and says Kirk needs to look."
+            f"All {plan.max_passes} passes are used, so this is a close-out. Read the commits since "
+            f"your last pass (`git diff {plan.base}..<head>`) to check the fixes. " + _THREAD_WORK +
+            " If those commits only address your threads, do not run cc-code-review and add no new "
+            "findings. If they also change anything else, review that change: run "
+            f"`cc-code-review high --since {plan.base} {pr_url}` without `--comment` and raise "
+            "findings only on lines that go beyond the fixes; never re-raise code you already "
+            "reviewed. Approve when every one of your threads is resolved or settled and nothing "
+            "you found must change before merge; request changes when a finding on those lines "
+            "must. Kirk needs to look only at a thread still in dispute: then post a `comment` "
+            "verdict whose body names it and says so."
         )
     return (
         "[CARGO_CHIEF_REVIEW_TASK]\n"

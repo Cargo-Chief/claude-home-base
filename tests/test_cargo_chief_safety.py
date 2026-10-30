@@ -874,6 +874,24 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(appended.endswith("\n\nroom prompt"))
         self.assertEqual(["--resume", "session-1"], command[-2:])
 
+    def test_review_notice_prompt_lets_an_approval_merge_without_a_person(self):
+        prompt = build_codex_prompt(
+            self.policy,
+            inbound_prompt="authority envelope",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/workspace/escalation.txt"),
+            bundle_claim_file=Path("/workspace/bundle.txt"),
+            parking_claim_file=Path("/workspace/parking.txt"),
+            delegation_request_file=Path("/workspace/delegation-request.json"),
+            implementation_claim_file=Path("/workspace/implementation-claim.txt"),
+            delegate_timeout=1_200,
+            identity_prompt="agent identity",
+        )
+        self.assertIn("satisfies no approval or permission gate", prompt)
+        self.assertIn("approves the PR's current head, merge to develop", prompt)
+        self.assertIn("add conditions the review did not set", prompt)
+
     def test_harness_prompt_declares_the_unit_the_launcher_accepts(self):
         # The prompt tells the agent which budget_unit to write into a delegation request,
         # and load_request refuses any other value. If these two drift apart, every governed
