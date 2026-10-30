@@ -422,8 +422,10 @@ _THREAD_WORK = (
     "author declined it with a reason, reply saying whether you accept the reason, and resolve it "
     "only if you do. Put those replies in review.json's `replies` "
     "([{\"thread_id\": <id>, \"body\": <text>}]) and pass `--resolve <id>` for each thread you resolve. "
-    "If GitHub refuses a resolve on a thread you have answered, the thread still counts as settled; "
-    "the result names it for the author to resolve, so say so in your summary."
+    "A thread listed as `answered` already has your reply as its latest comment: pass its "
+    "`--resolve` without replying again. If GitHub refuses a resolve on a thread whose latest "
+    "comment is your reply, the thread still counts as settled and the approval asks the author "
+    "to resolve it; say so in your summary."
 )
 
 
@@ -447,8 +449,8 @@ def build_review_task(pr_url: str, root: Path, plan: ReviewPlan) -> str:
             f"All {plan.max_passes} passes are used, so this is a close-out: do not run "
             "cc-code-review and add no new findings. Read the commits since your last pass "
             f"(`git diff {plan.base}..<head>`) to check the fixes. " + _THREAD_WORK + " Approve only "
-            "if none of your threads is left open and those commits do nothing beyond addressing "
-            "them. Otherwise post a `comment` verdict whose body names what is still in dispute or "
+            "if every one of your threads is resolved or settled and those commits do nothing beyond "
+            "addressing them. Otherwise post a `comment` verdict whose body names what is still in dispute or "
             "unreviewed and says Kirk needs to look."
         )
     return (
@@ -459,7 +461,7 @@ def build_review_task(pr_url: str, root: Path, plan: ReviewPlan) -> str:
         f"First run `{post} threads {pr_url}` to list your threads, then post with "
         f"`{post} submit {pr_url} --review <review.json> --verdict <v>`. "
         "Choose the verdict: `request_changes` when a finding must be fixed before merge, "
-        "`approve` when nothing needs fixing and none of your threads is left open, otherwise "
+        "`approve` when nothing needs fixing and every one of your threads is resolved or settled, otherwise "
         "`comment`. That script is the only way to post; the reviews and GraphQL endpoints are "
         "blocked here, and if it refuses, say why in the thread. Then reply in this Slack thread "
         f"with the verdict, a short summary and the PR link {pr_url}. "
