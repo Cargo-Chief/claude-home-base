@@ -6,7 +6,7 @@ The review task gives the exact command lines. Subcommands:
 
 review.json may carry `replies` ([{"thread_id", "body"}]) on this agent's own threads; they post
 after the review and before any thread is resolved. Each review body carries the pass marker the
-harness reads to plan the next pass. A close-out adds no findings.
+harness reads to plan the next pass. A close-out adds findings only on changes beyond the fixes.
 
 The room's permission rules deny the raw reviews and GraphQL endpoints because they cannot see a
 payload file; this script reads the payload and enforces the rules in code. It posts only to the
@@ -314,13 +314,9 @@ def submit(
         raise ReviewPostError("the PR is no longer open")
     head_sha = pull["head"]["sha"]
     review = build_review(payload, verdict, head_sha)
-    if mode == "closeout" and (review.get("comments") or verdict == "request_changes"):
-        raise ReviewPostError("a close-out adds no findings; approve, or comment naming the threads still in dispute")
     # Only the trailing marker is genuine; the model's text may quote one from the PR.
     body = REVIEW_MARKER_RE.sub("", review["body"]).strip()
-    # A close-out that does not approve leaves the commits it flagged unreviewed, so it keeps the base.
-    marked_head = head_sha if mode != "closeout" or verdict == "approve" else env.get(REVIEW_BASE_ENV, "") or head_sha
-    review["body"] = f"{body}\n\n{review_marker(pass_no, mode, marked_head)}".lstrip()
+    review["body"] = f"{body}\n\n{review_marker(pass_no, mode, head_sha)}".lstrip()
     replies = thread_replies(payload)
     resolve_ids = list(dict.fromkeys(resolve_ids))
 

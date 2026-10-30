@@ -41,10 +41,13 @@ whose reply failed is not resolved. A review token may be refused a resolve: a t
 counts as settled, and the approval's body asks the author to resolve it. A refusal on a thread the
 agent has not answered, or any other resolve error, still blocks the approval; every failure carries
 GitHub's error text. `threads` lists such a thread as `answered`. After the last pass a request runs a close-out instead of being
-refused, numbered as the last pass: no `cc-code-review` run and no new findings, only the thread
-work over the commits since the last pass. It approves only when no thread is left open and the
-last reviewed head is still in the branch history; otherwise it comments naming what is in
-dispute. One review runs per PR at a time. The 24-hour cap is a rate limit at twice the pass cap.
+refused, numbered as the last pass: the thread work over the commits since the last pass, and a
+`cc-code-review --since` run with findings only when those commits go beyond the fixes, so a commit
+that adds scope late is reviewed rather than left to a person. It approves only when no thread is
+left open and the last reviewed head is still in the branch history, and requests changes when a
+new finding must be fixed. Only a thread still in dispute goes to Kirk, named in the body whatever
+the verdict. A rewritten branch cannot be approved, so that close-out only comments; every close-out
+marks the head it checked, and the next request starts from there. One review runs per PR at a time. The 24-hour cap is a rate limit at twice the pass cap.
 
 The turn posts only through `review_post.py`, run under the GitHub App wrapper with the absolute
 paths the task names. The deny rules block the raw reviews and GraphQL endpoints because they cannot

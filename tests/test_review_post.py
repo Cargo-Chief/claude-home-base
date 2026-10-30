@@ -266,11 +266,15 @@ class ReviewPassPostTest(unittest.TestCase):
             with self.subTest(env=env), self.assertRaisesRegex(ReviewPostError, "not set"):
                 submit(FakeGitHub(), PR, payload(), "comment", [], env)
 
-    def test_closeout_adds_no_findings(self):
-        with self.assertRaisesRegex(ReviewPostError, "close-out adds no findings"):
-            submit(FakeGitHub(), PR, payload(["new finding"]), "comment", [], CLOSEOUT)
-        with self.assertRaisesRegex(ReviewPostError, "close-out adds no findings"):
-            submit(FakeGitHub(), PR, payload(), "request_changes", [], CLOSEOUT)
+    def test_closeout_can_review_changes_beyond_the_fixes(self):
+        for findings, verdict, event in ((["new finding"], "comment", "COMMENT"),
+                                         (["must fix"], "request_changes", "REQUEST_CHANGES")):
+            github = FakeGitHub()
+            with self.subTest(verdict=verdict):
+                submit(github, PR, payload(findings), verdict, [], CLOSEOUT)
+                self.assertEqual(event, github.submitted["event"])
+                self.assertEqual(findings, [c["body"] for c in github.submitted["comments"]])
+                self.assertTrue(github.submitted["body"].endswith(f"pass=3 mode=closeout head={HEAD} -->"))
         github = FakeGitHub(threads=[thread("T1")])
         body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed in abc."}]}
         submit(github, PR, body, "approve", ["T1"], CLOSEOUT)
@@ -339,10 +343,10 @@ class ReReviewFixesTest(unittest.TestCase):
         self.assertNotIn("submit", github.names())
         self.assertNotIn("resolve:T1", github.names())
 
-    def test_a_closeout_that_does_not_approve_keeps_the_base(self):
+    def test_every_closeout_marks_the_head_it_checked(self):
         github = FakeGitHub()
-        submit(github, PR, payload(body="New commits go beyond the fixes; Kirk needs to look."), "comment", [], CLOSEOUT)
-        self.assertTrue(github.submitted["body"].endswith(f"head={'b' * 40} -->"))
+        submit(github, PR, payload(body="Thread 2 is still in dispute; Kirk needs to look."), "comment", [], CLOSEOUT)
+        self.assertTrue(github.submitted["body"].endswith(f"head={HEAD} -->"))
         approved = FakeGitHub()
         submit(approved, PR, payload(), "approve", [], CLOSEOUT)
         self.assertTrue(approved.submitted["body"].endswith(f"head={HEAD} -->"))
