@@ -350,6 +350,17 @@ ticket key, or one Slack cannot return, does not restrict it), and caps live map
 the thread's private state and survives daemon/session restart; a resumed process starts in the
 validated bundle. A removed or invalid bundle safely falls back to the thread scratch directory.
 
+A claim only binds at turn end, so a thread could otherwise work in a bundle by its path and never
+claim it, and none of these checks would see that bundle. The `bundle_guard.py` PreToolUse hook,
+installed on every non-review Claude turn, refuses `Edit`, `MultiEdit`, `Write` and `NotebookEdit`
+calls, and git commands that change a repository (`add`, `commit`, `push`, `reset` and the like,
+following `cd` and `-C`), inside a valid bundle the thread has not claimed. The thread's bound
+bundle is allowed, and so is a pending claim that no other thread holds, so a bundle can be created,
+claimed and worked in the same turn; the ticket check still runs when the claim is consumed. Reads
+and other shell writes are not checked, and a guard fault lets the call through: it keeps the
+binding honest rather than enforcing a security boundary. The OpenAI fallback has no hooks, so it
+is not covered.
+
 Run the policy tests with:
 
 ```bash

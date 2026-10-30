@@ -15,6 +15,7 @@ from cargo_chief_safety import (
     BROWSER_DENY_RULES,
     BROWSER_MCP_REVIEWED_VERSION,
     BROWSER_PROMPT,
+    bundle_guard_hook,
     browser_mcp_config,
     browser_unavailable_reason,
     APPROVED_DELEGATES,
@@ -941,6 +942,7 @@ class PreflightTest(unittest.TestCase):
             {
                 "autoMemoryDirectory": str(auto_memory_directory(self.root, Path("/Users/agent"))),
                 "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(rm -rf /)"]},
+                "hooks": {"PreToolUse": [bundle_guard_hook(Path("/venv/bin/python"), Path("/home-base/bundle_guard.py"))]},
             },
             settings,
         )
@@ -1440,7 +1442,9 @@ class BrowserMcpTest(unittest.TestCase):
         settings = json.loads(command[command.index("--settings") + 1])
         self.assertEqual(list(BROWSER_DENY_RULES), settings["permissions"]["deny"][-len(BROWSER_DENY_RULES):])
         self.assertIn("mcp__playwright__browser_drop", BROWSER_DENY_RULES)
-        (hook,) = settings["hooks"]["PreToolUse"]
+        bundle_hook, hook = settings["hooks"]["PreToolUse"]
+        self.assertEqual("Edit|MultiEdit|Write|NotebookEdit|Bash", bundle_hook["matcher"])
+        self.assertEqual("/venv/bin/python /home-base/bundle_guard.py", bundle_hook["hooks"][0]["command"])
         self.assertEqual("mcp__playwright__.*", hook["matcher"])
         self.assertEqual("/venv/bin/python /home-base/browser_guard.py", hook["hooks"][0]["command"])
         self.assertIn(BROWSER_PROMPT, command[command.index("--append-system-prompt") + 1])
@@ -1457,8 +1461,13 @@ class BrowserMcpTest(unittest.TestCase):
             self.assertNotIn("--mcp-config", command)
             self.assertNotIn(BROWSER_PROMPT, command[command.index("--append-system-prompt") + 1])
             settings = json.loads(command[command.index("--settings") + 1])
-            self.assertNotIn("hooks", settings)
+            matchers = [hook["matcher"] for hook in settings.get("hooks", {}).get("PreToolUse", [])]
+            self.assertNotIn("mcp__playwright__.*", matchers)
             self.assertFalse(set(BROWSER_DENY_RULES) & set(settings.get("permissions", {}).get("deny", [])))
+        review = json.loads(commands[0][commands[0].index("--settings") + 1])
+        self.assertNotIn("hooks", review)
+        thread = json.loads(commands[1][commands[1].index("--settings") + 1])
+        self.assertEqual(["Edit|MultiEdit|Write|NotebookEdit|Bash"], [h["matcher"] for h in thread["hooks"]["PreToolUse"]])
 
     def test_a_failed_node_check_is_retried_not_cached(self):
         self.addCleanup(cargo_chief_safety._NODE_MAJORS.clear)
