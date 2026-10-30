@@ -127,6 +127,7 @@ from review_requests import (
     RequestThrottle,
     ReviewAdmission,
     ReviewCapStore,
+    ReviewNoticeStore,
     PeerRequestError,
     ReviewRequestHandler,
     ThreadClaims,
@@ -2363,6 +2364,7 @@ def process_message_async(
     event: dict,
     review_admission: ReviewAdmission | None = None,
     handoff_from: str | None = None,
+    review_notice: dict | None = None,
 ) -> None:
     """Process a message in a background thread.
 
@@ -2378,6 +2380,10 @@ def process_message_async(
 
     ``handoff_from`` marks a turn this agent's own handoff started from that source thread: it runs
     as the requester but never as an approver, and its own handoff claim is refused.
+
+    ``review_notice`` marks a turn home-base started because the peer's review of a PR this thread
+    requested has ended. The sender is the peer bot with no operator or approver authority; the
+    room is resolved for the person who owned the requesting turn.
     """
     user_id = event.get("user", "")
     text = event.get("text", "").strip()
@@ -2404,6 +2410,14 @@ def process_message_async(
             log_unauthorized(event)
             review_admission.refuse("refused_sender", ERROR_REPLY)
             return
+    elif review_notice:
+        try:
+            peer_ids = peer_review_config(_load_model_config()).peer_bot_user_ids
+        except SafetyError:
+            peer_ids = frozenset()
+        if user_id not in peer_ids:
+            log_unauthorized(event)
+            return
     elif not authority.allows(user_id):
         log_unauthorized(event)
         return
@@ -2415,7 +2429,7 @@ def process_message_async(
     # into a new DM session. A review turn never consumes or creates a route.
     forward = None
     original_thread = None
-    if not review and not handoff_from:
+    if not review and not handoff_from and not review_notice:
         route_result = _reply_routes.claim(
             from_channel=channel,
             from_thread=thread_ts,
@@ -2449,7 +2463,8 @@ def process_message_async(
         channel = forward["channel"]
 
     try:
-        room_policy = resolve_room_policy(_load_model_config(), channel, user_id)
+        room_user = review_notice["room_user"] if review_notice else user_id
+        room_policy = resolve_room_policy(_load_model_config(), channel, room_user)
     except SafetyError as exc:
         logger.error(f"Refusing unsafe room {channel}: {exc}")
         if review:
@@ -2562,7 +2577,7 @@ def process_message_async(
             show_reminder = True
 
     prefix = ""
-    if not review and not handoff_from and needs_relevance_prefix(
+    if not review and not handoff_from and not review_notice and needs_relevance_prefix(
         event_type=event.get("type", ""),
         is_dm=is_dm,
         has_existing_session=has_existing_session,
@@ -2587,6 +2602,7 @@ def process_message_async(
         forwarded_from=original_thread,
         review_requester=review,
         handoff_from=handoff_from,
+        review_notice=review_notice["pr"] if review_notice else None,
     )
     text = f"{build_review_task(review_admission.pr, room_policy.root, review_admission.plan)}\n\n{envelope}" if review else prefix + envelope
 
@@ -2654,7 +2670,7 @@ def process_message_async(
                 )
                 handoff_request = _take_handoff(
                     fallback_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
-                    review=review, from_handoff=bool(handoff_from), forwarded=bool(forward),
+                    review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
                 )
             session = None
         else:
@@ -2830,7 +2846,7 @@ def process_message_async(
                         _handoff_stops.discard(thread_ts)
                     handoff_request = _take_handoff(
                         handoff_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
-                        review=review, from_handoff=bool(handoff_from), forwarded=bool(forward),
+                        review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
                         stopped=stopped, senders=len(session.turn_senders),
                     )
 
@@ -3338,6 +3354,37 @@ def _lookup_review_pr(pr_url: str, root: Path, include_reviews: bool = True):
     )
 
 
+_review_notices = ReviewNoticeStore(STATE_DIR / "review-notices.json")
+
+REVIEW_NOTICE_MESSAGE = (
+    "Your peer agent's review of {pr} has ended. Read the verdict and its threads on the PR, "
+    "then carry on with this thread's work."
+)
+
+
+def _start_review_notice(entry: dict, event: dict) -> None:
+    """Wake the thread that asked for a review: a visible note, then a turn with no authority."""
+    channel, thread, pr = entry["channel"], entry["thread"], entry["pr"]
+    try:
+        note_ts = slack_client.chat_postMessage(
+            channel=channel, thread_ts=thread, text=f"The peer review of {pr} has ended; picking it up.",
+        )["ts"]
+    except Exception as exc:
+        audit_logger.warning("REVIEW_NOTICE_FAILED | CHANNEL:%s | THREAD:%s | REASON:%s",
+                             channel, thread, type(exc).__name__)
+        return
+    notice = {
+        "type": "review_notice",
+        "user": event.get("user", ""),
+        "channel": channel,
+        "channel_type": "im" if channel.startswith("D") else "channel",
+        "thread_ts": thread,
+        "ts": note_ts,
+        "text": REVIEW_NOTICE_MESSAGE.format(pr=pr),
+    }
+    process_message_async(notice, review_notice={"pr": pr, "room_user": entry.get("room_user", "")})
+
+
 def _spawn_review_admission(target, *args) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
 
@@ -3369,6 +3416,8 @@ _review_requests = ReviewRequestHandler(
     lookup=_lookup_review_pr,
     start_turn=lambda admission: process_message_async(admission.event, review_admission=admission),
     spawn=_spawn_review_admission,
+    notices=_review_notices,
+    start_notice=lambda entry, event: _start_review_notice(entry, event),
 )
 
 
@@ -3729,9 +3778,10 @@ def main():
                 config=_load_model_config(),
                 env=os.environ,
                 lookup=lambda pr, root: _lookup_review_pr(pr, root, include_reviews=False),
-                post=lambda channel, text: slack_client.chat_postMessage(channel=channel, text=text),
+                post=lambda channel, text: slack_client.chat_postMessage(channel=channel, text=text)["ts"],
                 audit=audit_logger.info,
                 sent=ReviewCapStore(STATE_DIR / "review-requests-sent.json"),
+                notices=_review_notices,
             )
         except PeerRequestError as exc:
             raise SystemExit(f"review request refused: {exc}") from exc

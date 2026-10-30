@@ -35,7 +35,10 @@ from review_requests import (
     PROVIDER_REPLY,
     USAGE_HINT,
     PullRequestInfo,
+    NOTICE_WINDOW_SECONDS,
     ReviewCapStore,
+    ReviewNoticeStore,
+    review_ended_text,
     ReviewGuardError,
     ReviewRequestHandler,
     ThreadClaims,
@@ -579,6 +582,39 @@ class HandlerTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+    def wire_notices(self):
+        self.notices = ReviewNoticeStore(Path(self.temp.name) / "notices.json")
+        self.woken = []
+        self.handler.notices = self.notices
+        self.handler.start_notice = lambda entry, event: self.woken.append((entry["thread"], event["user"]))
+
+    def test_the_peers_reply_in_a_recorded_thread_wakes_the_asking_thread(self):
+        self.wire_notices()
+        self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1", room_user="UKIRK")
+        self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=review_ended_text("ULISA", PR))
+        self.assertEqual([("5.1", "UNED")], self.woken)
+        self.assertEqual([], self.turns)
+        self.assertEqual([], self.posts)
+        self.assertTrue(self.audits[-1].endswith("OUTCOME:review_ended"), self.audits[-1])
+
+    def test_only_the_peer_bot_and_only_a_recorded_request(self):
+        self.wire_notices()
+        self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1", room_user="UKIRK")
+        self.mention(user="UKIRK", thread_ts="7.1", text=review_ended_text("ULISA", PR))
+        self.mention(user="UNED", bot_id="BNED", thread_ts="8.1", text=review_ended_text("ULISA", PR))
+        self.assertEqual([], self.woken)
+        self.assertIsNotNone(self.notices.take("7.1", PR))
+
+    def test_the_reviewer_hands_back_to_a_peer_bot_requester(self):
+        self.mention(user="UNED", bot_id="BNED")
+        self.assertEqual([("UNED", PR)], self.turns)
+        self.assertEqual(("CREVIEWS", "1.1", review_ended_text("UNED", PR)), self.posts[-1])
+
+    def test_a_human_requester_gets_no_hand_back(self):
+        self.mention(user="UKIRK")
+        self.assertEqual([("UKIRK", PR)], self.turns)
+        self.assertFalse(any("has ended" in text for _, _, text in self.posts))
+
 
 class PeerRequestTest(unittest.TestCase):
     def setUp(self):
@@ -692,6 +728,30 @@ class PeerRequestTest(unittest.TestCase):
             )
         self.assertIn("OUTCOME:refused_post", self.audits[-1])
 
+    def test_a_sent_request_is_recorded_against_the_asking_thread(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = ReviewNoticeStore(Path(temp) / "notices.json")
+            env = {"CLAUDE_CHANNEL_ID": "CWORK", "CLAUDE_THREAD_TS": "5.1", "CARGO_CHIEF_CURRENT_USER": "UKIRK"}
+            request_peer_review(
+                PR, config=self.config, env=env, lookup=self.lookup,
+                post=lambda channel, message: "9.1", audit=self.audits.append, notices=store,
+            )
+            self.assertEqual("5.1", store.take("9.1", PR)["thread"])
+
+    def test_a_failed_charge_after_posting_is_not_a_refusal(self):
+        class BrokenCaps:
+            def exhausted(self, pr, limit):
+                return False
+
+            def admit(self, pr, limit):
+                raise CapStoreError("unreadable")
+
+        request_peer_review(
+            PR, config=self.config, env={"CLAUDE_CHANNEL_ID": "CWORK"}, lookup=self.lookup,
+            post=lambda channel, message: "9.1", audit=self.audits.append, sent=BrokenCaps(),
+        )
+        self.assertTrue(self.audits[-1].endswith("OUTCOME:sent"))
+
 
 class PlanReviewPassTest(unittest.TestCase):
     HEAD1, HEAD2 = "1" * 40, "2" * 40
@@ -730,3 +790,28 @@ class PlanReviewPassTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewNoticeTest(unittest.TestCase):
+    """The peer's hand-back wakes the thread that asked for the review, once."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.now = 1000.0
+        self.store = ReviewNoticeStore(Path(self.temp.name) / "notices.json", clock=lambda: self.now)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_an_entry_is_taken_once_and_only_for_its_pr(self):
+        self.store.add("9.1", pr=PR, channel="CWORK", thread="5.1", room_user="UKIRK")
+        self.assertIsNone(self.store.take("9.1", "https://github.com/Cargo-Chief/c4/pull/9"))
+        entry = self.store.take("9.1", PR)
+        self.assertEqual(("CWORK", "5.1", "UKIRK"), (entry["channel"], entry["thread"], entry["room_user"]))
+        self.assertIsNone(self.store.take("9.1", PR))
+
+    def test_old_entries_expire(self):
+        self.store.add("9.1", pr=PR, channel="CWORK", thread="5.1", room_user="UKIRK")
+        self.now += NOTICE_WINDOW_SECONDS + 1
+        self.assertIsNone(self.store.take("9.1", PR))
+

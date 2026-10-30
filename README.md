@@ -80,6 +80,16 @@ takes only the URL, checks that the PR is open and authored by this agent's own 
 `<@peer> please review <URL>` in the single review-only room to the single configured peer bot.
 A review turn cannot run it, and the sender stops at the same per-PR budget the peer enforces (twice `max_reviews_per_pr` per 24 hours). Each call, including a failed Slack post, writes a `REVIEW_REQUEST_SENT` audit line.
 
+When the review ends, the asking thread is woken. The sender records the request message against
+the thread that ran it (`review-notices.json` in the state directory, file-locked, kept 7 days).
+After a peer bot's review turn, the reviewer's harness posts a fixed
+`<@requester> my review of <URL> has ended` in the request's thread. The requester's intake takes
+a peer-bot mention there whose PR matches a recorded request, once, as a hand-back rather than a
+new request: it writes a short note into the asking thread and starts a turn there whose sender
+is the peer bot with `review_notice` authority. That turn carries no operator or approver
+authority and cannot hand off; it reads the review and continues work the thread already had. A
+charge or record failure after the request posts is logged, never reported as a refusal.
+
 One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
 writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn. The
 harness takes the claim before the turn releases its lock, so the next turn in the thread can

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import fcntl
 import json
 import logging
 import os
@@ -306,6 +307,65 @@ class ReviewCapStore:
             return outcome
 
 
+NOTICE_WINDOW_SECONDS = 7 * 24 * 3600
+
+
+def review_ended_text(requester_id: str, pr: str) -> str:
+    """The reviewer's fixed hand-back to a peer bot that asked for a review."""
+    return f"<@{requester_id}> my review of {pr} has ended; the verdict and threads are on the PR."
+
+
+class ReviewNoticeStore:
+    """Review requests this agent sent, keyed by the request message, so the peer's hand-back
+    reaches the thread that asked. The CLI writes and the server reads, so access is file-locked;
+    each entry is taken once."""
+
+    def __init__(self, path: Path, *, window: int = NOTICE_WINDOW_SECONDS, clock: Callable = time.time):
+        self.path = path
+        self.window = window
+        self.clock = clock
+
+    def _locked(self, update: Callable[[dict], object]) -> object:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path.with_suffix(".lock"), "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            cutoff = self.clock() - self.window
+            data = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("at", 0) > cutoff}
+            result = update(data)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".review-notices.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(data, handle)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return result
+
+    def add(self, request_ts: str, *, pr: str, channel: str, thread: str, room_user: str) -> None:
+        entry = {"pr": pr, "channel": channel, "thread": thread, "room_user": room_user, "at": self.clock()}
+        self._locked(lambda data: data.__setitem__(request_ts, entry))
+
+    def take(self, request_ts: str, pr: str) -> dict | None:
+        """The entry for that request and PR, removed; None if there is none."""
+        def pop(data: dict) -> dict | None:
+            entry = data.get(request_ts)
+            if not entry or entry.get("pr") != pr:
+                return None
+            return data.pop(request_ts)
+        return self._locked(pop)
+
+
 class ThreadClaims:
     """Threads with a review being admitted or run, so a second mention never joins it."""
 
@@ -554,6 +614,8 @@ class ReviewRequestHandler:
     start_turn: Callable[[ReviewAdmission], None]
     spawn: Callable[..., None]
     wrapper_ready: Callable[[Path], bool] = github_wrapper_downscopes
+    notices: "ReviewNoticeStore | None" = None
+    start_notice: Callable[[dict, dict], None] | None = None
 
     def _audit(self, event: dict, pr: str | None, outcome: str) -> None:
         self.audit(format_review_audit(
@@ -590,6 +652,8 @@ class ReviewRequestHandler:
             self._refuse(event, None, "refused_config", CONFIG_REPLY if human else None)
             return
         pr = single_pr_url(event.get("text", ""))
+        if kind == PEER_BOT and pr and self._hand_back(event, pr):
+            return
         if pr is None:
             self._refuse(event, None, "refused_no_pr", USAGE_HINT if human else None)
             return
@@ -614,6 +678,22 @@ class ReviewRequestHandler:
             self.claims.release(thread)
             self.claims.release(_pr_claim(pr))
             raise
+
+    def _hand_back(self, event: dict, pr: str) -> bool:
+        """A peer's reply in the thread of a request this agent sent: wake the thread that asked."""
+        request_ts = event.get("thread_ts") or ""
+        if not request_ts or request_ts == event.get("ts") or self.notices is None or self.start_notice is None:
+            return False
+        try:
+            entry = self.notices.take(request_ts, pr)
+        except OSError as exc:
+            logger.error(f"Review notice record unreadable: {type(exc).__name__}")
+            return False
+        if entry is None:
+            return False
+        self._audit(event, pr, "review_ended")
+        self.spawn(self.start_notice, entry, event)
+        return True
 
     def _guard(self, event: dict, pr: str, peer: PeerReviewConfig) -> tuple[RoomPolicy, ReviewPlan] | None:
         """Every check before the turn; refuses (audit and reply) and returns None on failure."""
@@ -676,6 +756,12 @@ class ReviewRequestHandler:
             finally:
                 # Every admitted request ends in exactly one audit line.
                 admission.refuse("refused_error", ERROR_REPLY)
+            requester = event.get("user", "")
+            if admission.started and requester in peer.peer_bot_user_ids:
+                try:
+                    self.post(event.get("channel", ""), thread, review_ended_text(requester, pr))
+                except Exception as exc:
+                    logger.warning(f"Could not hand the review of {pr} back: {type(exc).__name__}")
         finally:
             self.claims.release(thread)
             self.claims.release(_pr_claim(pr))
@@ -699,13 +785,16 @@ def request_peer_review(
     config: Mapping,
     env: Mapping[str, str],
     lookup: Callable[[str, Path], PullRequestInfo],
-    post: Callable[[str, str], None],
+    post: Callable[[str, str], object],
     audit: Callable[[str], None],
     sent: "ReviewCapStore | None" = None,
+    notices: "ReviewNoticeStore | None" = None,
 ) -> str:
     """Ask the configured peer to review this agent's own open PR in the review-only room.
 
     The caller supplies only the URL; the room and the mention come from config. Returns the room ID.
+    With `notices`, the request is recorded against the asking thread (`CLAUDE_CHANNEL_ID`,
+    `CLAUDE_THREAD_TS`) so the peer's hand-back wakes it.
     """
     pr: str | None = None
     try:
@@ -750,11 +839,22 @@ def request_peer_review(
             except CapStoreError as exc:
                 raise PeerRequestError("refused_cap_store", "the sent-request record is unreadable") from exc
         try:
-            post(room, f"<@{peer_id}> please review {pr}")
+            request_ts = post(room, f"<@{peer_id}> please review {pr}")
         except Exception as exc:
             raise PeerRequestError("refused_post", f"Slack refused the post: {type(exc).__name__}") from exc
-        if sent is not None:
-            sent.admit(pr, daily_review_limit(peer))
+        # The request is posted; from here a failure is logged, never raised as a refusal.
+        try:
+            if sent is not None:
+                sent.admit(pr, daily_review_limit(peer))
+        except (CapStoreError, OSError) as exc:
+            logger.error(f"Review request sent but not charged: {type(exc).__name__}")
+        origin = (env.get("CLAUDE_CHANNEL_ID", ""), env.get("CLAUDE_THREAD_TS", ""))
+        if notices is not None and isinstance(request_ts, str) and request_ts and all(origin):
+            try:
+                notices.add(request_ts, pr=pr, channel=origin[0], thread=origin[1],
+                            room_user=env.get("CARGO_CHIEF_CURRENT_USER", ""))
+            except OSError as exc:
+                logger.error(f"Review request sent but its hand-back was not recorded: {type(exc).__name__}")
     except PeerRequestError as exc:
         audit(format_sent_audit(pr=pr, outcome=exc.outcome))
         raise

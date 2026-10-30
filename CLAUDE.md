@@ -51,6 +51,10 @@ preflight. Keep broadly useful transport improvements separable so they can be p
 - Review passes are counted from the agent's own marked reviews on the PR (`plan_review_pass`), not
   from local state; the 24-hour cap store is only a rate limit. After the last pass a request runs a
   close-out, which can still approve. See README
+- A peer's review ending wakes the thread that asked (`ReviewNoticeStore`, `_start_review_notice`):
+  the turn runs as the peer bot with `review_notice` authority, never as an operator, and cannot
+  hand off. Its `review_notice` bypasses in `process_message_async` and the prompt line naming
+  `review_notice_pr` change together. See README
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:

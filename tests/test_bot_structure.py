@@ -220,9 +220,19 @@ class BotTurnStructureTest(unittest.TestCase):
     def test_review_turns_never_touch_reply_routes(self):
         process = ast.unparse(self._function("process_message_async"))
         self.assertIn("elif not authority.allows(user_id):", process)
-        self.assertLess(process.index("if not review and (not handoff_from):"), process.index("_reply_routes.claim("))
+        self.assertLess(process.index("if not review and (not handoff_from) and (not review_notice):"), process.index("_reply_routes.claim("))
         self.assertNotIn("_reply_routes.add", process)
         self.assertLess(process.index("raise _ReviewBusy()"), process.index("_send_to_claude(session, text)"))
+
+    def test_a_review_notice_turn_is_the_peer_bot_with_no_routes_or_handoff(self):
+        process = ast.unparse(self._function("process_message_async"))
+        notice = process.index("elif review_notice:")
+        self.assertLess(notice, process.index("elif not authority.allows(user_id):"))
+        self.assertIn("if user_id not in peer_ids:", process[notice:notice + 300])
+        self.assertIn("review_notice=review_notice['pr'] if review_notice else None", process)
+        self.assertEqual(2, process.count("from_handoff=bool(handoff_from or review_notice)"))
+        start = ast.unparse(self._function("_start_review_notice"))
+        self.assertIn("review_notice={'pr': pr", start)
 
     def test_escalation_and_forwarding_refuse_review_only_rooms_server_side(self):
         main = ast.unparse(self._function("main"))
