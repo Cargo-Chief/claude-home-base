@@ -36,20 +36,33 @@ CLOSEOUT = {**ENV, REVIEW_MODE_ENV: "closeout", REVIEW_PASS_ENV: "3", "CARGO_CHI
 OPEN = {"state": "open", "draft": False, "user": {"login": "dev1", "type": "User"}}
 
 
-def thread(tid, login="lisa-cargochief", typename="Bot", resolved=False, body="finding\nmore"):
+SELF = ("lisa-cargochief", "Bot")
+AUTHOR = ("dev1", "User")
+
+
+def thread(tid, login="lisa-cargochief", typename="Bot", resolved=False, body="finding\nmore", replies=()):
+    """A review thread; `replies` are (login, __typename) pairs after the opening comment."""
+    last = replies[-1] if replies else (login, typename)
     return {"id": tid, "isResolved": resolved, "path": "a.py", "line": 3,
-            "comments": {"nodes": [{"author": {"login": login, "__typename": typename}, "body": body}]}}
+            "comments": {"totalCount": 1 + len(replies),
+                         "nodes": [{"author": {"login": login, "__typename": typename}, "body": body}]},
+            "latest": {"nodes": [{"author": {"login": last[0], "__typename": last[1]}}]}}
 
 
 class FakeGitHub:
     def __init__(self, pull=None, threads=(), heads=None, fail_resolve=(), fail_submit=False,
-                 compare="ahead", reply_error=None):
+                 compare="ahead", reply_error=None, refuse_resolve=(), interject=(), resolve_error=None,
+                 threads_error_after=None):
         self.compare = compare
         self.reply_error = reply_error
         self._pull = {**OPEN, **(pull or {})}
         self._threads = list(threads)
         self._heads = list(heads or [])
         self.fail_resolve = set(fail_resolve)
+        self.refuse_resolve = set(refuse_resolve)
+        self.interject = set(interject)
+        self.resolve_error = resolve_error
+        self.threads_error_after = threads_error_after
         self.fail_submit = fail_submit
         self.calls = []
 
@@ -60,11 +73,19 @@ class FakeGitHub:
 
     def threads(self, owner, repo, number):
         self.calls.append(("threads",))
+        if self.threads_error_after is not None and self.calls.count(("threads",)) > self.threads_error_after:
+            raise ReviewPostError("gh api graphql failed: HTTP 502")
         return self._threads
 
     def compare_status(self, owner, repo, base, head):
         self.calls.append(("compare",))
         return self.compare
+
+    def _comment(self, thread_id, author):
+        for item in self._threads:
+            if item["id"] == thread_id:
+                item["comments"]["totalCount"] += 1
+                item["latest"] = {"nodes": [{"author": {"login": author[0], "__typename": author[1]}}]}
 
     def reply(self, thread_id, body):
         self.calls.append(("reply", thread_id))
@@ -72,11 +93,18 @@ class FakeGitHub:
             raise self.reply_error
         if thread_id in self.fail_resolve:
             raise ReviewPostError("graphql failed")
+        self._comment(thread_id, SELF)
 
     def resolve(self, thread_id):
         self.calls.append(("resolve", thread_id))
         if thread_id in self.fail_resolve:
             raise ReviewPostError("graphql failed")
+        if thread_id in self.interject:
+            self._comment(thread_id, AUTHOR)
+        if thread_id in self.refuse_resolve:
+            raise ReviewPostError("gh api graphql failed: Resource not accessible by integration")
+        if self.resolve_error:
+            raise self.resolve_error
 
     def submit(self, owner, repo, number, review):
         self.calls.append(("submit", review["event"]))
@@ -319,6 +347,83 @@ class ReReviewFixesTest(unittest.TestCase):
         submit(approved, PR, payload(), "approve", [], CLOSEOUT)
         self.assertTrue(approved.submitted["body"].endswith(f"head={HEAD} -->"))
 
+
+
+
+class RefusedResolveTest(unittest.TestCase):
+    """A review token may be refused a resolve; a thread this agent has answered is still settled."""
+
+    def test_an_approval_posts_over_a_refused_resolve_on_a_thread_it_answers(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR])], refuse_resolve={"T1"})
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed in abc."}]}
+        out = submit(github, PR, body, "approve", ["T1"], ENV)
+        self.assertEqual(["pull", "threads", "reply:T1", "resolve:T1", "threads", "pull", "submit"], github.names())
+        self.assertIn("so the author must resolve: T1", out)
+        note, marker = github.submitted["body"].rsplit("\n\n", 1)
+        self.assertIn("please resolve: `a.py:3`", note)
+        self.assertTrue(marker.startswith("<!-- cc-peer-review pass=2"))
+
+    def test_an_earlier_reply_that_is_still_latest_settles_the_thread(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR, SELF])], refuse_resolve={"T1"})
+        out = submit(github, PR, payload(), "approve", ["T1"], ENV)
+        self.assertIn("APPROVE review posted", out)
+
+    def test_a_bare_finding_is_not_an_answer(self):
+        github = FakeGitHub(threads=[thread("T1")], refuse_resolve={"T1"})
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: Resource not accessible by integration; your reply is not"):
+            submit(github, PR, payload(), "approve", ["T1"], ENV)
+        self.assertNotIn("submit", github.names())
+
+    def test_a_refused_resolve_blocks_when_the_author_spoke_last(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[SELF, AUTHOR])], refuse_resolve={"T1"})
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: Resource not accessible by integration; your reply is not"):
+            submit(github, PR, payload(), "approve", ["T1"], ENV)
+
+    def test_an_author_reply_during_posting_is_seen(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR, SELF])], refuse_resolve={"T1"}, interject={"T1"})
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: Resource not accessible by integration; your reply is not"):
+            submit(github, PR, payload(), "approve", ["T1"], ENV)
+
+    def test_a_failure_that_is_not_a_refusal_still_blocks(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR, SELF])], fail_resolve={"T1"})
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: graphql failed"):
+            submit(github, PR, payload(), "approve", ["T1"], ENV)
+
+    def test_a_comment_reports_a_refused_resolve(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR])], refuse_resolve={"T1"})
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Accepted."}]}
+        out = submit(github, PR, body, "comment", ["T1"], ENV)
+        self.assertIn("(1 replies, resolved 0 threads); answered but GitHub refused the resolve, so the author "
+                      "must resolve: T1 (Resource not accessible by integration)", out)
+
+    def test_a_rate_limit_403_is_not_a_refusal(self):
+        error = ReviewPostError("gh api graphql failed: HTTP 403: Forbidden, you have exceeded a secondary rate limit")
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR, SELF])], resolve_error=error)
+        with self.assertRaisesRegex(ReviewPostError, "approval not posted: resolve T1: HTTP 403"):
+            submit(github, PR, payload(), "approve", ["T1"], ENV)
+
+    def test_a_failed_reread_says_the_replies_are_posted(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR])], refuse_resolve={"T1"}, threads_error_after=1)
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "Fixed."}]}
+        with self.assertRaisesRegex(ReviewPostError, "after posting 1 replies .*do not post them again"):
+            submit(github, PR, body, "approve", ["T1"], ENV)
+        self.assertNotIn("submit", github.names())
+
+    def test_the_note_names_an_outdated_thread_without_a_line(self):
+        outdated = {**thread("T1", replies=[AUTHOR, SELF]), "line": None}
+        github = FakeGitHub(threads=[outdated], refuse_resolve={"T1"})
+        submit(github, PR, payload(), "approve", ["T1"], ENV)
+        self.assertIn("please resolve: `a.py` (outdated).", github.submitted["body"])
+
+    def test_every_reply_is_counted(self):
+        github = FakeGitHub(threads=[thread("T1")])
+        body = {**payload(), "replies": [{"thread_id": "T1", "body": "One."}, {"thread_id": "T1", "body": "Two."}]}
+        self.assertIn("(2 replies", submit(github, PR, body, "comment", [], ENV))
+
+    def test_threads_lists_an_answered_thread(self):
+        github = FakeGitHub(threads=[thread("T1", replies=[AUTHOR, SELF]), thread("T2", replies=[AUTHOR])])
+        rows = [json.loads(row) for row in list_threads(github, PR, ENV).splitlines()]
+        self.assertEqual(["answered", "open"], [row["state"] for row in rows])
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,7 +45,9 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   `result` after its `REVIEW_DONE_MARKER` line with no background subagent running
   (`session_lifecycle.BackgroundAgents`); every other `result` is a pause. See README
 - A review turn writes to GitHub only through `review_post.py` (verdict, inline comments, resolving
-  its own threads); approvals need the requester in `peer_review.github_logins`. See README
+  its own threads); approvals need the requester in `peer_review.github_logins`. The review token
+  (`REVIEW_TOKEN_PERMISSIONS`) may be refused a resolve, so an approval can post over a thread the
+  agent answered and could not resolve, asking the author to resolve it. See README
 - Review passes are counted from the agent's own marked reviews on the PR (`plan_review_pass`), not
   from local state; the 24-hour cap store is only a rate limit. After the last pass a request runs a
   close-out, which can still approve. See README

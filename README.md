@@ -35,7 +35,11 @@ stamping. With no marker the turn is pass 1, a full review. Passes 2 to `max_rev
 only the commits since the last marked head (`cc-code-review --since`, which falls back to a full
 review after a rebase). Every pass goes through the agent's open threads: a reply naming the fix or
 accepting or rejecting the author's reason, then a resolve for each fixed or accepted one; a thread
-whose reply failed is not resolved. After the last pass a request runs a close-out instead of being
+whose reply failed is not resolved. A review token may be refused a resolve: a thread named in
+`--resolve` whose latest comment is still the agent's own reply (read again after posting) then
+counts as settled, and the approval's body asks the author to resolve it. A refusal on a thread the
+agent has not answered, or any other resolve error, still blocks the approval; every failure carries
+GitHub's error text. `threads` lists such a thread as `answered`. After the last pass a request runs a close-out instead of being
 refused, numbered as the last pass: no `cc-code-review` run and no new findings, only the thread
 work over the commits since the last pass. It approves only when no thread is left open and the
 last reviewed head is still in the branch history; otherwise it comments naming what is in

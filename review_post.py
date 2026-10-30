@@ -15,6 +15,9 @@ posts first and then does its thread work; an approval does its thread work firs
 if all of it succeeded. It approves only an open, non-draft PR whose head is still the reviewed
 commit, with no findings attached, none of this agent's own threads left open, a requester with a
 mapped GitHub login, and a PR this agent did not write.
+
+A review token may be refused a resolve. A thread this agent has answered, whose latest comment is
+still its own reply, then counts as settled; the approval names it for the author to resolve.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Callable, Mapping
+from typing import Callable, Mapping, NamedTuple
 
 from cargo_chief_safety import (
     REVIEW_BASE_ENV,
@@ -47,7 +50,8 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved path line
-          comments(first: 1) { nodes { author { __typename login } body } }
+          comments(first: 1) { totalCount nodes { author { __typename login } body } }
+          latest: comments(last: 1) { nodes { author { __typename login } } }
         }
       }
     }
@@ -134,6 +138,28 @@ def _first_comment(thread: Mapping) -> Mapping:
     return nodes[0] if nodes else {}
 
 
+def has_answered(thread: Mapping, login: str) -> bool:
+    """This agent replied on its thread and its reply is still the latest comment."""
+    comments = thread.get("comments") or {}
+    latest = ((thread.get("latest") or {}).get("nodes") or [{}])[0]
+    return (comments.get("totalCount") or 0) > 1 and is_this_app(latest.get("author") or {}, login)
+
+
+# GitHub's answer when a token may not resolve; anything else (5xx, rate limit) stays a failure.
+_REFUSAL_MARKERS = ("resource not accessible", "does not have permission", "forbidden")
+_RETRYABLE_MARKERS = ("rate limit", "abuse", "try again")
+
+
+def _refused(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(m in text for m in _REFUSAL_MARKERS) and not any(m in text for m in _RETRYABLE_MARKERS)
+
+
+def _reason(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    return text.split("failed: ", 1)[-1][:300]
+
+
 def own_threads(github: GitHub, owner: str, repo: str, number: int, login: str) -> list[Mapping]:
     return [
         thread for thread in github.threads(owner, repo, number)
@@ -217,18 +243,25 @@ def approval_refusal(*, pull: Mapping, login: str, requester_login: str, open_ow
     return None
 
 
+class ThreadWork(NamedTuple):
+    replied: int
+    resolved: int
+    failed: list[str]
+    refused: list[tuple[str, str]]  # (thread id, GitHub's text) for resolves refused for lack of permission
+
+
 def _thread_work(
     github: GitHub, replies: list[tuple[str, str]], resolve_ids: list[str], mine: Mapping[str, Mapping],
-) -> tuple[int, int, list[str]]:
+) -> ThreadWork:
     """Post the replies, then resolve; a thread whose reply failed stays open."""
-    failed, unreplied = [], set()
+    failed, refused, unreplied = [], [], set()
     replied = resolved = 0
     for thread_id, body in replies:
         try:
             github.reply(thread_id, body)
             replied += 1
-        except Exception:
-            failed.append(f"reply on {thread_id}")
+        except Exception as exc:
+            failed.append(f"reply on {thread_id}: {_reason(exc)}")
             unreplied.add(thread_id)
     for thread_id in resolve_ids:
         if mine[thread_id].get("isResolved"):
@@ -239,9 +272,34 @@ def _thread_work(
         try:
             github.resolve(thread_id)
             resolved += 1
-        except Exception:
-            failed.append(f"resolve {thread_id}")
-    return replied, resolved, failed
+        except Exception as exc:
+            if _refused(exc):
+                refused.append((thread_id, _reason(exc)))
+            else:
+                failed.append(f"resolve {thread_id}: {_reason(exc)}")
+    return ThreadWork(replied, resolved, failed, refused)
+
+
+def _settle_refused(
+    github: GitHub, owner: str, repo: str, number: int, login: str, work: ThreadWork,
+) -> tuple[list[str], list[str]]:
+    """Refused resolves, read fresh: (threads this agent has answered, failures for the rest)."""
+    if not work.refused:
+        return [], []
+    try:
+        fresh = {thread["id"]: thread for thread in own_threads(github, owner, repo, number, login)}
+    except Exception as exc:
+        raise ReviewPostError(
+            f"could not re-read the threads after posting {work.replied} replies (they are posted; "
+            f"do not post them again): {_reason(exc)}"
+        ) from exc
+    answered, unanswered = [], []
+    for tid, reason in work.refused:
+        if tid in fresh and has_answered(fresh[tid], login):
+            answered.append(tid)
+        else:
+            unanswered.append(f"resolve {tid}: {reason}; your reply is not the thread's latest comment")
+    return answered, unanswered
 
 
 def submit(
@@ -286,23 +344,45 @@ def submit(
 
     if verdict == "approve":
         # The approval lands only after every reply and resolve it depends on has.
-        replied, resolved, failed = _thread_work(github, replies, resolve_ids, mine)
+        work = _thread_work(github, replies, resolve_ids, mine)
+        left, unanswered = _settle_refused(github, owner, repo, number, login, work)
+        failed = [*work.failed, *unanswered]
         if failed:
             raise ReviewPostError(f"approval not posted: {', '.join(failed)}")
         if github.pull(owner, repo, number)["head"]["sha"] != head_sha:
             raise ReviewPostError("the PR head moved during posting; review the current head")
+        if left:
+            text, marker = review["body"].rsplit("\n\n", 1) if "\n\n" in review["body"] else ("", review["body"])
+            review["body"] = f"{text}\n\n{_left_note(left, mine)}\n\n{marker}".lstrip()
         result = github.submit(owner, repo, number, review)
     else:
         result = github.submit(owner, repo, number, review)
         # The review is posted; from here a failure is reported, never raised as a refusal.
-        replied, resolved, failed = _thread_work(github, replies, resolve_ids, mine)
+        work = _thread_work(github, replies, resolve_ids, mine)
+        try:
+            left, unanswered = _settle_refused(github, owner, repo, number, login, work)
+        except ReviewPostError as exc:
+            left, unanswered = [], [str(exc)]
+        failed = [*work.failed, *unanswered]
     message = (
         f"{review['event']} review posted for pass {pass_no} ({mode}): "
-        f"{(result or {}).get('html_url', '')} ({replied} replies, resolved {resolved} threads)"
+        f"{(result or {}).get('html_url', '')} ({work.replied} replies, resolved {work.resolved} threads)"
     )
     if failed:
         message += f"; failed: {', '.join(failed)}"
+    if left:
+        reasons = dict(work.refused)
+        message += ("; answered but GitHub refused the resolve, so the author must resolve: "
+                    + ", ".join(f"{tid} ({reasons[tid]})" for tid in left))
     return message
+
+
+def _left_note(left: list[str], mine: Mapping[str, Mapping]) -> str:
+    """The note an approval carries for threads it answered but could not resolve."""
+    where = [f"`{mine[tid].get('path')}" + (f":{mine[tid]['line']}`" if mine[tid].get("line") else "` (outdated)")
+             for tid in left]
+    return (f"{len(left)} of my threads are settled but GitHub would not let this review resolve them; "
+            f"please resolve: {', '.join(where)}.")
 
 
 def list_threads(github: GitHub, pr_url: str, env: Mapping[str, str]) -> str:
@@ -311,7 +391,7 @@ def list_threads(github: GitHub, pr_url: str, env: Mapping[str, str]) -> str:
     rows = []
     for thread in own_threads(github, owner, repo, number, login):
         first = ((_first_comment(thread).get("body") or "").strip().splitlines() or [""])[0][:100]
-        state = "resolved" if thread.get("isResolved") else "open"
+        state = "resolved" if thread.get("isResolved") else "answered" if has_answered(thread, login) else "open"
         rows.append(json.dumps({"id": thread["id"], "state": state, "path": thread.get("path"),
                                 "line": thread.get("line"), "first_line": first}))
     return "\n".join(rows) or "no threads from this agent on this PR"
