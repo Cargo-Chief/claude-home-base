@@ -353,13 +353,18 @@ validated bundle. A removed or invalid bundle safely falls back to the thread sc
 A claim only binds at turn end, so a thread could otherwise work in a bundle by its path and never
 claim it, and none of these checks would see that bundle. The `bundle_guard.py` PreToolUse hook,
 installed on every non-review Claude turn, refuses `Edit`, `MultiEdit`, `Write` and `NotebookEdit`
-calls, and git commands that change a repository (`add`, `commit`, `push`, `reset` and the like,
-following `cd` and `-C`), inside a valid bundle the thread has not claimed. The thread's bound
-bundle is allowed, and so is a pending claim that no other thread holds, so a bundle can be created,
-claimed and worked in the same turn; the ticket check still runs when the claim is consumed. Reads
-and other shell writes are not checked, and a guard fault lets the call through: it keeps the
-binding honest rather than enforcing a security boundary. The OpenAI fallback has no hooks, so it
-is not covered.
+calls inside a valid bundle the thread has not claimed, and any Bash command that runs a git write
+(`add`, `commit`, `push`, `clean`, `branch -D` and the rest of `GIT_WRITES`; listing forms such as
+`stash list` or `branch -a` read) while it names such a bundle or runs from inside one. The Bash check
+scans every word of the command rather than parsing the shell, so env prefixes, wrappers such as the
+GitHub App token script, subshells, `bash -c`, `$VAR` paths and `--work-tree=` are all seen; the cost
+is that a command mixing a write elsewhere with a mere mention of another bundle is refused too.
+The thread's bound bundle is allowed unless another thread also holds it, and so is a pending claim
+the turn-end check would accept (no other holder or pending claim, under the live cap), so a bundle
+can be created, claimed and worked in the same turn; the ticket check still runs only when the claim
+is consumed. Other shell writes are not checked, and a guard fault lets the call through: it keeps the
+binding honest rather than enforcing a security boundary. The OpenAI fallback has no hooks, so it is
+not covered.
 
 Run the policy tests with:
 

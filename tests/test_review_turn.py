@@ -181,7 +181,7 @@ class SpawnTest(unittest.TestCase):
         for key in (
             "CARGO_CHIEF_ESCALATION_CHANNEL", "CARGO_CHIEF_ESCALATION_MESSAGE_FILE",
             "CARGO_CHIEF_ESCALATION_RECEIPT_FILE", "CARGO_CHIEF_ESCALATION_ATTEMPT_FILE",
-            "CARGO_CHIEF_PARKING_CLAIM_FILE", "CARGO_CHIEF_BUNDLE_CLAIM_FILE",
+            "CARGO_CHIEF_PARKING_CLAIM_FILE", "CARGO_CHIEF_BUNDLE_CLAIM_FILE", "CARGO_CHIEF_MAX_LIVE_BUNDLES",
             "CARGO_CHIEF_THREAD_BUNDLE_DIR", "AWS_PROFILE", "SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET",
         ):
             self.assertNotIn(key, child, key)
@@ -223,6 +223,9 @@ class SpawnTest(unittest.TestCase):
         self.assertEqual("saved", cmd[cmd.index("--resume") + 1])
         self.assertIn("CARGO_CHIEF_ESCALATION_CHANNEL", kwargs["env"])
         self.assertEqual("kirk", kwargs["env"]["AWS_PROFILE"])
+        for key in ("CARGO_CHIEF_ROOT", "CARGO_CHIEF_THREAD_WORK_DIR", "CARGO_CHIEF_BUNDLE_CLAIM_FILE"):
+            self.assertIn(key, kwargs["env"], key)
+        self.assertIn("CARGO_CHIEF_MAX_LIVE_BUNDLES", kwargs["env"])
 
 
 class FakeSession:

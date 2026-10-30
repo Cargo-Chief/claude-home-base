@@ -15,7 +15,8 @@ from cargo_chief_safety import (
     BROWSER_DENY_RULES,
     BROWSER_MCP_REVIEWED_VERSION,
     BROWSER_PROMPT,
-    bundle_guard_hook,
+    BUNDLE_GUARD_MATCHER,
+    guard_hook,
     browser_mcp_config,
     browser_unavailable_reason,
     APPROVED_DELEGATES,
@@ -942,7 +943,7 @@ class PreflightTest(unittest.TestCase):
             {
                 "autoMemoryDirectory": str(auto_memory_directory(self.root, Path("/Users/agent"))),
                 "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(rm -rf /)"]},
-                "hooks": {"PreToolUse": [bundle_guard_hook(Path("/venv/bin/python"), Path("/home-base/bundle_guard.py"))]},
+                "hooks": {"PreToolUse": [guard_hook(BUNDLE_GUARD_MATCHER, Path("/venv/bin/python"), Path("/home-base/bundle_guard.py"))]},
             },
             settings,
         )

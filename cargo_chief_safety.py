@@ -574,7 +574,7 @@ def _bound_bundles(root: Path) -> dict[str, str]:
         try:
             bundle = json.loads(state_file.read_text(encoding="utf-8")).get("bundle")
             _validated_bundle_path(root, bundle)
-        except (OSError, json.JSONDecodeError, AttributeError, SafetyError):
+        except (OSError, ValueError, AttributeError, SafetyError):
             continue
         bound[state_file.parent.name] = str(bundle)
     return bound
@@ -1365,6 +1365,7 @@ BROWSER_DENY_RULES = (
     "mcp__playwright__browser_drop",
 )
 BROWSER_TOOL_MATCHER = "mcp__playwright__.*"
+BUNDLE_GUARD_MATCHER = "Edit|MultiEdit|Write|NotebookEdit|Bash"
 BROWSER_PROMPT = (
     "- A headless browser is available as the `playwright` MCP server, for checking dev and local "
     "UIs. Its profile is in memory and discarded when the turn ends. Let it name its own output "
@@ -1431,22 +1432,10 @@ def browser_mcp_config(output_dir: Path, cli: Path = BROWSER_MCP_CLI) -> dict | 
     }
 
 
-def _hook(matcher: str, transport_python: Path, script: Path) -> dict:
+def guard_hook(matcher: str, transport_python: Path, script: Path) -> dict:
+    """One PreToolUse entry running a guard script; exit 2 refuses the call."""
     command = f"{shlex.quote(str(transport_python))} {shlex.quote(str(script))}"
     return {"matcher": matcher, "hooks": [{"type": "command", "command": command}]}
-
-
-def browser_guard_hooks(transport_python: Path, guard_script: Path) -> dict:
-    """PreToolUse hook refusing browser calls that name a file, which resolve against the cwd."""
-    return {"PreToolUse": [_hook(BROWSER_TOOL_MATCHER, transport_python, guard_script)]}
-
-
-BUNDLE_GUARD_MATCHER = "Edit|MultiEdit|Write|NotebookEdit|Bash"
-
-
-def bundle_guard_hook(transport_python: Path, guard_script: Path) -> dict:
-    """PreToolUse hook refusing edits and git writes in a bundle the thread has not claimed."""
-    return _hook(BUNDLE_GUARD_MATCHER, transport_python, guard_script)
 
 
 REVIEW_HARNESS_PROMPT = (
@@ -1488,12 +1477,16 @@ def build_claude_command(
     settings = owner_settings(policy.root, home, review_only=policy.review_only)
     pre_tool_use = []
     if not policy.review_only:
-        pre_tool_use.append(bundle_guard_hook(transport_python, transport_script.parent / "bundle_guard.py"))
+        # Refuses edits and git writes in a bundle the thread has not claimed.
+        pre_tool_use.append(
+            guard_hook(BUNDLE_GUARD_MATCHER, transport_python, transport_script.parent / "bundle_guard.py")
+        )
     if browser is not None:
         permissions = settings.setdefault("permissions", {})
         permissions["deny"] = [*permissions.get("deny", []), *BROWSER_DENY_RULES]
-        pre_tool_use.extend(
-            browser_guard_hooks(transport_python, transport_script.parent / "browser_guard.py")["PreToolUse"]
+        # Refuses browser calls that name a file, which resolve against the cwd.
+        pre_tool_use.append(
+            guard_hook(BROWSER_TOOL_MATCHER, transport_python, transport_script.parent / "browser_guard.py")
         )
     if pre_tool_use:
         settings["hooks"] = {"PreToolUse": pre_tool_use}
@@ -1657,8 +1650,9 @@ def _build_harness_prompt(
         "- When a normal worktree_task.sh run creates a ticket bundle for this thread, or before you "
         "edit or commit in an existing bundle this thread has not claimed, write only its bundle "
         f"directory name (CN-####-lowercase-slug) to {bundle_claim_file}. The harness validates "
-        "ownership, safety, and the live-bundle cap before persisting the mapping. Edits and git "
-        "writes in a bundle this thread has not claimed are refused.\n"
+        "ownership, safety, and the live-bundle cap before persisting the mapping. A claim replaces "
+        "any bundle this thread already holds, so never claim a second ticket's bundle: hand that "
+        "work off. Edits and git writes in a bundle this thread has not claimed are refused.\n"
         "- To request a peer review of your own open PR, run exactly:\n"
         f"  {shlex.quote(str(transport_python))} {shlex.quote(str(transport_script))} "
         "--request-review <PR URL>\n"
