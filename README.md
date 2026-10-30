@@ -357,10 +357,12 @@ calls inside a valid bundle the thread has not claimed, and any Bash command tha
 (`add`, `commit`, `push`, `clean`, `branch -D` and the rest of `GIT_WRITES`; listing forms such as
 `stash list` or `branch -a` read) while it names such a bundle or runs from inside one. The Bash check
 scans every word of the command rather than parsing the shell, so env prefixes, wrappers such as the
-GitHub App token script, subshells, `bash -c`, `$VAR` paths and `--work-tree=` are all seen; the cost
+GitHub App token script, subshells, backticks, `bash -c`, `$VAR` paths (including variables set
+in the same command) and `--work-tree=` are all seen; the cost
 is that a command mixing a write elsewhere with a mere mention of another bundle is refused too.
 The thread's bound bundle is allowed unless another thread also holds it, and so is a pending claim
-the turn-end check would accept (no other holder or pending claim, under the live cap), so a bundle
+the turn-end check would accept (no other holder, under the live cap) and no other thread claimed
+in the last hour, so a bundle
 can be created, claimed and worked in the same turn; the ticket check still runs only when the claim
 is consumed. Other shell writes are not checked, and a guard fault lets the call through: it keeps the
 binding honest rather than enforcing a security boundary. The OpenAI fallback has no hooks, so it is

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -72,6 +73,16 @@ class BundleGuardTest(unittest.TestCase):
             f"git -C {bundle} branch -D feature",
             f"git -C {bundle} worktree remove --force .",
             f"git -C {bundle} stash pop",
+            f"git -C {bundle} stash",
+            f"git -C {bundle} remote -v set-url origin u2",
+            f"git -C {bundle} branch -v -D y",
+            f"git -C {bundle} branch newname",
+            f"git -C {bundle} tag -d v1",
+            f"git -C {bundle} config --list --add a.b c",
+            f"B={bundle}; git -C $B commit -m x",
+            f"export WT={bundle} && cd $WT && git push",
+            f"GIT_DIR={bundle}/.git GIT_WORK_TREE={bundle} git commit -m x",
+            f"echo `git -C {bundle} commit -m x`",
         ):
             self.assertIsNotNone(self.bash(command), command)
 
@@ -85,6 +96,11 @@ class BundleGuardTest(unittest.TestCase):
             f"git -C {bundle} tag -l",
             f"git -C {bundle} worktree list",
             f"git -C {bundle} config --get user.email",
+            f"git -C {bundle} config --global --get user.email",
+            f"git -C {bundle} branch --list 'feat*'",
+            f"git -C {bundle} branch --format=%(refname) --sort=-committerdate",
+            f"git -C {bundle} tag -n5 --sort=v:refname",
+            f"git -C {bundle} remote -v",
             f"git -C {self.root}/worktrees/docs-only/docs commit -m x",
             "git commit -m x",
         ):
@@ -111,7 +127,10 @@ class BundleGuardTest(unittest.TestCase):
         rival = self.state("rival", None)
         (rival / "bundle-claim.txt").write_text("CN-2-other\n")
         self.assertIn("CN-2-other", self.edit(other))
-        (rival / "bundle-claim.txt").unlink()
+        stale = rival / "bundle-claim.txt"
+        os.utime(stale, (0, 0))
+        self.assertIsNone(self.edit(other))
+        stale.unlink()
         self.state("a", "CN-1-mine")
         self.state("b", "CN-3-third")
         self.env["CARGO_CHIEF_MAX_LIVE_BUNDLES"] = "2"
