@@ -86,7 +86,10 @@ adding `"bundle": "CN-####-slug"` when it already created that work's worktree b
 harness takes the claim before the turn releases its lock, so the next turn in the thread can
 neither discard nor supply it. Once the turn has completed, the harness:
 1. opens a new top-level thread in the same room, with the title and brief as Slack-escaped text;
-2. moves the named bundle's mapping to the new thread, releasing it from the source thread;
+2. moves the named bundle's mapping to the new thread, releasing it from the source thread and
+   closing the source's idle process so its next turn resumes outside the bundle. If the move
+   fails, the new thread still starts and both its first message and its first turn say why the
+   bundle stayed behind;
 3. starts a fresh session there with the brief as its first turn;
 4. links the new thread from the source thread.
 
@@ -102,13 +105,19 @@ The harness refuses a claim from:
 - a forwarded reply;
 - a turn more than one person wrote into;
 - a thread whose delegation budget is exhausted or awaiting verification;
-- a claim naming a bundle that another thread owns.
+- a claim naming a bundle it cannot move: owned by another thread, over the live cap, invalid, or
+  for a ticket the title does not name.
 
-Thread turns are denied `bot.py --send` (`THREAD_DENY_RULES`): a thread opened that way starts no
+`bot.py` refuses `--send`, `--send-result` and `--channel` from a thread session (one with
+`CARGO_CHIEF_THREAD_WORK_DIR` set, on either provider) unless the message replies in an existing
+thread (`--thread`) or forwards its reply back (`--forward-to`): a thread opened that way starts no
 session and strands the bundle in the source thread.
 
 The claim is read through one no-follow descriptor, capped at 16 KiB. Audit lines:
-`THREAD_HANDOFF` (opened), `HANDOFF_REFUSED`, and `HANDOFF_FAILED` (Slack refused the new thread).
+`THREAD_HANDOFF` (opened), `HANDOFF_REFUSED`, `HANDOFF_FAILED` (Slack refused the new thread), and
+`BUNDLE_BOUND` or `BUNDLE_REFUSED` with `VIA:handoff` for the bundle move. Every bundle binding
+runs under one lock, and a move releases the source before binding the target, restoring it if the
+second write fails.
 
 Every Slack ingress path checks the current sender. Unauthorized DMs, channel messages, mentions,
 button actions, forwarded replies, stops, and mid-turn steering are refused before reaching a live

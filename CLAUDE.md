@@ -61,7 +61,10 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   - the `handoff_from` bypasses in `process_message_async`;
   - the prompt text in `cargo_chief_safety.handoff_prompt`, which names the `handoff_from_thread`
     envelope field and the claim's optional `bundle`;
-  - the bundle move (`check_bundle_handoff` in `_take_handoff`, `transfer_bundle` in
-    `_start_handoff`), the ticket check in `consume_bundle_claim`, and `THREAD_DENY_RULES`.
+  - the bundle move: `check_bundle_handoff` in `_take_handoff`, then `_move_handoff_bundle`
+    (`transfer_bundle`, `_retire_source_session`) in `_start_handoff`, fed by `handoff_source`;
+  - the ticket check: `thread_tickets=lambda: _thread_ticket_keys(...)` at both
+    `consume_bundle_claim` sites, and the title check in the handoff path;
+  - `thread_handoff.new_thread_refusal`, checked in `main` before any send.
 
   Change them together.

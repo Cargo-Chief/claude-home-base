@@ -383,6 +383,7 @@ class ThreadTicketKeysTest(unittest.TestCase):
 class HandoffBundleTest(unittest.TestCase):
     def setUp(self):
         FakeThread.started = []
+        self.retired = []
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         bundle = self.root / "worktrees" / "CN-2-next"
@@ -407,6 +408,8 @@ class HandoffBundleTest(unittest.TestCase):
             "consume_handoff_claim": consume_handoff_claim,
             "handoff_refusal": handoff_refusal,
             "check_bundle_handoff": check_bundle_handoff,
+            "_retire_source_session": lambda thread_ts: self.retired.append(thread_ts),
+            "slack_escape": thread_handoff.slack_escape,
             "transfer_bundle": transfer_bundle,
             "prepare_thread_workspace": prepare_thread_workspace,
             "RUNTIME_POLICY": type("RuntimePolicy", (), {"max_live_bundles": 3}),
@@ -440,6 +443,21 @@ class HandoffBundleTest(unittest.TestCase):
         self.assertEqual([(self.root / "worktrees" / "CN-2-next").resolve()], bound_at_start)
         self.assertIsNone(resolve_thread_bundle(self.source))
         self.assertTrue(any(line.startswith("BUNDLE_BOUND") and "VIA:handoff" in line for line in self.audit.lines))
+        self.assertEqual(["1.0"], self.retired)
+
+    def test_a_failed_move_is_reported_in_the_new_thread_and_its_first_turn(self):
+        other = prepare_thread_workspace(self.root, channel="C1", thread="2.0")
+        self.namespace["_start_handoff"](
+            HandoffRequest("CN-2 next", "b", "CN-2-next"), user_id="U1", channel="C1", channel_type="im",
+            source_thread="2.0", source_workspace=other,
+        )
+        notes = [text for thread, text in self.slack.posts if thread == "9.0"]
+        self.assertEqual(1, len(notes))
+        self.assertIn("stayed with the earlier thread: claimed worktree bundle is already bound", notes[0])
+        ((_, (event,), _),) = FakeThread.started
+        self.assertIn("Harness note: The bundle CN-2-next stayed with the earlier thread", event["text"])
+        self.assertEqual([], self.retired)
+        self.assertTrue(any(line.startswith("BUNDLE_REFUSED") for line in self.audit.lines))
 
     def test_a_claim_naming_a_bundle_bound_elsewhere_is_refused_before_anything_posts(self):
         other = prepare_thread_workspace(self.root, channel="C1", thread="2.0")
@@ -453,7 +471,34 @@ class HandoffBundleTest(unittest.TestCase):
         self.assertIn("already bound to another thread", text)
 
 
+class NewThreadRefusalTest(unittest.TestCase):
+    def refusal(self, env=None, **flags):
+        args = {"send": False, "send_result": False, "channel": False, "thread": None, "forward_to": None, **flags}
+        return thread_handoff.new_thread_refusal(env={"CARGO_CHIEF_THREAD_WORK_DIR": "/w"} if env is None else env, **args)
+
+    def test_a_thread_session_cannot_open_a_new_thread(self):
+        for flags in ({"send": True}, {"send_result": True}, {"channel": True}):
+            self.assertIn("handoff claim", self.refusal(**flags), flags)
+
+    def test_replies_forwarded_dms_and_non_thread_callers_stay_allowed(self):
+        self.assertIsNone(self.refusal(send=True, thread="1.0"))
+        self.assertIsNone(self.refusal(channel=True, thread="1.0"))
+        self.assertIsNone(self.refusal(send=True, forward_to="1.0"))
+        self.assertIsNone(self.refusal(send=True, env={}))
+        self.assertIsNone(self.refusal())
+
+
 class WiringTest(unittest.TestCase):
+    def test_both_bundle_claim_sites_pass_the_thread_ticket_lookup(self):
+        source = BOT.read_text(encoding="utf-8")
+        self.assertEqual(2, source.count("consume_bundle_claim("))
+        self.assertEqual(2, source.count("thread_tickets=lambda: _thread_ticket_keys("))
+
+    def test_the_cli_checks_new_thread_refusal_before_sending(self):
+        main = ast.unparse(_bot_function("main"))
+        self.assertLess(main.index("new_thread_refusal("), main.index("if args.send:"))
+        self.assertLess(main.index("new_thread_refusal("), main.index("if args.channel:"))
+
     def test_a_handoff_turn_skips_reply_routes_and_the_relevance_filter_and_marks_its_envelope(self):
         process = ast.unparse(_bot_function("process_message_async"))
         self.assertIn("if not review and (not handoff_from):", process)

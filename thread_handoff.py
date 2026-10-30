@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
-from cargo_chief_safety import SafetyError
+from cargo_chief_safety import BUNDLE_NAME, SafetyError
 
 MAX_CLAIM_BYTES = 16384
 MAX_TITLE_CHARS = 120
 MAX_BRIEF_CHARS = 6000
-BUNDLE_NAME = re.compile(r"CN-\d+-[a-z0-9][a-z0-9-]*")
 
 
 @dataclass(frozen=True)
@@ -111,6 +110,24 @@ def handoff_refusal(
         return "more than one person wrote into this turn; ask for the handoff in a new message"
     if delegation_blocked:
         return "this thread's delegation budget is exhausted or awaiting verification; a named approver must reset it first"
+    return None
+
+
+def new_thread_refusal(
+    *, send: bool, send_result: bool, channel: bool, thread: str | None, forward_to: str | None,
+    env: Mapping[str, str],
+) -> str | None:
+    """Why a thread session may not open a new Slack thread from the CLI, or None when it may.
+
+    A reply in an existing thread, and a DM whose reply is forwarded back to this thread, stay allowed.
+    """
+    if not env.get("CARGO_CHIEF_THREAD_WORK_DIR") or thread:
+        return None
+    if channel or send_result or (send and not forward_to):
+        return (
+            "a thread session opens new work only through its handoff claim, which starts the new "
+            "thread's session and moves its bundle"
+        )
     return None
 
 
