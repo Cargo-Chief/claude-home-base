@@ -2829,7 +2829,9 @@ def process_message_async(
                     post_response(channel, PROVIDER_REPLY, thread_ts=thread_ts)
                 elif fallback_requested and review_notice:
                     # A Codex turn would run as the peer bot.
-                    post_response(channel, REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]), thread_ts=thread_ts)
+                    note = REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"])
+                    all_texts.append(note)
+                    post_response(channel, note, thread_ts=thread_ts)
                 elif fallback_requested:
                     fallback_context = _fetch_thread_context(channel, thread_ts, msg_ts)
                     fallback_prompt = text
@@ -2880,9 +2882,12 @@ def process_message_async(
         return
     except _NoLiveSession:
         _clear_eyes(reaction_channel, reaction_msg_ts)
-        slack_client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
-        )
+        try:
+            slack_client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
+            )
+        except Exception as exc:
+            logger.warning(f"Could not post the review notice note in {thread_ts}: {type(exc).__name__}")
         return
     except Exception as e:
         try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
@@ -3390,6 +3395,10 @@ REVIEW_NOTICE_MESSAGE = (
     "Your peer agent's review turn on {pr} has ended. Read the verdict and its threads on the PR."
 )
 REVIEW_NOTICE_IDLE = "The peer review of {pr} has ended. Tell me to continue when ready."
+REVIEW_NOTICE_LIMIT = (
+    "I hit a usage limit while picking up the peer review of {pr}. Tell me to continue when ready, "
+    "and repeat anything you sent during that turn."
+)
 
 
 def _live_session_for(thread: str, channel: str) -> "LiveSession | None":
@@ -3409,7 +3418,7 @@ def _notice_room(channel: str) -> bool:
     """A configured, non-review work room: the only place an idle note may go."""
     config = _load_model_config()
     entry = (config.get("channels") or {}).get(channel) if isinstance(config, dict) else None
-    return isinstance(entry, dict) and not entry.get("review_only")
+    return isinstance(entry, dict) and entry.get("review_only", False) is False
 
 
 def _start_review_notice(entry: dict, event: dict) -> None:
