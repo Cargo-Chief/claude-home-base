@@ -74,6 +74,12 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   - `thread_handoff.new_thread_refusal`, checked in `main` before any send.
 
   Change them together.
+- `bundle_guard.py` (PreToolUse, non-review turns) refuses edits, and Bash git writes that name or
+  run inside a bundle the thread has neither bound nor validly pending-claimed. Its pending-claim
+  rule mirrors `consume_bundle_claim` (holders and the cap via `CARGO_CHIEF_MAX_LIVE_BUNDLES`, set in
+  `_spawn_claude_process`) except the ticket check, also refuses a rival pending claim, and it
+  reuses `_validated_bundle_path`, `_bound_bundles` and `_check_bundle_binding`: a change to how
+  bundles bind changes it too. It fails open. See README
 - The headless browser is `mcp/playwright/` (pinned, `npm ci` per checkout) wired in by
   `cargo_chief_safety.browser_mcp_config`, `BROWSER_DENY_RULES` and the `browser_guard.py` hook.
   A pin bump changes `BROWSER_MCP_REVIEWED_VERSION` with the regenerated lockfile, after

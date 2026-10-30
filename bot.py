@@ -944,6 +944,7 @@ def _spawn_claude_process(
         proc_env["CARGO_CHIEF_ESCALATION_RECEIPT_FILE"] = str(escalation_receipt_file)
         proc_env["CARGO_CHIEF_ESCALATION_ATTEMPT_FILE"] = str(workspace.escalation_attempt_file)
         proc_env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"] = str(workspace.bundle_claim_file)
+        proc_env["CARGO_CHIEF_MAX_LIVE_BUNDLES"] = str(RUNTIME_POLICY.max_live_bundles)
         proc_env["CARGO_CHIEF_PARKING_CLAIM_FILE"] = str(workspace.parking_claim_file)
         proc_env["CARGO_CHIEF_HANDOFF_CLAIM_FILE"] = str(workspace.handoff_claim_file)
     proc_env["CARGO_CHIEF_THREAD_WORK_DIR"] = str(workspace.path)
