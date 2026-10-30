@@ -8,7 +8,6 @@ Claude process.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import functools
 import hashlib
 import json
 import os
@@ -1285,13 +1284,20 @@ BROWSER_PROMPT = (
 )
 
 
-@functools.lru_cache(maxsize=4)
+_NODE_MAJORS: dict[str, int] = {}
+
+
 def _node_major(node: str) -> int | None:
+    """node's major version, cached only once known so a slow or failed check is retried."""
+    if node in _NODE_MAJORS:
+        return _NODE_MAJORS[node]
     try:
         result = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10)
-        return int(result.stdout.strip().lstrip("v").split(".")[0])
+        major = int(result.stdout.strip().lstrip("v").split(".")[0])
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
+    _NODE_MAJORS[node] = major
+    return major
 
 
 def _installed_browser_version(cli: Path) -> str | None:
@@ -1312,7 +1318,9 @@ def browser_unavailable_reason(cli: Path = BROWSER_MCP_CLI) -> str | None:
     if node is None:
         return "node is not on PATH"
     major = _node_major(node)
-    if major is None or major < BROWSER_MIN_NODE_MAJOR:
+    if major is None:
+        return f"could not read the version of {node}"
+    if major < BROWSER_MIN_NODE_MAJOR:
         return f"{node} is not node {BROWSER_MIN_NODE_MAJOR} or later"
     return None
 

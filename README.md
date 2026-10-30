@@ -140,8 +140,10 @@ each principal's checkout, as that user, with `npm ci` in `mcp/playwright/`. Unt
 warns with the reason and sessions start without it. Review-only turns never get it.
 
 Playwright resolves a named file against the session cwd (the bundle or thread workspace), outside
-the Edit/Write rails, so a PreToolUse hook (`browser_guard.py`) refuses any browser call whose
-arguments name a file or path. `browser_run_code_unsafe` (arbitrary JavaScript in the server
+the Edit/Write rails, and its `file:` block checks only a URL's outer scheme (`view-source:file://`
+gets through), so a PreToolUse hook (`browser_guard.py`) refuses any browser call whose arguments,
+at any depth, name a file or path or give a URL other than `http`, `https` or `about:blank`. The
+hook refuses on any failure of its own, since only its refusal exit code blocks the call. `browser_run_code_unsafe` (arbitrary JavaScript in the server
 process), `browser_file_upload` and `browser_drop` (local files to the page) are denied. Every owner
 command carries `--strict-mcp-config`, so an MCP server the agent registers itself never loads.
 "Never open a production UI" is a prompt rule: the profile holds no credentials, and Playwright's

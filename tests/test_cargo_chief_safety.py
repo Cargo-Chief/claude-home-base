@@ -10,6 +10,7 @@ import threading
 import unittest
 from unittest import mock
 
+import cargo_chief_safety
 from cargo_chief_safety import (
     BROWSER_DENY_RULES,
     BROWSER_MCP_REVIEWED_VERSION,
@@ -1312,6 +1313,8 @@ class BrowserMcpTest(unittest.TestCase):
         self.write_version(BROWSER_MCP_REVIEWED_VERSION)
         with mock.patch("cargo_chief_safety._node_major", return_value=18):
             self.assertIn("node 20 or later", browser_unavailable_reason(self.cli))
+        with mock.patch("cargo_chief_safety._node_major", return_value=None):
+            self.assertIn("could not read the version", browser_unavailable_reason(self.cli))
         with mock.patch("cargo_chief_safety.shutil.which", return_value=None):
             self.assertEqual("node is not on PATH", browser_unavailable_reason(self.cli))
 
@@ -1342,6 +1345,17 @@ class BrowserMcpTest(unittest.TestCase):
             settings = json.loads(command[command.index("--settings") + 1])
             self.assertNotIn("hooks", settings)
             self.assertFalse(set(BROWSER_DENY_RULES) & set(settings.get("permissions", {}).get("deny", [])))
+
+    def test_a_failed_node_check_is_retried_not_cached(self):
+        self.addCleanup(cargo_chief_safety._NODE_MAJORS.clear)
+        mock.patch.stopall()
+        cargo_chief_safety._NODE_MAJORS.clear()
+        ok = mock.Mock(stdout="v22.1.0\n")
+        with mock.patch("cargo_chief_safety.subprocess.run", side_effect=[subprocess.TimeoutExpired("node", 10), ok]) as run:
+            self.assertIsNone(cargo_chief_safety._node_major("/n"))
+            self.assertEqual(22, cargo_chief_safety._node_major("/n"))
+            self.assertEqual(22, cargo_chief_safety._node_major("/n"))
+        self.assertEqual(2, run.call_count)
 
     def test_lockfile_pins_the_reviewed_version(self):
         source = Path(__file__).resolve().parents[1] / "mcp" / "playwright"
