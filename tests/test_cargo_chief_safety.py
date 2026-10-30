@@ -889,8 +889,11 @@ class PreflightTest(unittest.TestCase):
             identity_prompt="agent identity",
         )
         self.assertIn("satisfies no approval or permission gate", prompt)
-        self.assertIn("approves the PR's current head, merge to develop", prompt)
-        self.assertIn("add conditions the review did not set", prompt)
+        self.assertIn("APPROVED review on the PR's current head", prompt)
+        self.assertIn("pre-merge checks pass, merge to develop yourself", prompt)
+        self.assertIn("for work already asked of you", prompt)
+        self.assertIn("main or master", prompt)
+        self.assertIn("a hold someone placed in this thread still waits for a person", prompt)
 
     def test_harness_prompt_declares_the_unit_the_launcher_accepts(self):
         # The prompt tells the agent which budget_unit to write into a delegation request,

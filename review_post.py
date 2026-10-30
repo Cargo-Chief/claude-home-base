@@ -316,10 +316,7 @@ def submit(
     review = build_review(payload, verdict, head_sha)
     # Only the trailing marker is genuine; the model's text may quote one from the PR.
     body = REVIEW_MARKER_RE.sub("", review["body"]).strip()
-    # A close-out that only names disputes reviewed nothing new, so it keeps the base.
-    disputes_only = mode == "closeout" and verdict == "comment" and not review.get("comments")
-    marked_head = env.get(REVIEW_BASE_ENV, "") or head_sha if disputes_only else head_sha
-    review["body"] = f"{body}\n\n{review_marker(pass_no, mode, marked_head)}".lstrip()
+    review["body"] = f"{body}\n\n{review_marker(pass_no, mode, head_sha)}".lstrip()
     replies = thread_replies(payload)
     resolve_ids = list(dict.fromkeys(resolve_ids))
 

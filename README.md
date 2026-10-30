@@ -45,8 +45,9 @@ refused, numbered as the last pass: the thread work over the commits since the l
 `cc-code-review --since` run with findings only when those commits go beyond the fixes, so a commit
 that adds scope late is reviewed rather than left to a person. It approves only when no thread is
 left open and the last reviewed head is still in the branch history, and requests changes when a
-new finding must be fixed. Only a thread still in dispute goes to Kirk, as a comment naming it;
-that close-out keeps the last reviewed head so the next one checks the same commits. One review runs per PR at a time. The 24-hour cap is a rate limit at twice the pass cap.
+new finding must be fixed. Only a thread still in dispute goes to Kirk, named in the body whatever
+the verdict. A rewritten branch cannot be approved, so that close-out only comments; every close-out
+marks the head it checked, and the next request starts from there. One review runs per PR at a time. The 24-hour cap is a rate limit at twice the pass cap.
 
 The turn posts only through `review_post.py`, run under the GitHub App wrapper with the absolute
 paths the task names. The deny rules block the raw reviews and GraphQL endpoints because they cannot

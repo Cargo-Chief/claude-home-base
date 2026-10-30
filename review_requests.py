@@ -523,16 +523,22 @@ def build_review_task(pr_url: str, root: Path, plan: ReviewPlan) -> str:
         )
     else:
         work = (
-            f"All {plan.max_passes} passes are used, so this is a close-out. Read the commits since "
-            f"your last pass (`git diff {plan.base}..<head>`) to check the fixes. " + _THREAD_WORK +
-            " If those commits only address your threads, do not run cc-code-review and add no new "
-            "findings. If they also change anything else, review that change: run "
+            f"All {plan.max_passes} passes are used, so this is a close-out. First run "
+            f"`git merge-base --is-ancestor {plan.base} <head>`: if it fails, the branch was "
+            "rewritten since your last pass and a close-out cannot approve it, so do only the "
+            "thread work below against the head, run no cc-code-review, and post a `comment` "
+            "saying the branch was rewritten; the next request checks from this head. Otherwise "
+            f"read the commits since your last pass (`git diff {plan.base}..<head>`) to check the "
+            "fixes. " + _THREAD_WORK + " If those commits only address your threads, do not run "
+            "cc-code-review and add no new findings. If they change anything else, or you are "
+            "not sure, review that change: run "
             f"`cc-code-review high --since {plan.base} {pr_url}` without `--comment` and raise "
             "findings only on lines that go beyond the fixes; never re-raise code you already "
-            "reviewed. Approve when every one of your threads is resolved or settled and nothing "
-            "you found must change before merge; request changes when a finding on those lines "
-            "must. Kirk needs to look only at a thread still in dispute: then post a `comment` "
-            "verdict whose body names it and says so."
+            "reviewed. A thread still in dispute is not a new finding and never a reason to "
+            "request changes: name every one in the review body and say Kirk needs to look at "
+            "it, whatever the verdict. Approve when every one of your threads is resolved or "
+            "settled and nothing you found must change before merge; request changes only for a "
+            "new finding that must; otherwise comment."
         )
     return (
         "[CARGO_CHIEF_REVIEW_TASK]\n"

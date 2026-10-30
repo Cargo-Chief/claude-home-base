@@ -250,13 +250,15 @@ class AuditAndTaskTest(unittest.TestCase):
         closeout = build_review_task(PR, Path("/root"), ReviewPlan("closeout", 3, 3, base))
         self.assertIn("this is a close-out", closeout)
         self.assertIn("only address your threads, do not run cc-code-review", closeout)
+        self.assertIn(f"git merge-base --is-ancestor {base} <head>", closeout)
+        self.assertIn("never a reason to request changes", closeout)
         self.assertIn(f"cc-code-review high --since {base} {PR}", closeout)
         self.assertIn("only on lines that go beyond the fixes", closeout)
         self.assertIn(f"git diff {base}..<head>", closeout)
         full = build_review_task(PR, Path("/root"), ReviewPlan("full", 1, 3))
         self.assertIn("If you have open threads from earlier reviews", full)
         self.assertIn("--resolve <id>", full)
-        self.assertIn("Kirk needs to look only at a thread still in dispute", closeout)
+        self.assertIn("say Kirk needs to look at it, whatever the verdict", closeout)
 
     def test_task_posts_through_review_post_with_a_verdict(self):
         task = build_review_task(PR, Path("/root"), ReviewPlan("full", 1, 3))
