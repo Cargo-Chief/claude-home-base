@@ -2502,6 +2502,12 @@ def process_message_async(
     if review and use_openai:
         review_admission.refuse("refused_provider", PROVIDER_REPLY)
         return
+    if review_notice and use_openai:
+        # A Codex turn would run as the peer bot; leave the thread for a person to resume.
+        slack_client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
+        )
+        return
 
     # Replace user mentions with readable names
     text = re.sub(
@@ -2689,6 +2695,13 @@ def process_message_async(
                 # A review is never steered into a running process, and that process is not ours.
                 session = None
                 raise _ReviewBusy()
+            if review_notice and session is None:
+                # A notice only wakes a live session; a fresh process would run as the peer bot.
+                _clear_eyes(reaction_channel, reaction_msg_ts)
+                slack_client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
+                )
+                return
             if not (session and session.turn_lock.locked()):
                 _turn_admission.acquire(
                     lambda: _post_queue_notice(channel, thread_ts)
@@ -2719,7 +2732,8 @@ def process_message_async(
                 # A person already started a turn in the new thread; the brief is its opening message.
                 _clear_eyes(reaction_channel, reaction_msg_ts)
                 return
-            session.turn_senders.add(user_id)
+            if not review_notice:
+                session.turn_senders.add(user_id)
             _send_to_claude(session, text)
             session.pending_reactions.append((reaction_channel, reaction_msg_ts))
             audit_interaction(event, "(steered into running turn)", 0.0, session.session_id)
@@ -3357,22 +3371,44 @@ def _lookup_review_pr(pr_url: str, root: Path, include_reviews: bool = True):
 _review_notices = ReviewNoticeStore(STATE_DIR / "review-notices.json")
 
 REVIEW_NOTICE_MESSAGE = (
-    "Your peer agent's review of {pr} has ended. Read the verdict and its threads on the PR, "
-    "then carry on with this thread's work."
+    "Your peer agent's review turn on {pr} has ended. Read the verdict and its threads on the PR."
 )
+REVIEW_NOTICE_IDLE = "The peer review of {pr} has ended. Tell me to continue when ready."
+
+
+def _live_session_for(thread: str, channel: str) -> "LiveSession | None":
+    with _live_sessions_lock:
+        session = _live_sessions.get(thread)
+    if session and session.channel == channel and session.proc.poll() is None:
+        return session
+    return None
 
 
 def _start_review_notice(entry: dict, event: dict) -> None:
-    """Wake the thread that asked for a review: a visible note, then a turn with no authority."""
+    """Wake the thread that asked for a review, only while its own session is live.
+
+    The recorded origin comes from the agent's environment, so a turn starts only in a thread with
+    a live session in that channel; otherwise a configured room gets a note and nothing else.
+    """
     channel, thread, pr = entry["channel"], entry["thread"], entry["pr"]
+    session = _live_session_for(thread, channel)
+    if session is None:
+        if channel in room_channel_ids(_load_model_config()):
+            try:
+                slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=REVIEW_NOTICE_IDLE.format(pr=pr))
+            except Exception:
+                pass
+        audit_logger.info("REVIEW_NOTICE | CHANNEL:%s | THREAD:%s | PR:%s | OUTCOME:idle", channel, thread, pr)
+        return
     try:
         note_ts = slack_client.chat_postMessage(
             channel=channel, thread_ts=thread, text=f"The peer review of {pr} has ended; picking it up.",
         )["ts"]
     except Exception as exc:
-        audit_logger.warning("REVIEW_NOTICE_FAILED | CHANNEL:%s | THREAD:%s | REASON:%s",
-                             channel, thread, type(exc).__name__)
+        audit_logger.warning("REVIEW_NOTICE | CHANNEL:%s | THREAD:%s | PR:%s | OUTCOME:failed_%s",
+                             channel, thread, pr, type(exc).__name__)
         return
+    audit_logger.info("REVIEW_NOTICE | CHANNEL:%s | THREAD:%s | PR:%s | OUTCOME:woken", channel, thread, pr)
     notice = {
         "type": "review_notice",
         "user": event.get("user", ""),
@@ -3382,7 +3418,7 @@ def _start_review_notice(entry: dict, event: dict) -> None:
         "ts": note_ts,
         "text": REVIEW_NOTICE_MESSAGE.format(pr=pr),
     }
-    process_message_async(notice, review_notice={"pr": pr, "room_user": entry.get("room_user", "")})
+    process_message_async(notice, review_notice={"pr": pr, "room_user": session.user_id})
 
 
 def _spawn_review_admission(target, *args) -> None:
@@ -3417,7 +3453,7 @@ _review_requests = ReviewRequestHandler(
     start_turn=lambda admission: process_message_async(admission.event, review_admission=admission),
     spawn=_spawn_review_admission,
     notices=_review_notices,
-    start_notice=lambda entry, event: _start_review_notice(entry, event),
+    start_notice=_start_review_notice,
 )
 
 
@@ -3784,6 +3820,8 @@ def main():
                 notices=_review_notices,
             )
         except PeerRequestError as exc:
+            if exc.outcome == "sent_uncharged":
+                raise SystemExit(f"review requested, but {exc}") from exc
             raise SystemExit(f"review request refused: {exc}") from exc
         print(f"review requested in {room}")
         return

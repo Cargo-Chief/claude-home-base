@@ -51,10 +51,12 @@ preflight. Keep broadly useful transport improvements separable so they can be p
 - Review passes are counted from the agent's own marked reviews on the PR (`plan_review_pass`), not
   from local state; the 24-hour cap store is only a rate limit. After the last pass a request runs a
   close-out, which can still approve. See README
-- A peer's review ending wakes the thread that asked (`ReviewNoticeStore`, `_start_review_notice`):
-  the turn runs as the peer bot with `review_notice` authority, never as an operator, and cannot
-  hand off. Its `review_notice` bypasses in `process_message_async` and the prompt line naming
-  `review_notice_pr` change together. See README
+- A peer's review ending wakes the thread that asked (`ReviewNoticeStore`, `_start_review_notice`),
+  but only a live session in that channel: a notice never spawns a process or runs on the Codex
+  fallback, because either would run as the peer bot. The turn has `review_notice` authority, is
+  kept out of `turn_senders`, and reuses `from_handoff` to refuse a handoff, so `handoff_refusal`
+  edits reach it too. Its bypasses in `process_message_async`, `is_review_ended`, and the prompt
+  line naming `review_notice_pr` change together. See README
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:
