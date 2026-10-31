@@ -178,8 +178,9 @@ the installed package at the reviewed version (`BROWSER_MCP_REVIEWED_VERSION`); 
 each principal's checkout, as that user, with `npm ci` in `mcp/playwright/`. Until then preflight
 warns with the reason and sessions start without it. Review-only turns never get it. Actions,
 screenshots included, time out after 30 s (`BROWSER_ACTION_TIMEOUT_MS`) rather than Playwright's 5 s,
-which screenshots under the agent service exceeded. An element that never stops
-animating still fails its stability wait; disabling animations with `browser_evaluate` gets past it.
+which screenshots under the agent service exceeded. An element screenshot still fails its stability
+wait on an element that never stops moving: injecting CSS that disables animations and transitions
+with `browser_evaluate` fixes CSS motion only, and a full-page screenshot skips that wait.
 
 Playwright resolves a named file against the session cwd (the bundle or thread workspace), outside
 the Edit/Write rails, and its `file:` block checks only a URL's outer scheme (`view-source:file://`
