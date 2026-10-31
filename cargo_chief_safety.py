@@ -1357,6 +1357,8 @@ BROWSER_MCP_CLI = BROWSER_MCP_PACKAGE / "cli.js"
 # The deny rules and the guard were reviewed against this version's tool list; a bump repeats that.
 BROWSER_MCP_REVIEWED_VERSION = "0.0.83"
 BROWSER_MIN_NODE_MAJOR = 20
+# Playwright's 5 s default was too short for screenshots under the agent service.
+BROWSER_ACTION_TIMEOUT_MS = 30_000
 # run_code_unsafe executes arbitrary JavaScript in the server process, outside the Bash rails;
 # file_upload and drop send local files to whatever page is open.
 BROWSER_DENY_RULES = (
@@ -1425,7 +1427,7 @@ def browser_mcp_config(output_dir: Path, cli: Path = BROWSER_MCP_CLI) -> dict | 
                 "command": shutil.which("node"),
                 "args": [
                     str(cli), "--headless", "--isolated", "--no-webmcp",
-                    "--output-dir", str(output_dir),
+                    "--output-dir", str(output_dir), "--timeout-action", str(BROWSER_ACTION_TIMEOUT_MS),
                 ],
             },
         },

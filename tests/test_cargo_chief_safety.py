@@ -1438,7 +1438,10 @@ class BrowserMcpTest(unittest.TestCase):
         server = browser_mcp_config(self.output, self.cli)["mcpServers"]["playwright"]
         self.assertEqual("/opt/homebrew/bin/node", server["command"])
         self.assertEqual(
-            [str(self.cli), "--headless", "--isolated", "--no-webmcp", "--output-dir", str(self.output)],
+            [
+                str(self.cli), "--headless", "--isolated", "--no-webmcp", "--output-dir", str(self.output),
+                "--timeout-action", "30000",
+            ],
             server["args"],
         )
 
