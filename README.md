@@ -163,11 +163,14 @@ that Claude owners delegate natively; for them it reads `CLAUDE_CODE_OAUTH_TOKEN
 owner session's shell does not reliably carry it.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
 `CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live work sessions plus one peer-review session
-(`REVIEW_SESSION_SLOTS`). Reviews never evict: a second review waits for that slot, with a queued note
-in `#pr-reviews`, and still takes a turn-admission slot when it runs. At the work cap the oldest idle
-work thread is evicted, but a thread waiting on a peer's review (`ReviewNoticeStore.waiting_threads`)
-goes last, so it is normally still live to be woken; the 3-hour idle cleanup can still close it. A turn
-stops after at most 15
+(`REVIEW_SESSION_SLOTS`, `session_lifecycle.ReviewSlots`). Reviews never evict. Up to two more
+(`REVIEW_QUEUE_DEPTH`) wait for the slot, with one queued note, for at most an hour
+(`REVIEW_QUEUE_WAIT`); past either bound the request is refused aloud (`refused_queue`). A review that
+waited re-checks the provider and that the PR is still open before it starts. At the work cap the oldest
+idle work thread is evicted: a thread whose review hand-back is being delivered (`LiveSession.waking`)
+never, and one that asked a peer for a review in the last two hours (`REVIEW_WAIT_PROTECTION`) last, so
+it is normally still live to be woken; the 3-hour idle cleanup can still close it. A turn stops after at
+most 15
 minutes without owner output; a native subagent's streamed events count as output, and so does an
 owner tool call that is still running (for up to 30 minutes per call), so a quiet test run is not
 cut off. `TURN_TIMEOUT` logs `LIMIT:inactivity` or `LIMIT:hard`. On the OpenAI

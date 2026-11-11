@@ -373,9 +373,13 @@ class ReviewNoticeStore:
         entry = {"pr": pr, "channel": channel, "thread": thread, "at": self.clock()}
         self._locked(lambda data: (data.__setitem__(request_ts, entry), True))
 
-    def waiting_threads(self) -> set[str]:
-        """Threads that asked a peer for a review whose hand-back has not arrived yet."""
-        return self._locked(lambda data: ({entry.get("thread", "") for entry in data.values()} - {""}, False))
+    def waiting_threads(self, max_age: float) -> set[str]:
+        """Threads that asked a peer for a review in the last ``max_age`` seconds and have no hand-back yet."""
+        cutoff = self.clock() - max_age
+
+        def recent(data: dict) -> tuple[set[str], bool]:
+            return {entry.get("thread", "") for entry in data.values() if entry["at"] > cutoff} - {""}, False
+        return self._locked(recent)
 
     def take(self, request_ts: str, pr: str) -> dict | None:
         """The entry for that request and PR, removed; None if there is none."""

@@ -124,6 +124,8 @@ from provider_control import (
 from reply_routing import ReplyRouteStore
 from review_requests import (
     BUSY_REPLY,
+    LOOKUP_FAILED_REPLY,
+    NOT_OPEN_REPLY,
     CONFIG_REPLY,
     ERROR_REPLY,
     PROVIDER_REPLY,
@@ -146,6 +148,7 @@ from session_lifecycle import (
     BackgroundAgents,
     PendingTools,
     REVIEW_SESSION_SLOTS,
+    ReviewSlots,
     TurnAdmission,
     needs_eviction,
     oldest_evictable_session,
@@ -685,8 +688,11 @@ IDLE_TIMEOUT = 10800  # 3 hours — kill process if no messages
 STOP_WAIT_SECONDS = 30  # a tree stop takes at most its grace plus kill wait
 MAX_LIVE_SESSIONS = RUNTIME_POLICY.max_live_sessions
 _turn_admission = TurnAdmission(MAX_LIVE_SESSIONS)
-# Peer reviews wait for their own session slot instead of evicting a work thread.
-_review_slots = TurnAdmission(REVIEW_SESSION_SLOTS)
+# Peer reviews wait for their own session slot instead of evicting a work thread; the queue is bounded.
+REVIEW_QUEUE_DEPTH = 2
+REVIEW_QUEUE_WAIT = 3600  # seconds a review may wait for the slot
+REVIEW_WAIT_PROTECTION = 7200  # seconds a thread that asked for a review is evicted last
+_review_slots = ReviewSlots(REVIEW_SESSION_SLOTS, max_waiting=REVIEW_QUEUE_DEPTH)
 
 
 @dataclass
@@ -748,6 +754,8 @@ class LiveSession:
     stop_done: threading.Event | None = None
     # Set once output arrives with no turn running; cleared when the next turn starts
     after_turn_noticed: bool = False
+    # Set while a review hand-back is queued to wake this thread; such a session is never evicted
+    waking: bool = False
 
 
 # thread_ts → LiveSession
@@ -1042,12 +1050,13 @@ def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
 
 
 REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatically"
+REVIEW_QUEUE_FULL_REPLY = "Too many reviews are waiting here right now; ask again later."
 
 
 def _post_queue_notice(channel: str, thread_ts: str, note: str = "") -> None:
     """Tell the requester that admission is delayed, without dropping the turn."""
     try:
-        note = note or "queued — Ned is finishing another thread; this request will start automatically"
+        note = note or f"queued — {BOT_DISPLAY_NAME} is finishing another thread; this request will start automatically"
         slack_client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
             text=note,
@@ -1470,11 +1479,6 @@ def _get_or_create_live_session(
                 close_process_tree(replaced.proc, replaced.proc.stdin.close, wait=10)
             except Exception as e:
                 logger.warning(f"Could not stop replaced pid={replaced.proc.pid}: {e}")
-    try:
-        waiting = _review_notices.waiting_threads()
-    except Exception as exc:
-        logger.warning(f"Review notice record unusable for eviction: {type(exc).__name__}")
-        waiting = set()
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
         if not fresh and session and session.proc.poll() is None and not session.stop_done:
@@ -1483,14 +1487,15 @@ def _get_or_create_live_session(
         if existing_only:
             raise _NoLiveSession()
 
-        # At the work cap, evict the oldest idle work thread, sparing one that waits on a peer's review where
-        # possible. This thread's own stale entry and dead or stopping sessions do not count.
+        # At the work cap, evict the oldest idle work thread; one being woken is never chosen, and one waiting on
+        # a peer's review goes last. This thread's own stale entry and exited processes do not count.
         work = {
             ts: live for ts, live in _live_sessions.items()
-            if ts != thread_ts and not live.review and live.proc.poll() is None and not live.stop_done
+            if ts != thread_ts and not live.review and live.proc.poll() is None
         }
         if needs_eviction(work, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh):
-            oldest_ts = oldest_evictable_session(work, protected=waiting)
+            candidates = {ts: live for ts, live in work.items() if not live.waking}
+            oldest_ts = oldest_evictable_session(candidates, protected=_waiting_threads())
             if oldest_ts is None:
                 raise SafetyError(
                     "live session cap reached; every existing session is processing a turn"
@@ -1527,6 +1532,33 @@ def _get_or_create_live_session(
 
         threading.Thread(target=_reader_loop, args=(session,), daemon=True).start()
         return session
+
+
+def _waiting_threads() -> set[str]:
+    """Threads with a recent, unanswered peer-review request; empty if the record is unusable."""
+    try:
+        return _review_notices.waiting_threads(REVIEW_WAIT_PROTECTION)
+    except Exception as exc:
+        logger.warning(f"Review notice record unusable for eviction: {type(exc).__name__}")
+        return set()
+
+
+def _review_still_runnable(admission, policy: RoomPolicy, thread_ts: str) -> bool:
+    """After waiting for the review slot, re-check what may have changed; refuse aloud if it did."""
+    if use_openai_provider(_get_provider_override(thread_ts), limit_paused=_limit_paused(),
+                           has_openai_session=_get_openai_session(thread_ts) is not None):
+        admission.refuse("refused_provider", PROVIDER_REPLY)
+        return False
+    try:
+        info = _lookup_review_pr(admission.pr, policy.root, include_reviews=False)
+    except Exception as exc:
+        logger.warning(f"Review re-check failed for {admission.pr}: {type(exc).__name__}")
+        admission.refuse("refused_lookup", LOOKUP_FAILED_REPLY)
+        return False
+    if info.state != "OPEN":
+        admission.refuse("refused_state", NOT_OPEN_REPLY)
+        return False
+    return True
 
 
 def _close_review_session(session: LiveSession) -> None:
@@ -2754,10 +2786,20 @@ def process_message_async(
                 return
             if not (session and session.turn_lock.locked()):
                 if review:
-                    _review_slots.acquire(lambda: _post_queue_notice(channel, thread_ts, REVIEW_QUEUE_NOTE))
+                    slot = _review_slots.acquire(
+                        REVIEW_QUEUE_WAIT, lambda: _post_queue_notice(channel, thread_ts, REVIEW_QUEUE_NOTE),
+                    )
+                    if slot in ("full", "timeout"):
+                        _clear_eyes(reaction_channel, reaction_msg_ts)
+                        review_admission.refuse("refused_queue", REVIEW_QUEUE_FULL_REPLY)
+                        return
                     review_slot_held = True
+                    if slot == "queued" and not _review_still_runnable(review_admission, room_policy, thread_ts):
+                        _clear_eyes(reaction_channel, reaction_msg_ts)
+                        return
+                # A review already said it was queued, so it waits for a turn without a second note.
                 _turn_admission.acquire(
-                    lambda: _post_queue_notice(channel, thread_ts)
+                    None if review else lambda: _post_queue_notice(channel, thread_ts)
                 )
                 turn_admitted = True
                 session = _get_or_create_live_session(
@@ -2814,6 +2856,7 @@ def process_message_async(
                 session._turn_done.clear()
                 session.turn_senders = {user_id}
                 session.limit_notices.clear()
+                session.waking = False
                 with _live_sessions_lock:
                     _handoff_stops.discard(thread_ts)
                 if session.workspace:
@@ -2958,6 +3001,8 @@ def process_message_async(
             _turn_admission.release()
         if review_slot_held:
             _review_slots.release()
+        if review_notice and session is not None:
+            session.waking = False
 
     duration = time.time() - start
 
@@ -3569,8 +3614,8 @@ def _start_review_notice(entry: dict, event: dict) -> None:
     try:
         session = _live_session_for(thread, channel)
         if session is not None:
-            # Its notice record is gone now, so make it the newest session while it queues for admission.
-            session.last_activity = time.time()
+            # Its notice record is gone now, so mark it unevictable until its turn runs.
+            session.waking = True
         if session is None:
             if _notice_room(channel):
                 slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=REVIEW_NOTICE_IDLE.format(pr=pr))

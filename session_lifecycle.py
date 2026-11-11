@@ -29,14 +29,41 @@ class TurnAdmission:
         self._semaphore.release()
 
 
-REVIEW_SESSION_SLOTS = 1  # peer-review sessions, held outside the work-session cap; extra reviews queue
+REVIEW_SESSION_SLOTS = 1  # peer-review sessions, held outside the work-session cap
 
 
-def needs_eviction(sessions: Mapping[str, Any], *, max_work_sessions: int, new_is_review: bool) -> bool:
-    """Whether a new session must evict one first; reviews queue for their own slot and never evict."""
-    if new_is_review:
-        return False
-    return sum(1 for session in sessions.values() if not session.review) >= max_work_sessions
+class ReviewSlots:
+    """Review sessions held outside the work cap; a bounded number of requests may wait for one."""
+
+    def __init__(self, slots: int, *, max_waiting: int):
+        self._semaphore = threading.BoundedSemaphore(slots)
+        self._lock = threading.Lock()
+        self._waiting = 0
+        self.max_waiting = max_waiting
+
+    def acquire(self, timeout: float, on_queued: Callable[[], None] | None = None) -> str:
+        """'free' or 'queued' when a slot is held; 'full' or 'timeout' when none was taken."""
+        if self._semaphore.acquire(blocking=False):
+            return "free"
+        with self._lock:
+            if self._waiting >= self.max_waiting:
+                return "full"
+            self._waiting += 1
+        try:
+            if on_queued is not None:
+                on_queued()
+            return "queued" if self._semaphore.acquire(timeout=timeout) else "timeout"
+        finally:
+            with self._lock:
+                self._waiting -= 1
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
+def needs_eviction(work_sessions: Mapping[str, Any], *, max_work_sessions: int, new_is_review: bool) -> bool:
+    """Whether a new session must evict a work session first; a review has its own slot and never does."""
+    return not new_is_review and len(work_sessions) >= max_work_sessions
 
 
 def oldest_evictable_session(sessions: Mapping[str, Any], protected: Collection[str] = ()) -> str | None:

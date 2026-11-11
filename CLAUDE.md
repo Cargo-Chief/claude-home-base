@@ -54,9 +54,10 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   from local state; the 24-hour cap store is only a rate limit. After the last pass a request runs a
   close-out, which reviews only what goes beyond the fixes and can still approve. See README
 - A peer's review ending wakes the thread that asked (`ReviewNoticeStore`, `_start_review_notice`),
-  but only a live session in that channel. Reviews queue for their own session slot (`_review_slots`) and
-  never evict, and work-session eviction spares waiting threads first (`oldest_evictable_session(protected=)`),
-  so that session is normally still live. A notice never spawns a process or runs on the Codex
+  but only a live session in that channel. Reviews queue (bounded) for their own session slot
+  (`_review_slots`) and never evict; work eviction never takes a `waking` session and takes threads with a
+  recent request (`_waiting_threads`) last, so that session is normally still live. A notice never spawns a
+  process or runs on the Codex
   fallback, because either would run as the peer bot (`existing_only` in
   `_get_or_create_live_session`). The turn has `review_notice` authority, counts in `turn_senders`,
   and reuses `from_handoff` to refuse a handoff, so `handoff_refusal` edits reach it too. Its bypasses in `process_message_async`, `is_review_ended`, and the prompt

@@ -846,7 +846,13 @@ class ReviewNoticeTest(unittest.TestCase):
         self.store.add("9.1", pr=PR, channel="CWORK", thread="5.1")
         self.store.add("9.2", pr=PR, channel="CWORK", thread="6.1")
         self.store.take("9.2", PR)
-        self.assertEqual({"5.1"}, self.store.waiting_threads())
+        self.assertEqual({"5.1"}, self.store.waiting_threads(3600))
+
+    def test_an_old_request_no_longer_counts_as_waiting(self):
+        self.store.add("9.1", pr=PR, channel="CWORK", thread="5.1")
+        self.now += 7201
+        self.store.add("9.2", pr=PR, channel="CWORK", thread="6.1")
+        self.assertEqual({"6.1"}, self.store.waiting_threads(7200))
 
     def test_an_unreadable_record_raises_and_is_not_reset(self):
         self.store.path.write_text("{not json", encoding="utf-8")
