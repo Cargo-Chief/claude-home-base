@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import re
 import subprocess
@@ -20,9 +20,12 @@ CLAUDE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 LIMIT_RESET_RE = re.compile(
-    r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?", re.IGNORECASE,
+    r"resets\s+(?:at\s+)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)(?:\s*\(([^)]+)\))?", re.IGNORECASE,
 )
 LIMIT_RESET_BUFFER = 120  # seconds, so a resume never lands a minute before the limit lifts
+LIMIT_RESET_GRACE = timedelta(minutes=5)  # a reset this recent has just passed; it is not tomorrow's
+# The model name the Claude CLI puts on messages it writes itself, such as a usage-limit notice
+SYNTHETIC_MODEL = "<synthetic>"
 
 
 def is_claude_limit_notice(text: str) -> bool:
@@ -41,14 +44,18 @@ def limit_reset_epoch(text: str, now: datetime | None = None) -> float | None:
     if match.group(4):
         try:
             zone = ZoneInfo(match.group(4).strip())
-        except (ZoneInfoNotFoundError, ValueError):
+        except Exception:
             zone = None
-    current = now or datetime.now().astimezone()
     if zone is not None:
-        current = current.astimezone(zone)
-    reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if reset <= current:
+        current = (now or datetime.now(timezone.utc)).astimezone(zone)
+    else:
+        # Naive local time, so the conversion below applies the host's DST rules for the reset date.
+        current = now or datetime.now()
+    reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0, fold=0)
+    if reset <= current - LIMIT_RESET_GRACE:
         reset += timedelta(days=1)
+    elif reset < current:
+        reset = current
     return reset.timestamp() + LIMIT_RESET_BUFFER
 
 
@@ -62,7 +69,7 @@ def fallback_error_kind(error: str | None) -> str:
 
 def model_notice_text(model: str, previous: str = "") -> str | None:
     """Build truthful model attribution, excluding CLI synthetic envelopes."""
-    if not model or model == "<synthetic>" or model == previous:
+    if not model or model == SYNTHETIC_MODEL or model == previous:
         return None
     if previous:
         return f"model changed: {previous} → {model}"

@@ -43,8 +43,9 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   range 1–10) are optional. See README's safety gate
 - A review turn's process is closed when the turn ends, so the reader ends a review only at a
   `result` after its `REVIEW_DONE_MARKER` line with no background subagent running
-  (`session_lifecycle.BackgroundAgents`), or at the first `result` after a usage-limit notice
-  (`LiveSession.limit_hit`); every other `result` is a pause. See README
+  (`session_lifecycle.BackgroundAgents`), or at the first `result` after a CLI-written usage-limit
+  notice (`LiveSession.limit_hit`; only `<synthetic>` messages count, never quoted model text); every
+  other `result` is a pause. See README
 - A review turn writes to GitHub only through `review_post.py` (verdict, inline comments, resolving
   its own threads); approvals need the requester in `peer_review.github_logins`. The review token
   (`REVIEW_TOKEN_PERMISSIONS`) may be refused a resolve, so an approval can post over a thread the

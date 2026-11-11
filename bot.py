@@ -35,7 +35,6 @@ import urllib.error
 import urllib.request
 import signal
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -111,6 +110,7 @@ from process_control import close_process_tree, stop_process_tree
 from slack_transport import NoUnfurlMixin, RecentEvents
 from openai_fallback import (
     fallback_error_kind,
+    SYNTHETIC_MODEL,
     is_claude_limit_notice,
     limit_reset_epoch,
     model_notice_text,
@@ -732,7 +732,9 @@ class LiveSession:
     background_agents: BackgroundAgents = field(default_factory=BackgroundAgents)
     # Set once the review's reply carries REVIEW_DONE_MARKER
     review_done: bool = False
-    # Set once a review turn sees a usage-limit notice: nothing more will run, so the review ends
+    # Usage-limit notices the CLI itself emitted (model "<synthetic>"); quoted model text never lands here
+    limit_notices: set[str] = field(default_factory=set)
+    # Set once a review turn sees such a notice: nothing more will run, so the review ends
     limit_hit: bool = False
     # Slack users whose messages started or were steered into the running turn
     turn_senders: set[str] = field(default_factory=set)
@@ -1225,7 +1227,7 @@ def _take_review_marker(session: LiveSession, text_blocks: list[str]) -> list[st
 def _pause_review_turn(session: LiveSession) -> None:
     """A review turn that ended without finishing: its text is narration, folded into the status."""
     for text in session.pre_tool_text:
-        if text.strip() == "SKIP" or is_claude_limit_notice(text) or _ATTACH_PATTERN.search(text):
+        if text.strip() == "SKIP" or text in session.limit_notices or _ATTACH_PATTERN.search(text):
             if session._on_text:
                 _deliver_text(session, text)
         elif session.reporter:
@@ -1302,9 +1304,12 @@ def _reader_loop(session: LiveSession) -> None:
                     if isinstance(block, dict) and block.get("type") == "text"
                     and block.get("text", "").strip()
                 ]
-                if session.review:
-                    if any(is_claude_limit_notice(text) for text in text_blocks):
+                if data.get("message", {}).get("model") == SYNTHETIC_MODEL:
+                    notices = {text for text in text_blocks if is_claude_limit_notice(text)}
+                    session.limit_notices |= notices
+                    if notices and session.review:
                         session.limit_hit = True
+                if session.review:
                     text_blocks = _take_review_marker(session, text_blocks)
                 if not session.turn_lock.locked() and not session.after_turn_noticed:
                     _notice_output_after_turn(session)
@@ -1326,7 +1331,7 @@ def _reader_loop(session: LiveSession) -> None:
                         _post_skill_notice(session, inp.get("skill", "?"), args_str)
                 if session.reporter and session.reporter.active:
                     for text in text_blocks:
-                        if (text.strip() == "SKIP" or is_claude_limit_notice(text)
+                        if (text.strip() == "SKIP" or text in session.limit_notices
                                 or _ATTACH_PATTERN.search(text)):
                             if session._on_text:
                                 _deliver_text(session, text)
@@ -2656,10 +2661,10 @@ def process_message_async(
         """Called for each text block Claude produces — post it to Slack immediately."""
         nonlocal first_text_sent, skip_detected, fallback_requested
 
-        # Usage-limit notices are synthesized by the CLI, not the model.
+        # Usage-limit notices are synthesized by the CLI, not the model; the reader records only those.
         # Suppress them and replay the same authenticated turn through the
         # configured OpenAI fallback after the Claude result closes.
-        if is_claude_limit_notice(text_block):
+        if session is not None and text_block in session.limit_notices:
             _enter_limit_pause(text_block)
             fallback_requested = True
             logger.warning(f"Usage limit hit in thread {thread_ts}")
@@ -2844,8 +2849,10 @@ def process_message_async(
                 fallback_workspace = None
                 if fallback_requested and review:
                     # The Codex fallback carries none of the review-only controls.
-                    all_texts.append(PROVIDER_REPLY)
-                    post_response(channel, PROVIDER_REPLY, thread_ts=thread_ts)
+                    # A review that already posted its reply needs no "paused" note under it.
+                    if not session.review_done:
+                        all_texts.append(PROVIDER_REPLY)
+                        post_response(channel, PROVIDER_REPLY, thread_ts=thread_ts)
                 elif fallback_requested and review_notice:
                     # A Codex turn would run as the peer bot.
                     note = REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"])

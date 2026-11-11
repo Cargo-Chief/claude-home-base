@@ -205,7 +205,13 @@ class BotTurnStructureTest(unittest.TestCase):
 
     def test_reader_keeps_on_text_filters_for_skip_limit_and_attachments(self):
         reader = ast.unparse(self._function("_reader_loop"))
-        self.assertIn("text.strip() == 'SKIP' or is_claude_limit_notice(text) or _ATTACH_PATTERN.search(text)", reader)
+        self.assertIn("text.strip() == 'SKIP' or text in session.limit_notices or _ATTACH_PATTERN.search(text)", reader)
+        self.assertIn("data.get('message', {}).get('model') == SYNTHETIC_MODEL", reader)
+
+    def test_on_text_treats_only_the_cli_notice_as_a_limit(self):
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("session is not None and text_block in session.limit_notices", process)
+        self.assertNotIn("is_claude_limit_notice(text_block)", process)
 
     def test_heartbeat_uses_the_guarded_pass(self):
         heartbeat = ast.unparse(self._function("_reporter_heartbeat"))

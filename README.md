@@ -72,10 +72,13 @@ carrying that line is posted as the reply as soon as it arrives, without the lin
 ends at the first `result` after it while no background subagent it started (the review's
 finders) is still running. Any other `result` pauses the turn: its text folds into the status
 line, and the turn continues when a finder's notification starts the next one. The one exception is
-a usage-limit notice (`is_claude_limit_notice`, e.g. "You've hit your 5-hour limit"): no finder can
-progress after it, so the turn ends at its next `result` and replies `PROVIDER_REPLY` rather than
-idling into the inactivity timeout. The notice also starts the account-wide limit pause, read in
-the zone the notice names, so further requests are refused at once until the reset. A review that
+a usage-limit notice the CLI wrote itself (message model `<synthetic>`, text matching
+`is_claude_limit_notice`, e.g. "You've hit your 5-hour limit"): no finder can progress after it, so
+the turn ends at its next `result` and replies `PROVIDER_REPLY` (unless it already posted its reply)
+rather than idling into the inactivity timeout. Model text that merely quotes such a line, as a
+review of this code will, is ordinary text in every turn. The notice also starts the account-wide
+limit pause until the reset, read in the zone the notice names (else the host's local time), so
+further requests are refused at once. A review that
 already posted its completion line and then times out ends without a timeout note. Background shell tasks and `Monitor`
 timers are not counted; they die with the process. While a finder is tracked (at most 30 minutes
 each) the inactivity limit does not fire, so `REVIEW_MAX_RUNTIME` (45 minutes) is the bound that

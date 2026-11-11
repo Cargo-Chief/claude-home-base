@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 import json
+import os
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -53,6 +55,39 @@ class OpenAIFallbackTest(unittest.TestCase):
             with self.subTest(notice=notice):
                 self.assertEqual(datetime(2026, 11, 11, 16, 0, tzinfo=timezone.utc).timestamp() + 120,
                                  limit_reset_epoch(notice, now=now))
+
+    def test_a_reset_just_past_is_now_not_tomorrow(self):
+        now = datetime(2026, 11, 11, 16, 0, 5, tzinfo=timezone.utc)
+        self.assertEqual(now.timestamp() + 120, limit_reset_epoch("resets 4pm (UTC)", now=now))
+
+    def test_impossible_times_are_not_parsed(self):
+        now = datetime(2026, 11, 11, 1, 0, tzinfo=timezone.utc)
+        for notice in ("resets 4:99pm (UTC)", "resets 13pm (UTC)", "resets 0am (UTC)"):
+            with self.subTest(notice=notice):
+                self.assertIsNone(limit_reset_epoch(notice, now=now))
+
+    def test_unloadable_zone_names_fall_back_without_raising(self):
+        now = datetime(2026, 11, 11, 1, 0, tzinfo=timezone.utc)
+        for zone in ("America", "../etc/passwd", "/etc/hosts", "x" * 5000, "PST"):
+            with self.subTest(zone=zone[:20]):
+                self.assertIsNotNone(limit_reset_epoch(f"resets 4pm ({zone})", now=now))
+
+    def test_zoneless_reset_applies_the_host_dst_rules(self):
+        if not hasattr(time, "tzset"):
+            self.skipTest("needs time.tzset")
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        try:
+            # 23:00 PDT the night before fall-back; 4am the next morning is PST, 12:00 UTC.
+            reset = limit_reset_epoch("resets 4am", now=datetime(2026, 10, 31, 23, 0))
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+        self.assertEqual(datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc).timestamp() + 120, reset)
 
     def test_no_reset_time_returns_none(self):
         self.assertIsNone(limit_reset_epoch("You've hit your weekly limit · resets Sep 2 at 7pm"))
