@@ -3,25 +3,53 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 import json
 import re
 import subprocess
 import threading
 import time
 from typing import Callable, Iterable, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from session_lifecycle import wait_for_turn_completion
 
 
 CLAUDE_LIMIT_RE = re.compile(
-    r"You've hit your (?:(?:usage|weekly|monthly(?: spend)?) )?limit",
+    r"You've hit your (?:(?:usage|weekly|monthly(?: spend)?|session|daily|\d+-hour) )?limit",
     re.IGNORECASE,
 )
+LIMIT_RESET_RE = re.compile(
+    r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?", re.IGNORECASE,
+)
+LIMIT_RESET_BUFFER = 120  # seconds, so a resume never lands a minute before the limit lifts
 
 
 def is_claude_limit_notice(text: str) -> bool:
     """Return whether Claude emitted an account usage-limit notice."""
     return CLAUDE_LIMIT_RE.search(text) is not None
+
+
+def limit_reset_epoch(text: str, now: datetime | None = None) -> float | None:
+    """The next 'resets 4pm (Zone)' time as an epoch, read in that zone (else local time); None if absent."""
+    match = LIMIT_RESET_RE.search(text)
+    if not match:
+        return None
+    hour = int(match.group(1)) % 12 + (12 if match.group(3).lower() == "pm" else 0)
+    minute = int(match.group(2) or 0)
+    zone = None
+    if match.group(4):
+        try:
+            zone = ZoneInfo(match.group(4).strip())
+        except (ZoneInfoNotFoundError, ValueError):
+            zone = None
+    current = now or datetime.now().astimezone()
+    if zone is not None:
+        current = current.astimezone(zone)
+    reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset <= current:
+        reset += timedelta(days=1)
+    return reset.timestamp() + LIMIT_RESET_BUFFER
 
 
 def fallback_error_kind(error: str | None) -> str:

@@ -173,6 +173,7 @@ class FakeSession:
         self.pending_tools = PendingTools()
         self.review = False
         self.review_done = False
+        self.limit_hit = False
         self.background_agents = BackgroundAgents()
         self.stop_done = None
         self.escalation_message_file = None
@@ -265,6 +266,26 @@ class ReviewReaderTest(unittest.TestCase):
         session = self.review_session([assistant_text("LIMIT"), result()], posted)
         load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
         self.assertEqual(["LIMIT"], posted)
+
+    def test_a_limit_notice_ends_the_review_instead_of_pausing(self):
+        posted = []
+        session = self.review_session([assistant_text("LIMIT"), result()], posted)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertTrue(session.limit_hit)
+        self.assertEqual(["LIMIT"], posted)
+        self.assertEqual([{"post_reply": True}], self.finished_by_result(session))
+
+    def test_a_limit_notice_ends_the_review_even_with_a_finder_marked_running(self):
+        posted = []
+        session = self.review_session([agent_started("a"), assistant_text("LIMIT"), result()], posted)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertEqual(["LIMIT"], posted)
+        self.assertEqual([{"post_reply": True}], self.finished_by_result(session))
+
+    def test_a_non_review_turn_never_sets_the_limit_flag(self):
+        session = FakeSession([assistant_text("LIMIT"), result()], on_text=lambda text: None)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertFalse(session.limit_hit)
 
     def test_a_review_never_consumes_bundle_or_parking_claims(self):
         consumed = []

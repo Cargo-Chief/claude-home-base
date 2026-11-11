@@ -112,6 +112,7 @@ from slack_transport import NoUnfurlMixin, RecentEvents
 from openai_fallback import (
     fallback_error_kind,
     is_claude_limit_notice,
+    limit_reset_epoch,
     model_notice_text,
     run_codex_turn,
 )
@@ -731,6 +732,8 @@ class LiveSession:
     background_agents: BackgroundAgents = field(default_factory=BackgroundAgents)
     # Set once the review's reply carries REVIEW_DONE_MARKER
     review_done: bool = False
+    # Set once a review turn sees a usage-limit notice: nothing more will run, so the review ends
+    limit_hit: bool = False
     # Slack users whose messages started or were steered into the running turn
     turn_senders: set[str] = field(default_factory=set)
     # Live status line, human messages and final reply for the running turn
@@ -770,27 +773,14 @@ REMINDER_EVERY = 10
 # the explicit OpenAI fallback until the reset time. Limits are account-wide,
 # so the pause is a single global, while successful fallback sessions remain
 # pinned per thread.
-LIMIT_RESET_RE = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)", re.I)
 LIMIT_PAUSE_FALLBACK = 1800  # seconds, if the reset time can't be parsed
 _limit_pause_lock = threading.Lock()
 _limit_pause = {"until": 0.0, "announced": False}
 
 
 def _parse_limit_reset(text: str) -> float:
-    """Parse 'resets 4pm (UTC)' into an epoch timestamp (next occurrence)."""
-    m = LIMIT_RESET_RE.search(text)
-    if not m:
-        return time.time() + LIMIT_PAUSE_FALLBACK
-    hour = int(m.group(1)) % 12
-    if m.group(3).lower() == "pm":
-        hour += 12
-    minute = int(m.group(2) or 0)
-    now = datetime.now(timezone.utc)
-    reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if reset <= now:
-        reset += timedelta(days=1)
-    # Small buffer so we don't resume a minute before the limit actually lifts
-    return reset.timestamp() + 120
+    """The pause end for a limit notice: its stated reset, else a fixed fallback window."""
+    return limit_reset_epoch(text) or time.time() + LIMIT_PAUSE_FALLBACK
 
 
 def _limit_paused() -> bool:
@@ -1313,6 +1303,8 @@ def _reader_loop(session: LiveSession) -> None:
                     and block.get("text", "").strip()
                 ]
                 if session.review:
+                    if any(is_claude_limit_notice(text) for text in text_blocks):
+                        session.limit_hit = True
                     text_blocks = _take_review_marker(session, text_blocks)
                 if not session.turn_lock.locked() and not session.after_turn_noticed:
                     _notice_output_after_turn(session)
@@ -1408,8 +1400,10 @@ def _reader_loop(session: LiveSession) -> None:
                             thread=session.thread_ts,
                             session_id=sid,
                         )
-                # A review ends only on its completion line, never while a finder still runs.
-                if session.review and not (session.review_done and not session.background_agents.running()):
+                # A review ends only on its completion line, never while a finder still runs,
+                # unless the account hit its usage limit and no finder can make progress.
+                if (session.review and not session.limit_hit
+                        and not (session.review_done and not session.background_agents.running())):
                     _pause_review_turn(session)
                     continue
                 _finish_turn(session, parking=parking, parking_refused=parking_refused)

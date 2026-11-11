@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import json
 import threading
 import unittest
@@ -6,6 +7,7 @@ from unittest.mock import patch
 from openai_fallback import (
     fallback_error_kind,
     is_claude_limit_notice,
+    limit_reset_epoch,
     model_notice_text,
     parse_codex_events,
     run_codex_turn,
@@ -23,6 +25,8 @@ class OpenAIFallbackTest(unittest.TestCase):
             "You've hit your limit · resets 4pm (UTC)",
             "You've hit your usage limit · resets at 4:00 pm",
             "You've hit your weekly limit · resets Sep 2 at 7pm (America/Los_Angeles)",
+            "You've hit your 5-hour limit · resets 12am (America/Los_Angeles)",
+            "You've hit your session limit · resets 2:20am (America/Los_Angeles)",
             "You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your session limit resets 3:50pm (America/Los_Angeles)",
         ):
             with self.subTest(notice=notice):
@@ -31,6 +35,27 @@ class OpenAIFallbackTest(unittest.TestCase):
     def test_does_not_treat_ordinary_errors_as_limit_notices(self):
         self.assertFalse(is_claude_limit_notice("Claude process exited with status 1"))
         self.assertFalse(is_claude_limit_notice("You've hit your tool limit"))
+
+    def test_reset_time_is_read_in_the_zone_the_notice_names(self):
+        # 23:44 in Los Angeles is 07:44 UTC; "resets 12am" is 16 minutes away, not 16 hours.
+        now = datetime(2026, 11, 11, 7, 44, tzinfo=timezone.utc)
+        reset = limit_reset_epoch("You've hit your 5-hour limit · resets 12am (America/Los_Angeles)", now=now)
+        self.assertEqual(datetime(2026, 11, 11, 8, 0, tzinfo=timezone.utc).timestamp() + 120, reset)
+
+    def test_reset_time_with_minutes_rolls_to_the_next_day_once_past(self):
+        now = datetime(2026, 11, 11, 17, 0, tzinfo=timezone.utc)
+        reset = limit_reset_epoch("You've hit your limit · resets 3:50pm (UTC)", now=now)
+        self.assertEqual(datetime(2026, 11, 12, 15, 50, tzinfo=timezone.utc).timestamp() + 120, reset)
+
+    def test_reset_time_without_a_usable_zone_uses_the_clock_given(self):
+        now = datetime(2026, 11, 11, 1, 0, tzinfo=timezone.utc)
+        for notice in ("resets 4pm", "resets 4pm (Not/AZone)"):
+            with self.subTest(notice=notice):
+                self.assertEqual(datetime(2026, 11, 11, 16, 0, tzinfo=timezone.utc).timestamp() + 120,
+                                 limit_reset_epoch(notice, now=now))
+
+    def test_no_reset_time_returns_none(self):
+        self.assertIsNone(limit_reset_epoch("You've hit your weekly limit · resets Sep 2 at 7pm"))
 
     def test_model_notice_ignores_synthetic_limit_envelope(self):
         self.assertIsNone(model_notice_text("<synthetic>"))
