@@ -29,6 +29,20 @@ class TurnAdmission:
         self._semaphore.release()
 
 
+REVIEW_SESSION_SLOTS = 1  # peer-review sessions held outside the work-session cap
+
+
+def needs_eviction(
+    sessions: Mapping[str, Any], *, max_work_sessions: int, new_is_review: bool,
+    review_slots: int = REVIEW_SESSION_SLOTS,
+) -> bool:
+    """Whether a new session must evict one first; reviews beyond their own slots count as work."""
+    reviews = sum(1 for session in sessions.values() if getattr(session, "review", False))
+    if new_is_review and reviews < review_slots:
+        return False
+    return len(sessions) - min(reviews, review_slots) >= max_work_sessions
+
+
 def oldest_evictable_session(sessions: Mapping[str, Any]) -> str | None:
     """Return the oldest unlocked session; active turns are never evictable."""
     candidates = {

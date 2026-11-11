@@ -162,7 +162,10 @@ that Claude owners delegate natively; for them it reads `CLAUDE_CODE_OAUTH_TOKEN
 `CARGO_CHIEF_ENV_FILE`) and sets it only on the Claude delegate's environment, because the
 owner session's shell does not reliably carry it.
 Logs, session maps, forwards, votes, stderr, and temporary artifacts live under the external
-`CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live sessions and stops a turn after at most 15
+`CARGO_CHIEF_RUNTIME_DIR`. Gate A permits two live work sessions, plus one peer-review session
+(`REVIEW_SESSION_SLOTS`) that never evicts a work thread, so a thread waiting on the peer's review is
+still live to be woken when it ends; a second concurrent review counts against the two. It stops a
+turn after at most 15
 minutes without owner output; a native subagent's streamed events count as output, and so does an
 owner tool call that is still running (for up to 30 minutes per call), so a quiet test run is not
 cut off. `TURN_TIMEOUT` logs `LIMIT:inactivity` or `LIMIT:hard`. On the OpenAI

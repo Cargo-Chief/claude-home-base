@@ -145,7 +145,9 @@ from review_requests import (
 from session_lifecycle import (
     BackgroundAgents,
     PendingTools,
+    REVIEW_SESSION_SLOTS,
     TurnAdmission,
+    needs_eviction,
     oldest_evictable_session,
     owner_stream_event_is_activity,
     stop_timed_out_session,
@@ -1471,8 +1473,9 @@ def _get_or_create_live_session(
         if existing_only:
             raise _NoLiveSession()
 
-        # Evict oldest idle session if at capacity
-        if len(_live_sessions) >= MAX_LIVE_SESSIONS:
+        # Evict the oldest idle session at capacity; a peer review has its own slot, so it never evicts the
+        # work thread that is waiting on the other agent's review.
+        if needs_eviction(_live_sessions, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh):
             oldest_ts = oldest_evictable_session(_live_sessions)
             if oldest_ts is None:
                 raise SafetyError(
@@ -4157,7 +4160,7 @@ def main():
     logger.info(f"Allowed channel substrings: {ALLOWED_CHANNEL_SUBSTRINGS or '(all channels)'}")
     logger.info("Project roots are resolved per room from model-config.json")
     logger.info(
-        f"Runtime: {RUNTIME_POLICY.root} (sessions={MAX_LIVE_SESSIONS}, "
+        f"Runtime: {RUNTIME_POLICY.root} (sessions={MAX_LIVE_SESSIONS}+{REVIEW_SESSION_SLOTS} review, "
         f"bundles={RUNTIME_POLICY.max_live_bundles}, timeout={CLAUDE_TIMEOUT}s, "
         "file_transfer=off, transcript_search=off)"
     )

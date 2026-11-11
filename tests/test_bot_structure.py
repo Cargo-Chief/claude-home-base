@@ -76,6 +76,13 @@ class BotTurnStructureTest(unittest.TestCase):
             self.assertIn("close_process_tree(", source, name)
             self.assertNotIn(".kill()", source, name)
 
+    def test_a_review_session_uses_its_own_slot_when_deciding_to_evict(self):
+        creation = ast.unparse(self._function("_get_or_create_live_session"))
+        self.assertIn(
+            "needs_eviction(_live_sessions, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh)", creation,
+        )
+        self.assertNotIn("len(_live_sessions) >= MAX_LIVE_SESSIONS", creation)
+
     def test_owner_inactivity_waits_on_the_busy_check_and_logs_the_limit(self):
         source = ast.unparse(self._function("process_message_async"))
         self.assertIn("delegate_active=lambda: _owner_turn_busy(session)", source)

@@ -6,6 +6,7 @@ from session_lifecycle import (
     BackgroundAgents,
     PendingTools,
     TurnAdmission,
+    needs_eviction,
     oldest_evictable_session,
     owner_stream_event_is_activity,
     stop_timed_out_session,
@@ -46,8 +47,9 @@ class FakeDoneEvent:
 
 
 class FakeSession:
-    def __init__(self, last_activity, *, active=False):
+    def __init__(self, last_activity, *, active=False, review=False):
         self.last_activity = last_activity
+        self.review = review
         self.turn_lock = threading.Lock()
         if active:
             self.turn_lock.acquire()
@@ -111,6 +113,30 @@ class SessionLifecycleTests(unittest.TestCase):
             "old-idle": FakeSession(20),
         }
         self.assertEqual("old-idle", oldest_evictable_session(sessions))
+
+    def test_a_review_takes_its_own_slot_and_evicts_no_work_thread(self):
+        waiting = {"work-a": FakeSession(10), "work-b": FakeSession(20)}
+        self.assertFalse(needs_eviction(waiting, max_work_sessions=2, new_is_review=True))
+
+    def test_a_work_session_at_the_cap_still_evicts(self):
+        sessions = {"work-a": FakeSession(10), "work-b": FakeSession(20)}
+        self.assertTrue(needs_eviction(sessions, max_work_sessions=2, new_is_review=False))
+
+    def test_a_running_review_does_not_count_against_work_sessions(self):
+        sessions = {"work-a": FakeSession(10), "review": FakeSession(20, active=True, review=True)}
+        self.assertFalse(needs_eviction(sessions, max_work_sessions=2, new_is_review=False))
+        sessions["work-b"] = FakeSession(30)
+        self.assertTrue(needs_eviction(sessions, max_work_sessions=2, new_is_review=False))
+
+    def test_a_second_review_counts_against_work_sessions(self):
+        sessions = {"work-a": FakeSession(10), "review": FakeSession(20, active=True, review=True)}
+        self.assertFalse(needs_eviction(sessions, max_work_sessions=2, new_is_review=True))
+        sessions["work-b"] = FakeSession(30)
+        self.assertTrue(needs_eviction(sessions, max_work_sessions=2, new_is_review=True))
+
+    def test_below_the_cap_nothing_is_evicted(self):
+        self.assertFalse(needs_eviction({"work-a": FakeSession(10)}, max_work_sessions=2, new_is_review=False))
+        self.assertFalse(needs_eviction({}, max_work_sessions=1, new_is_review=True))
 
     def test_refuses_to_select_when_every_session_is_active(self):
         sessions = {
