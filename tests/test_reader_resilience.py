@@ -95,6 +95,7 @@ def load_functions(**overrides):
         "stop_process_tree": _fake_stop_process_tree,
         "governed_delegate_active": lambda pid_file: False,
         "REVIEW_DONE_MARKER": "REVIEW COMPLETE",
+        "SYNTHETIC_MODEL": "<synthetic>",
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=constants + wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -173,6 +174,8 @@ class FakeSession:
         self.pending_tools = PendingTools()
         self.review = False
         self.review_done = False
+        self.limit_hit = False
+        self.limit_notices = set()
         self.background_agents = BackgroundAgents()
         self.stop_done = None
         self.escalation_message_file = None
@@ -193,6 +196,13 @@ class FakeSession:
 
 def assistant_text(*texts):
     return {"type": "assistant", "message": {"content": [{"type": "text", "text": t} for t in texts]}}
+
+
+def cli_notice(text):
+    """A message the CLI writes itself, as it does for a usage-limit notice."""
+    event = assistant_text(text)
+    event["message"]["model"] = "<synthetic>"
+    return event
 
 
 def result(sid="s-2"):
@@ -260,11 +270,35 @@ class ReviewReaderTest(unittest.TestCase):
         load_functions()["_reader_loop"](session)
         self.assertFalse(session.review_done)
 
-    def test_a_limit_notice_held_at_a_pause_still_reaches_the_turn(self):
+    def test_a_quoted_limit_string_at_a_pause_is_folded_and_does_not_end_the_review(self):
         posted = []
         session = self.review_session([assistant_text("LIMIT"), result()], posted)
         load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertFalse(session.limit_hit)
+        self.assertEqual([], posted)
+        self.assertEqual(["LIMIT"], session.reporter.texts)
+        self.assertEqual([], self.finished_by_result(session), "model text is not the CLI's notice")
+
+    def test_a_limit_notice_ends_the_review_instead_of_pausing(self):
+        posted = []
+        session = self.review_session([cli_notice("LIMIT"), result()], posted)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertTrue(session.limit_hit)
         self.assertEqual(["LIMIT"], posted)
+        self.assertEqual([{"post_reply": True}], self.finished_by_result(session))
+
+    def test_a_limit_notice_ends_the_review_even_with_a_finder_marked_running(self):
+        posted = []
+        session = self.review_session([agent_started("a"), cli_notice("LIMIT"), result()], posted)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertEqual(["LIMIT"], posted)
+        self.assertEqual([{"post_reply": True}], self.finished_by_result(session))
+
+    def test_a_non_review_turn_never_sets_the_limit_flag(self):
+        session = FakeSession([cli_notice("LIMIT"), result()], on_text=lambda text: None)
+        load_functions(is_claude_limit_notice=lambda text: text == "LIMIT")["_reader_loop"](session)
+        self.assertFalse(session.limit_hit)
+        self.assertEqual({"LIMIT"}, session.limit_notices, "every turn records the CLI's notice for on_text")
 
     def test_a_review_never_consumes_bundle_or_parking_claims(self):
         consumed = []
