@@ -354,6 +354,23 @@ class ProcessReviewTest(unittest.TestCase):
     def test_a_review_that_already_replied_gets_no_paused_note(self):
         self.assertEqual([], self.limited_turn(review_done=True))
 
+    def test_a_notice_is_consumed_and_cleared_so_a_later_echo_is_plain_text(self):
+        def send(session, text):
+            self.assertEqual(set(), session.limit_notices, "a new turn starts with no recorded notices")
+            session.limit_notices.add("LIMIT")
+            session._on_text("LIMIT")
+            session._on_text("LIMIT")
+
+        replies = []
+        paused = []
+        self.session.limit_notices.add("LIMIT")
+        self.ns["_send_to_claude"] = send
+        self.ns["post_response"] = lambda channel, text, thread_ts=None: replies.append(text)
+        self.ns["_enter_limit_pause"] = paused.append
+        self.run_turn(self.admission())
+        self.assertEqual(["LIMIT"], paused)
+        self.assertEqual(["LIMIT", "paused"], replies)
+
     def test_a_quoted_limit_string_is_not_treated_as_the_notice(self):
         def send(session, text):
             session._on_text("LIMIT")

@@ -732,7 +732,7 @@ class LiveSession:
     background_agents: BackgroundAgents = field(default_factory=BackgroundAgents)
     # Set once the review's reply carries REVIEW_DONE_MARKER
     review_done: bool = False
-    # Usage-limit notices the CLI itself emitted (model "<synthetic>"); quoted model text never lands here
+    # This turn's usage-limit notices the CLI itself emitted (model "<synthetic>"); each is consumed once
     limit_notices: set[str] = field(default_factory=set)
     # Set once a review turn sees such a notice: nothing more will run, so the review ends
     limit_hit: bool = False
@@ -2665,6 +2665,7 @@ def process_message_async(
         # Suppress them and replay the same authenticated turn through the
         # configured OpenAI fallback after the Claude result closes.
         if session is not None and text_block in session.limit_notices:
+            session.limit_notices.discard(text_block)
             _enter_limit_pause(text_block)
             fallback_requested = True
             logger.warning(f"Usage limit hit in thread {thread_ts}")
@@ -2791,6 +2792,7 @@ def process_message_async(
                 session.pending_tools.clear()
                 session._turn_done.clear()
                 session.turn_senders = {user_id}
+                session.limit_notices.clear()
                 with _live_sessions_lock:
                     _handoff_stops.discard(thread_ts)
                 if session.workspace:

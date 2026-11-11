@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
-import os
 import threading
 import time
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from openai_fallback import (
     fallback_error_kind,
@@ -29,6 +29,8 @@ class OpenAIFallbackTest(unittest.TestCase):
             "You've hit your weekly limit · resets Sep 2 at 7pm (America/Los_Angeles)",
             "You've hit your 5-hour limit · resets 12am (America/Los_Angeles)",
             "You've hit your session limit · resets 2:20am (America/Los_Angeles)",
+            "You've hit your Opus limit · resets 3pm",
+            "You've hit your weekly Opus limit · resets Sep 2 at 7pm (America/Los_Angeles)",
             "You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your session limit resets 3:50pm (America/Los_Angeles)",
         ):
             with self.subTest(notice=notice):
@@ -72,25 +74,34 @@ class OpenAIFallbackTest(unittest.TestCase):
             with self.subTest(zone=zone[:20]):
                 self.assertIsNotNone(limit_reset_epoch(f"resets 4pm ({zone})", now=now))
 
-    def test_zoneless_reset_applies_the_host_dst_rules(self):
-        if not hasattr(time, "tzset"):
-            self.skipTest("needs time.tzset")
-        saved = os.environ.get("TZ")
-        os.environ["TZ"] = "America/Los_Angeles"
-        time.tzset()
-        try:
-            # 23:00 PDT the night before fall-back; 4am the next morning is PST, 12:00 UTC.
-            reset = limit_reset_epoch("resets 4am", now=datetime(2026, 10, 31, 23, 0))
-        finally:
-            if saved is None:
-                os.environ.pop("TZ", None)
-            else:
-                os.environ["TZ"] = saved
-            time.tzset()
+    def test_zoneless_reset_applies_the_local_zone_dst_rules(self):
+        # 23:00 PDT the night before fall-back; 4am the next morning is PST, 12:00 UTC.
+        now = datetime(2026, 11, 1, 6, 0, tzinfo=timezone.utc)
+        reset = limit_reset_epoch("resets 4am", now=now, local_zone=ZoneInfo("America/Los_Angeles"))
         self.assertEqual(datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc).timestamp() + 120, reset)
 
+    def test_zoneless_reset_without_a_given_clock_uses_host_local_time(self):
+        reset = limit_reset_epoch("resets 4am")
+        expected = datetime.now().replace(hour=4, minute=0, second=0, microsecond=0)
+        if expected <= datetime.now() - timedelta(minutes=5):
+            expected += timedelta(days=1)
+        self.assertAlmostEqual(max(expected.timestamp(), time.time()) + 120, reset, delta=5)
+
+    def test_a_dated_weekly_reset_is_parsed(self):
+        now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+        reset = limit_reset_epoch("You've hit your weekly limit · resets Sep 2 at 7pm (America/Los_Angeles)", now=now)
+        self.assertEqual(datetime(2026, 9, 3, 2, 0, tzinfo=timezone.utc).timestamp() + 120, reset)
+
+    def test_a_dated_reset_already_past_rolls_to_next_year(self):
+        now = datetime(2026, 12, 30, 12, 0, tzinfo=timezone.utc)
+        reset = limit_reset_epoch("resets Jan 2 at 7am (UTC)", now=now)
+        self.assertEqual(datetime(2027, 1, 2, 7, 0, tzinfo=timezone.utc).timestamp() + 120, reset)
+
+    def test_an_impossible_date_is_not_parsed(self):
+        self.assertIsNone(limit_reset_epoch("resets Feb 30 at 7am (UTC)", now=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+
     def test_no_reset_time_returns_none(self):
-        self.assertIsNone(limit_reset_epoch("You've hit your weekly limit · resets Sep 2 at 7pm"))
+        self.assertIsNone(limit_reset_epoch("You've hit your weekly limit"))
 
     def test_model_notice_ignores_synthetic_limit_envelope(self):
         self.assertIsNone(model_notice_text("<synthetic>"))

@@ -10,18 +10,21 @@ import subprocess
 import threading
 import time
 from typing import Callable, Iterable, Mapping
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from session_lifecycle import wait_for_turn_completion
 
 
 CLAUDE_LIMIT_RE = re.compile(
-    r"You've hit your (?:(?:usage|weekly|monthly(?: spend)?|session|daily|\d+-hour) )?limit",
+    r"You've hit your (?:(?:usage|weekly|monthly|spend|session|daily|opus|sonnet|haiku|fable|\d+-hour) ){0,3}limit",
     re.IGNORECASE,
 )
 LIMIT_RESET_RE = re.compile(
-    r"resets\s+(?:at\s+)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)(?:\s*\(([^)]+)\))?", re.IGNORECASE,
+    r"resets\s+(?:([A-Z][a-z]{2})\s+(\d{1,2}),?\s+)?(?:at\s+)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)"
+    r"(?:\s*\(([^)]+)\))?",
+    re.IGNORECASE,
 )
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 LIMIT_RESET_BUFFER = 120  # seconds, so a resume never lands a minute before the limit lifts
 LIMIT_RESET_GRACE = timedelta(minutes=5)  # a reset this recent has just passed; it is not tomorrow's
 # The model name the Claude CLI puts on messages it writes itself, such as a usage-limit notice
@@ -33,28 +36,39 @@ def is_claude_limit_notice(text: str) -> bool:
     return CLAUDE_LIMIT_RE.search(text) is not None
 
 
-def limit_reset_epoch(text: str, now: datetime | None = None) -> float | None:
-    """The next 'resets 4pm (Zone)' time as an epoch, read in that zone (else local time); None if absent."""
+def limit_reset_epoch(text: str, now: datetime | None = None, local_zone=None) -> float | None:
+    """The next 'resets [Sep 2 at] 4pm (Zone)' time as an epoch, read in that zone, else the host's; None if absent."""
     match = LIMIT_RESET_RE.search(text)
     if not match:
         return None
-    hour = int(match.group(1)) % 12 + (12 if match.group(3).lower() == "pm" else 0)
-    minute = int(match.group(2) or 0)
-    zone = None
-    if match.group(4):
+    month_name, day, hour, minute, meridiem, zone_name = match.groups()
+    hour = int(hour) % 12 + (12 if meridiem.lower() == "pm" else 0)
+    minute = int(minute or 0)
+    zone = local_zone
+    if zone_name:
         try:
-            zone = ZoneInfo(match.group(4).strip())
+            zone = ZoneInfo(zone_name.strip())
         except Exception:
-            zone = None
+            pass
     if zone is not None:
         current = (now or datetime.now(timezone.utc)).astimezone(zone)
     else:
         # Naive local time, so the conversion below applies the host's DST rules for the reset date.
         current = now or datetime.now()
-    reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0, fold=0)
-    if reset <= current - LIMIT_RESET_GRACE:
-        reset += timedelta(days=1)
-    elif reset < current:
+    try:
+        if month_name:
+            month = _MONTHS.index(month_name.lower()) + 1
+            reset = current.replace(month=month, day=int(day), hour=hour, minute=minute,
+                                    second=0, microsecond=0, fold=0)
+            if reset <= current - LIMIT_RESET_GRACE:
+                reset = reset.replace(year=reset.year + 1)
+        else:
+            reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0, fold=0)
+            if reset <= current - LIMIT_RESET_GRACE:
+                reset += timedelta(days=1)
+    except ValueError:
+        return None
+    if reset < current:
         reset = current
     return reset.timestamp() + LIMIT_RESET_BUFFER
 
