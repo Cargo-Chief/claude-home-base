@@ -3568,6 +3568,9 @@ def _start_review_notice(entry: dict, event: dict) -> None:
 
     try:
         session = _live_session_for(thread, channel)
+        if session is not None:
+            # Its notice record is gone now, so make it the newest session while it queues for admission.
+            session.last_activity = time.time()
         if session is None:
             if _notice_room(channel):
                 slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=REVIEW_NOTICE_IDLE.format(pr=pr))

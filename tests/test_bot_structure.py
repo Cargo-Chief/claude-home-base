@@ -83,6 +83,10 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("ts != thread_ts and (not live.review)", creation)
         self.assertNotIn("len(_live_sessions) >= MAX_LIVE_SESSIONS", creation)
 
+    def test_a_woken_thread_is_made_newest_before_it_queues(self):
+        notice = ast.unparse(self._function("_start_review_notice"))
+        self.assertLess(notice.index("session.last_activity = time.time()"), notice.index("process_message_async("))
+
     def test_a_review_waits_for_its_slot_before_turn_admission_and_always_frees_it(self):
         process = ast.unparse(self._function("process_message_async"))
         self.assertLess(process.index("_review_slots.acquire("), process.index("_turn_admission.acquire("))
