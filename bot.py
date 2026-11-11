@@ -685,6 +685,8 @@ IDLE_TIMEOUT = 10800  # 3 hours — kill process if no messages
 STOP_WAIT_SECONDS = 30  # a tree stop takes at most its grace plus kill wait
 MAX_LIVE_SESSIONS = RUNTIME_POLICY.max_live_sessions
 _turn_admission = TurnAdmission(MAX_LIVE_SESSIONS)
+# Peer reviews wait for their own session slot instead of evicting a work thread.
+_review_slots = TurnAdmission(REVIEW_SESSION_SLOTS)
 
 
 @dataclass
@@ -1039,10 +1041,13 @@ def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
     )
 
 
-def _post_queue_notice(channel: str, thread_ts: str) -> None:
+REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatically"
+
+
+def _post_queue_notice(channel: str, thread_ts: str, note: str = "") -> None:
     """Tell the requester that admission is delayed, without dropping the turn."""
     try:
-        note = "queued — Ned is finishing another thread; this request will start automatically"
+        note = note or "queued — Ned is finishing another thread; this request will start automatically"
         slack_client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
             text=note,
@@ -1465,6 +1470,11 @@ def _get_or_create_live_session(
                 close_process_tree(replaced.proc, replaced.proc.stdin.close, wait=10)
             except Exception as e:
                 logger.warning(f"Could not stop replaced pid={replaced.proc.pid}: {e}")
+    try:
+        waiting = _review_notices.waiting_threads()
+    except Exception as exc:
+        logger.warning(f"Review notice record unusable for eviction: {type(exc).__name__}")
+        waiting = set()
     with _live_sessions_lock:
         session = _live_sessions.get(thread_ts)
         if not fresh and session and session.proc.poll() is None and not session.stop_done:
@@ -1473,10 +1483,14 @@ def _get_or_create_live_session(
         if existing_only:
             raise _NoLiveSession()
 
-        # Evict the oldest idle session at capacity; a peer review has its own slot, so it never evicts the
-        # work thread that is waiting on the other agent's review.
-        if needs_eviction(_live_sessions, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh):
-            oldest_ts = oldest_evictable_session(_live_sessions)
+        # At the work cap, evict the oldest idle work thread, sparing one that waits on a peer's review where
+        # possible. This thread's own stale entry and dead or stopping sessions do not count.
+        work = {
+            ts: live for ts, live in _live_sessions.items()
+            if ts != thread_ts and not live.review and live.proc.poll() is None and not live.stop_done
+        }
+        if needs_eviction(work, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh):
+            oldest_ts = oldest_evictable_session(work, protected=waiting)
             if oldest_ts is None:
                 raise SafetyError(
                     "live session cap reached; every existing session is processing a turn"
@@ -2691,6 +2705,7 @@ def process_message_async(
     start = time.time()
     audit_session_id = _get_openai_session(thread_ts) if use_openai else None
     turn_admitted = False
+    review_slot_held = False
     session = None
     handoff_request = None
     handoff_source = None
@@ -2738,6 +2753,9 @@ def process_message_async(
                 )
                 return
             if not (session and session.turn_lock.locked()):
+                if review:
+                    _review_slots.acquire(lambda: _post_queue_notice(channel, thread_ts, REVIEW_QUEUE_NOTE))
+                    review_slot_held = True
                 _turn_admission.acquire(
                     lambda: _post_queue_notice(channel, thread_ts)
                 )
@@ -2938,6 +2956,8 @@ def process_message_async(
             _close_review_session(session)
         if turn_admitted:
             _turn_admission.release()
+        if review_slot_held:
+            _review_slots.release()
 
     duration = time.time() - start
 

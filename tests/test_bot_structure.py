@@ -78,10 +78,15 @@ class BotTurnStructureTest(unittest.TestCase):
 
     def test_a_review_session_uses_its_own_slot_when_deciding_to_evict(self):
         creation = ast.unparse(self._function("_get_or_create_live_session"))
-        self.assertIn(
-            "needs_eviction(_live_sessions, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh)", creation,
-        )
+        self.assertIn("needs_eviction(work, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh)", creation)
+        self.assertIn("oldest_evictable_session(work, protected=waiting)", creation)
+        self.assertIn("ts != thread_ts and (not live.review)", creation)
         self.assertNotIn("len(_live_sessions) >= MAX_LIVE_SESSIONS", creation)
+
+    def test_a_review_waits_for_its_slot_before_turn_admission_and_always_frees_it(self):
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertLess(process.index("_review_slots.acquire("), process.index("_turn_admission.acquire("))
+        self.assertIn("if review_slot_held:\n            _review_slots.release()", process)
 
     def test_owner_inactivity_waits_on_the_busy_check_and_logs_the_limit(self):
         source = ast.unparse(self._function("process_message_async"))

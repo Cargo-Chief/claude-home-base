@@ -311,6 +311,19 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual(["accepted"], self.outcomes())
         self.assertEqual([self.session], self.closed)
 
+    def test_a_review_holds_the_review_slot_for_its_turn_and_frees_it_on_failure(self):
+        calls = []
+        slots = mock.MagicMock()
+        slots.acquire.side_effect = lambda *args: calls.append("acquire")
+        slots.release.side_effect = lambda: calls.append("release")
+        self.ns["_review_slots"] = slots
+        self.run_turn(self.admission())
+        self.assertEqual(["acquire", "release"], calls)
+        calls.clear()
+        self.ns["_send_to_claude"] = mock.MagicMock(side_effect=RuntimeError("boom"))
+        self.run_turn(self.admission())
+        self.assertEqual(["acquire", "release"], calls)
+
     def test_a_review_turn_is_bounded_by_the_review_limit(self):
         limits = []
 

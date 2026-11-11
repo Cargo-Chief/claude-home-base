@@ -373,6 +373,10 @@ class ReviewNoticeStore:
         entry = {"pr": pr, "channel": channel, "thread": thread, "at": self.clock()}
         self._locked(lambda data: (data.__setitem__(request_ts, entry), True))
 
+    def waiting_threads(self) -> set[str]:
+        """Threads that asked a peer for a review whose hand-back has not arrived yet."""
+        return self._locked(lambda data: ({entry.get("thread", "") for entry in data.values()} - {""}, False))
+
     def take(self, request_ts: str, pr: str) -> dict | None:
         """The entry for that request and PR, removed; None if there is none."""
         def pop(data: dict) -> tuple[dict | None, bool]:

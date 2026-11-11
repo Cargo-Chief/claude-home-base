@@ -114,11 +114,11 @@ class SessionLifecycleTests(unittest.TestCase):
         }
         self.assertEqual("old-idle", oldest_evictable_session(sessions))
 
-    def test_a_review_takes_its_own_slot_and_evicts_no_work_thread(self):
+    def test_a_review_never_evicts(self):
         waiting = {"work-a": FakeSession(10), "work-b": FakeSession(20)}
         self.assertFalse(needs_eviction(waiting, max_work_sessions=2, new_is_review=True))
 
-    def test_a_work_session_at_the_cap_still_evicts(self):
+    def test_a_work_session_at_the_cap_evicts(self):
         sessions = {"work-a": FakeSession(10), "work-b": FakeSession(20)}
         self.assertTrue(needs_eviction(sessions, max_work_sessions=2, new_is_review=False))
 
@@ -128,15 +128,16 @@ class SessionLifecycleTests(unittest.TestCase):
         sessions["work-b"] = FakeSession(30)
         self.assertTrue(needs_eviction(sessions, max_work_sessions=2, new_is_review=False))
 
-    def test_a_second_review_counts_against_work_sessions(self):
-        sessions = {"work-a": FakeSession(10), "review": FakeSession(20, active=True, review=True)}
-        self.assertFalse(needs_eviction(sessions, max_work_sessions=2, new_is_review=True))
-        sessions["work-b"] = FakeSession(30)
-        self.assertTrue(needs_eviction(sessions, max_work_sessions=2, new_is_review=True))
-
     def test_below_the_cap_nothing_is_evicted(self):
         self.assertFalse(needs_eviction({"work-a": FakeSession(10)}, max_work_sessions=2, new_is_review=False))
-        self.assertFalse(needs_eviction({}, max_work_sessions=1, new_is_review=True))
+
+    def test_a_thread_waiting_on_a_review_is_evicted_last(self):
+        sessions = {"waiting": FakeSession(10), "other": FakeSession(20)}
+        self.assertEqual("other", oldest_evictable_session(sessions, protected={"waiting"}))
+
+    def test_when_every_idle_thread_is_waiting_the_oldest_still_goes(self):
+        sessions = {"waiting-a": FakeSession(10), "waiting-b": FakeSession(20), "busy": FakeSession(5, active=True)}
+        self.assertEqual("waiting-a", oldest_evictable_session(sessions, protected={"waiting-a", "waiting-b"}))
 
     def test_refuses_to_select_when_every_session_is_active(self):
         sessions = {

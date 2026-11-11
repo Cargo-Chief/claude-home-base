@@ -842,6 +842,12 @@ class ReviewNoticeTest(unittest.TestCase):
         self.assertEqual(("CWORK", "5.1"), (entry["channel"], entry["thread"]))
         self.assertIsNone(self.store.take("9.1", PR))
 
+    def test_waiting_threads_lists_threads_with_an_untaken_entry(self):
+        self.store.add("9.1", pr=PR, channel="CWORK", thread="5.1")
+        self.store.add("9.2", pr=PR, channel="CWORK", thread="6.1")
+        self.store.take("9.2", PR)
+        self.assertEqual({"5.1"}, self.store.waiting_threads())
+
     def test_an_unreadable_record_raises_and_is_not_reset(self):
         self.store.path.write_text("{not json", encoding="utf-8")
         with self.assertRaises(NoticeStoreError):

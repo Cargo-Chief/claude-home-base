@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any, Callable
 
 
@@ -29,22 +29,18 @@ class TurnAdmission:
         self._semaphore.release()
 
 
-REVIEW_SESSION_SLOTS = 1  # peer-review sessions held outside the work-session cap
+REVIEW_SESSION_SLOTS = 1  # peer-review sessions, held outside the work-session cap; extra reviews queue
 
 
-def needs_eviction(
-    sessions: Mapping[str, Any], *, max_work_sessions: int, new_is_review: bool,
-    review_slots: int = REVIEW_SESSION_SLOTS,
-) -> bool:
-    """Whether a new session must evict one first; reviews beyond their own slots count as work."""
-    reviews = sum(1 for session in sessions.values() if getattr(session, "review", False))
-    if new_is_review and reviews < review_slots:
+def needs_eviction(sessions: Mapping[str, Any], *, max_work_sessions: int, new_is_review: bool) -> bool:
+    """Whether a new session must evict one first; reviews queue for their own slot and never evict."""
+    if new_is_review:
         return False
-    return len(sessions) - min(reviews, review_slots) >= max_work_sessions
+    return sum(1 for session in sessions.values() if not session.review) >= max_work_sessions
 
 
-def oldest_evictable_session(sessions: Mapping[str, Any]) -> str | None:
-    """Return the oldest unlocked session; active turns are never evictable."""
+def oldest_evictable_session(sessions: Mapping[str, Any], protected: Collection[str] = ()) -> str | None:
+    """Return the oldest unlocked session, preferring one not in ``protected``; active turns are never evictable."""
     candidates = {
         thread: session
         for thread, session in sessions.items()
@@ -52,7 +48,7 @@ def oldest_evictable_session(sessions: Mapping[str, Any]) -> str | None:
     }
     if not candidates:
         return None
-    return min(candidates, key=lambda thread: candidates[thread].last_activity)
+    return min(candidates, key=lambda thread: (thread in protected, candidates[thread].last_activity))
 
 
 def wait_for_turn_completion(
