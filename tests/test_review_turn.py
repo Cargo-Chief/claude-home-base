@@ -52,6 +52,7 @@ PLAN = ReviewPlan("incremental", 2, 3, "a" * 40)
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "process_message_async", "_spawn_claude_process", "_get_or_create_live_session", "_clear_eyes",
+    "_review_still_runnable",
 )
 CLASSES = ("_ReviewBusy", "_NoLiveSession")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
@@ -310,6 +311,54 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual("Display Name", payload["untrusted_sender_display_name"])
         self.assertEqual(["accepted"], self.outcomes())
         self.assertEqual([self.session], self.closed)
+
+    def test_a_review_holds_the_review_slot_for_its_turn_and_frees_it_on_failure(self):
+        calls = []
+        slots = mock.MagicMock()
+        slots.acquire.side_effect = lambda *args: calls.append("acquire")
+        slots.release.side_effect = lambda: calls.append("release")
+        self.ns["_review_slots"] = slots
+        self.run_turn(self.admission())
+        self.assertEqual(["acquire", "release"], calls)
+        calls.clear()
+        self.ns["_send_to_claude"] = mock.MagicMock(side_effect=RuntimeError("boom"))
+        self.run_turn(self.admission())
+        self.assertEqual(["acquire", "release"], calls)
+
+    def test_the_recheck_after_waiting_refuses_what_changed(self):
+        check = self.ns["_review_still_runnable"]
+        cases = [
+            ("paused", lambda: True, mock.MagicMock(return_value=mock.MagicMock(state="OPEN")), False),
+            ("refused_state", lambda: False, mock.MagicMock(return_value=mock.MagicMock(state="MERGED")), False),
+            ("refused_lookup", lambda: False, mock.MagicMock(side_effect=RuntimeError("gh")), False),
+            (None, lambda: False, mock.MagicMock(return_value=mock.MagicMock(state="OPEN")), True),
+        ]
+        for outcome, paused, lookup, ok in cases:
+            with self.subTest(outcome=outcome):
+                self.audits.clear()
+                self.ns["use_openai_provider"] = lambda *args, **kwargs: paused()
+                self.ns["_lookup_review_pr"] = lookup
+                admission = self.admission()
+                self.assertIs(ok, check(admission, self.room.policy, "1.1"))
+                expected = [] if outcome is None else ["refused_provider" if outcome == "paused" else outcome]
+                self.assertEqual(expected, self.outcomes())
+
+    def test_a_full_review_queue_refuses_aloud_without_starting(self):
+        self.ns["_review_slots"] = mock.MagicMock(**{"acquire.return_value": "full"})
+        self.ns["REVIEW_QUEUE_FULL_REPLY"] = "too many"
+        self.run_turn(self.admission())
+        self.assertEqual(["refused_queue"], self.outcomes())
+        self.assertEqual([], self.sent)
+        self.assertEqual(["too many"], self.posts)
+
+    def test_a_queued_review_whose_pr_closed_meanwhile_is_refused(self):
+        self.ns["_review_slots"] = mock.MagicMock(**{"acquire.return_value": "queued"})
+        self.ns["_review_still_runnable"] = lambda admission, policy, thread: admission.refuse(
+            "refused_state", "not open") or False
+        self.run_turn(self.admission())
+        self.assertEqual(["refused_state"], self.outcomes())
+        self.assertEqual([], self.sent)
+        self.ns["_review_slots"].release.assert_called_once_with()
 
     def test_a_review_turn_is_bounded_by_the_review_limit(self):
         limits = []

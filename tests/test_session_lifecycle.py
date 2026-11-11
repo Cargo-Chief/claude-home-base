@@ -1,11 +1,14 @@
 import threading
+import time
 import unittest
 from unittest import mock
 
 from session_lifecycle import (
     BackgroundAgents,
     PendingTools,
+    ReviewSlots,
     TurnAdmission,
+    needs_eviction,
     oldest_evictable_session,
     owner_stream_event_is_activity,
     stop_timed_out_session,
@@ -46,8 +49,9 @@ class FakeDoneEvent:
 
 
 class FakeSession:
-    def __init__(self, last_activity, *, active=False):
+    def __init__(self, last_activity, *, active=False, review=False):
         self.last_activity = last_activity
+        self.review = review
         self.turn_lock = threading.Lock()
         if active:
             self.turn_lock.acquire()
@@ -111,6 +115,64 @@ class SessionLifecycleTests(unittest.TestCase):
             "old-idle": FakeSession(20),
         }
         self.assertEqual("old-idle", oldest_evictable_session(sessions))
+
+    def test_a_review_never_evicts(self):
+        waiting = {"work-a": FakeSession(10), "work-b": FakeSession(20)}
+        self.assertFalse(needs_eviction(waiting, max_work_sessions=2, new_is_review=True))
+
+    def test_a_work_session_at_the_cap_evicts(self):
+        sessions = {"work-a": FakeSession(10), "work-b": FakeSession(20)}
+        self.assertTrue(needs_eviction(sessions, max_work_sessions=2, new_is_review=False))
+
+    def test_a_free_review_slot_is_taken_at_once(self):
+        slots = ReviewSlots(1, max_waiting=1)
+        self.assertEqual("free", slots.acquire(0.01))
+
+    def test_a_review_waits_for_the_slot_and_gets_it_when_freed(self):
+        slots = ReviewSlots(1, max_waiting=1)
+        slots.acquire(0.01)
+        queued = []
+        threading.Timer(0.05, slots.release).start()
+        self.assertEqual("queued", slots.acquire(2, lambda: queued.append(True)))
+        self.assertEqual([True], queued)
+
+    def test_a_full_queue_refuses_without_waiting(self):
+        slots = ReviewSlots(1, max_waiting=1)
+        slots.acquire(0.01)
+        waiter = threading.Thread(target=slots.acquire, args=(0.5,))
+        waiter.start()
+        time.sleep(0.05)
+        self.assertEqual("full", slots.acquire(5))
+        waiter.join()
+
+    def test_a_wait_that_runs_out_takes_no_slot(self):
+        slots = ReviewSlots(1, max_waiting=1)
+        slots.acquire(0.01)
+        self.assertEqual("timeout", slots.acquire(0.05))
+        slots.release()
+        self.assertEqual("free", slots.acquire(0.01))
+
+    def test_a_failing_queue_note_frees_its_place_in_the_queue(self):
+        slots = ReviewSlots(1, max_waiting=1)
+        slots.acquire(0.01)
+
+        def boom():
+            raise RuntimeError("slack down")
+
+        with self.assertRaises(RuntimeError):
+            slots.acquire(0.05, boom)
+        self.assertEqual("timeout", slots.acquire(0.01), "the failed waiter no longer fills the queue")
+
+    def test_below_the_cap_nothing_is_evicted(self):
+        self.assertFalse(needs_eviction({"work-a": FakeSession(10)}, max_work_sessions=2, new_is_review=False))
+
+    def test_a_thread_waiting_on_a_review_is_evicted_last(self):
+        sessions = {"waiting": FakeSession(10), "other": FakeSession(20)}
+        self.assertEqual("other", oldest_evictable_session(sessions, protected={"waiting"}))
+
+    def test_when_every_idle_thread_is_waiting_the_oldest_still_goes(self):
+        sessions = {"waiting-a": FakeSession(10), "waiting-b": FakeSession(20), "busy": FakeSession(5, active=True)}
+        self.assertEqual("waiting-a", oldest_evictable_session(sessions, protected={"waiting-a", "waiting-b"}))
 
     def test_refuses_to_select_when_every_session_is_active(self):
         sessions = {

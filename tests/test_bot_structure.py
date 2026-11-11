@@ -76,6 +76,28 @@ class BotTurnStructureTest(unittest.TestCase):
             self.assertIn("close_process_tree(", source, name)
             self.assertNotIn(".kill()", source, name)
 
+    def test_a_review_session_uses_its_own_slot_when_deciding_to_evict(self):
+        creation = ast.unparse(self._function("_get_or_create_live_session"))
+        self.assertIn("needs_eviction(work, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh)", creation)
+        self.assertIn("if not live.waking", creation)
+        self.assertIn("oldest_evictable_session(candidates, protected=_waiting_threads())", creation)
+        self.assertNotIn("len(_live_sessions) >= MAX_LIVE_SESSIONS", creation)
+        self.assertNotIn("waiting_threads", creation.split("with _live_sessions_lock:")[0], "read only when evicting")
+
+    def test_a_queued_review_is_bounded_rechecked_and_always_frees_its_slot(self):
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertLess(process.index("_review_slots.acquire("), process.index("_turn_admission.acquire("))
+        self.assertIn("review_admission.refuse('refused_queue', REVIEW_QUEUE_FULL_REPLY)", process)
+        self.assertIn("slot == 'queued' and (not _review_still_runnable(", process)
+        self.assertIn("_turn_admission.acquire(None if review else", process)
+        self.assertIn("if review_slot_held:\n            _review_slots.release()", process)
+
+    def test_a_woken_thread_is_unevictable_until_its_turn_runs(self):
+        notice = ast.unparse(self._function("_start_review_notice"))
+        self.assertLess(notice.index("session.waking = True"), notice.index("process_message_async("))
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("if review_notice and session is not None:\n            session.waking = False", process)
+
     def test_owner_inactivity_waits_on_the_busy_check_and_logs_the_limit(self):
         source = ast.unparse(self._function("process_message_async"))
         self.assertIn("delegate_active=lambda: _owner_turn_busy(session)", source)
