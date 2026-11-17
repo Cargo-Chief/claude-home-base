@@ -51,6 +51,8 @@ from cargo_chief_safety import (
     build_claude_command,
     build_codex_command,
     build_codex_prompt,
+    build_codex_review_prompt,
+    github_wrapper_path,
     channel_message_action,
     claude_owner_env,
     cleanup_thread_workspaces,
@@ -143,6 +145,22 @@ from review_requests import (
     build_review_task,
     ReviewPlan,
     lookup_pr,
+    DEFERRED_REPLY,
+    DEFER_EXPIRED_REPLY,
+    REVIEW_POST_SCRIPT,
+    format_review_audit,
+    plan_review_pass,
+)
+from review_fallback import (
+    POST_REQUEST_FILE_NAME,
+    REVIEW_FILE_NAME,
+    DeferredReviewStore,
+    PostRequestError,
+    build_codex_review_command,
+    codex_review_env,
+    post_review,
+    read_post_request,
+    review_checkout,
 )
 from session_lifecycle import (
     BackgroundAgents,
@@ -1544,11 +1562,11 @@ def _waiting_threads() -> set[str]:
 
 
 def _review_still_runnable(admission, policy: RoomPolicy, thread_ts: str) -> bool:
-    """After waiting for the review slot, re-check what may have changed; refuse aloud if it did."""
-    if use_openai_provider(_get_provider_override(thread_ts), limit_paused=_limit_paused(),
-                           has_openai_session=_get_openai_session(thread_ts) is not None):
-        admission.refuse("refused_provider", PROVIDER_REPLY)
-        return False
+    """After waiting for the review slot, re-check the PR is still open; refuse aloud if not.
+
+    The provider is chosen after this (_review_provider), so a limit that began meanwhile moves the
+    review to Codex rather than refusing it.
+    """
     try:
         info = _lookup_review_pr(admission.pr, policy.root, include_reviews=False)
     except Exception as exc:
@@ -2423,6 +2441,291 @@ def _run_openai_fallback(
     return session_id, workspace
 
 
+def _limit_pause_until() -> float:
+    """When the current usage-limit pause ends, or 0 when there is none."""
+    _limit_paused()
+    with _limit_pause_lock:
+        return _limit_pause["until"]
+
+
+def _review_provider(thread_ts: str) -> str:
+    """Where an admitted review runs: claude, or codex while Claude is limited or the thread is pinned."""
+    return "codex" if use_openai_provider(
+        _get_provider_override(thread_ts), limit_paused=_limit_paused(),
+        has_openai_session=_get_openai_session(thread_ts) is not None,
+    ) else "claude"
+
+
+def _codex_review_ready() -> bool:
+    try:
+        validate_codex_runtime()
+    except SafetyError as exc:
+        logger.warning(f"Codex review unavailable: {exc}")
+        return False
+    return True
+
+
+def _strip_review_marker(texts: list[str]) -> list[str]:
+    kept = []
+    for text in texts:
+        lines = []
+        for line in text.splitlines():
+            match = _REVIEW_DONE_LINE.match(line)
+            lines.append(match.group("before").rstrip() if match else line)
+        text = "\n".join(lines).strip()
+        if text:
+            kept.append(text)
+    return kept
+
+
+class _ProcessTree:
+    """A process whose terminate stops its whole tree, for `stop`: the App wrapper runs Codex as a
+    child and does not forward signals to it."""
+
+    def __init__(self, proc: subprocess.Popen):
+        self.proc = proc
+        self.pid = proc.pid
+
+    def poll(self):
+        return self.proc.poll()
+
+    def terminate(self) -> None:
+        threading.Thread(target=stop_process_tree, args=(self.proc,), daemon=True).start()
+
+
+_WITHHELD_REVIEW = {
+    "pending": "a delegate's result was never independently verified",
+    "invalid": "a delegate's result was never independently verified",
+    "budget_exhausted": "this thread's delegation budget is exhausted; a named approver can reset it",
+    "allocation_exhausted": "a delegate ran out of its token allocation",
+}
+
+
+def _run_codex_review(
+    admission: ReviewAdmission,
+    policy: RoomPolicy,
+    *,
+    channel: str,
+    thread_ts: str,
+    user_id: str,
+    envelope: str,
+    on_text,
+    max_duration: float,
+) -> str:
+    """Run an admitted review on the Codex fallback under review-only controls, then post it.
+
+    The model gets a read-only GitHub token and a sandbox that cannot read credentials; it writes
+    review.json and a post request, and the harness posts them through review_post.py. Returns
+    "unavailable" when Codex could not run the review and nothing was posted, else "done".
+    """
+    if not _codex_review_ready():
+        return "unavailable"
+    if not github_wrapper_downscopes(policy.root):
+        on_text(WRAPPER_REPLY)
+        return "done"
+    workspace = prepare_thread_workspace(policy.root, channel=channel, thread=thread_ts)
+    prepare_owner_delegation_state(workspace.delegation_budget_file, workspace.delegate_verification_file)
+    review_file = workspace.path / REVIEW_FILE_NAME
+    post_file = workspace.path / POST_REQUEST_FILE_NAME
+    for stale_path in (
+        workspace.delegation_request_file, workspace.implementation_claim_file, review_file, post_file,
+    ):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
+    cleanup_stale_delegate_pid(workspace.delegate_pid_file)
+    writable = [policy.root.resolve() / "work"]
+    checkout = review_checkout(policy.root, admission.pr)
+    if checkout is not None:
+        writable.append(checkout / ".git")
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    command = [
+        sys.executable, str(github_wrapper_path(policy.root)), "--",
+        *build_codex_review_command(
+            policy, cwd=workspace.path, writable=writable, home=Path.home(), codex_home=codex_home,
+        ),
+    ]
+    task = build_review_task(admission.pr, policy.root, admission.plan, harness_posts=(review_file, post_file))
+    prompt = build_codex_review_prompt(
+        policy,
+        inbound_prompt=f"{task}\n\n{envelope}",
+        transport_python=Path(sys.executable),
+        transport_script=SOURCE_DIR / "bot.py",
+        delegation_request_file=workspace.delegation_request_file,
+        implementation_claim_file=workspace.implementation_claim_file,
+        delegate_timeout=DELEGATE_TIMEOUT,
+        identity_prompt=_identity_prompt(),
+    )
+    peer = peer_review_config(_load_model_config())
+    review_fields = dict(
+        self_login=peer.self_github_login, requester_login=peer.github_logins.get(user_id, ""),
+        pr=admission.pr, mode=admission.plan.mode, pass_no=admission.plan.pass_no,
+        review_base=admission.plan.base,
+    )
+    env = codex_review_env(claude_owner_env(os.environ), **review_fields)
+    env.update({
+        "CLAUDE_THREAD_TS": thread_ts,
+        "CLAUDE_CHANNEL_ID": channel,
+        "CARGO_CHIEF_THREAD_WORK_DIR": str(workspace.path),
+        "CARGO_CHIEF_ROOT": str(policy.root),
+        "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(workspace.delegation_request_file),
+        "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(workspace.implementation_claim_file),
+        "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(workspace.delegation_budget_file),
+        "CARGO_CHIEF_DELEGATE_PID_FILE": str(workspace.delegate_pid_file),
+        "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(workspace.delegate_verification_file),
+        "CARGO_CHIEF_AUDIT_LOG": str(delegation_audit_path(policy.root)),
+        "CARGO_CHIEF_OWNER_PROVIDER": "openai",
+        "CARGO_CHIEF_OWNER_MODEL": policy.fallback_model,
+        "CARGO_CHIEF_OWNER_EFFORT": policy.fallback_effort,
+        "CARGO_CHIEF_CURRENT_USER": user_id,
+        "CARGO_CHIEF_DELEGATE_TIMEOUT": str(DELEGATE_TIMEOUT),
+    })
+    started = time.time()
+
+    def track_process(process):
+        with _live_sessions_lock:
+            if process is None:
+                _openai_processes.pop(thread_ts, None)
+            else:
+                _openai_processes[thread_ts] = _ProcessTree(process)
+
+    result = run_codex_turn(
+        command, prompt, cwd=str(workspace.path), env=env, timeout=CLAUDE_TIMEOUT,
+        on_process=track_process, stop=stop_process_tree,
+        delegate_active=lambda: governed_delegate_active(workspace.delegate_pid_file),
+        max_duration=max_duration,
+    )
+    with _live_sessions_lock:
+        stopped = thread_ts in _openai_stopped
+        _openai_stopped.discard(thread_ts)
+    verification = delegation_verification_status(workspace.delegate_verification_file)
+    outcome = "done"
+    if stopped:
+        posted = "stopped"
+    elif result.error:
+        kind = fallback_error_kind(result.error)
+        logger.warning("Codex review failed in thread %s (kind=%s)", thread_ts, kind)
+        if kind == "timeout":
+            on_text("The review on the OpenAI fallback reached its time limit and stopped; nothing was "
+                    "posted. Ask again to rerun it.")
+            posted = "timeout"
+        else:
+            outcome, posted = "unavailable", "failed"
+    elif verification in _WITHHELD_REVIEW:
+        if verification == "budget_exhausted":
+            consume_budget_exhaustion(workspace.delegate_verification_file)
+        elif verification == "allocation_exhausted":
+            consume_allocation_exhaustion(workspace.delegate_verification_file)
+        on_text(f"Review withheld, nothing was posted: {_WITHHELD_REVIEW[verification]}.")
+        posted = "withheld"
+    else:
+        for text_block in _strip_review_marker(result.texts):
+            on_text(text_block)
+        try:
+            request = read_post_request(workspace.path)
+        except PostRequestError as exc:
+            request, posted = None, "invalid"
+            on_text(f"I could not post the review: {exc}.")
+        else:
+            if request is None:
+                posted = "none"
+                on_text("The review wrote no post request, so nothing was posted on the PR.")
+        if request is not None:
+            ok, detail = post_review(
+                request, pr=admission.pr, python=sys.executable, wrapper=github_wrapper_path(policy.root),
+                script=REVIEW_POST_SCRIPT, env=review_turn_env(claude_owner_env(os.environ), **review_fields),
+                scratch_dir=TEMP_DIR,
+            )
+            posted = request.verdict if ok else "refused"
+            on_text(f"Posted the review on the PR ({request.verdict})." if ok
+                    else f"review_post.py did not post the review: {detail or 'no detail'}")
+    audit_logger.info(
+        "FALLBACK_REVIEW | PROVIDER:openai | MODEL:%s | USER:%s | CHANNEL:%s | THREAD:%s | PR:%s "
+        "| POSTED:%s | DURATION:%.1fs",
+        policy.fallback_model, user_id, channel, thread_ts, admission.pr, posted, time.time() - started,
+    )
+    return outcome
+
+
+def _defer_review(admission: ReviewAdmission) -> None:
+    """Queue a review neither provider can run; it replays when Claude's limit pause ends."""
+    now = time.time()
+    until = _limit_pause_until()
+    not_before = until if until > now else now + LIMIT_PAUSE_FALLBACK
+    try:
+        _deferred_reviews.add(admission.event, pr=admission.pr, not_before=not_before)
+    except Exception as exc:
+        logger.error(f"Could not defer the review of {admission.pr}: {type(exc).__name__}")
+        if admission.started:
+            admission.post(admission.event.get("channel", ""), admission.event.get("thread_ts")
+                           or admission.event.get("ts", ""), PROVIDER_REPLY)
+        else:
+            admission.refuse("refused_provider", PROVIDER_REPLY)
+        return
+    when = time.strftime("at about %H:%M UTC", time.gmtime(not_before))
+    admission.defer(DEFERRED_REPLY.format(when=when))
+
+
+def _continue_review_after_limit(
+    admission: ReviewAdmission, policy: RoomPolicy, **turn,
+) -> None:
+    """A Claude review stopped by a usage limit: finish it on Codex, unless it already posted.
+
+    A marked review newer than the plan means the pass reached the PR before the limit, so running
+    it again would post it twice.
+    """
+    try:
+        info = _lookup_review_pr(admission.pr, policy.root)
+        peer = peer_review_config(_load_model_config())
+        now_plan = plan_review_pass(info.reviews, peer.self_github_login, admission.plan.max_passes)
+    except Exception as exc:
+        logger.warning(f"Review re-check after a limit failed for {admission.pr}: {type(exc).__name__}")
+        _defer_review(admission)
+        return
+    if now_plan.marked > admission.plan.marked:
+        turn["on_text"](
+            "The review was posted on the PR before Claude hit its usage limit; this summary was cut "
+            "short. The verdict and threads are on the PR."
+        )
+        return
+    if _run_codex_review(admission, policy, **turn) == "unavailable":
+        _defer_review(admission)
+
+
+DEFERRED_REVIEW_POLL = 60  # seconds between checks for due deferred reviews
+
+
+def _deferred_review_loop() -> None:
+    """Replay deferred reviews once due, through every admission guard; drop ones too old to run."""
+    while True:
+        time.sleep(DEFERRED_REVIEW_POLL)
+        try:
+            due, expired = _deferred_reviews.take_due()
+        except Exception as exc:
+            logger.error(f"Deferred review record unusable: {type(exc).__name__}")
+            continue
+        for entry in expired:
+            event = entry["event"]
+            thread = event.get("thread_ts") or event.get("ts", "")
+            audit_logger.info(format_review_audit(
+                user=event.get("user", ""), channel=event.get("channel", ""), thread=thread,
+                pr=entry.get("pr"), outcome="deferred_expired",
+            ))
+            try:
+                slack_client.chat_postMessage(
+                    channel=event.get("channel", ""), thread_ts=thread,
+                    text=DEFER_EXPIRED_REPLY.format(pr=entry.get("pr", "the PR")),
+                )
+            except Exception as exc:
+                logger.warning(f"Could not post the expired-review note: {type(exc).__name__}")
+        for entry in due:
+            try:
+                _review_requests.replay(dict(entry["event"]))
+            except Exception as exc:
+                logger.error(f"Could not replay the deferred review of {entry.get('pr')}: {type(exc).__name__}")
+
+
 def _clear_eyes(channel: str, ts: str) -> None:
     try:
         slack_client.reactions_remove(channel=channel, name="eyes", timestamp=ts)
@@ -2436,6 +2739,10 @@ class _NoLiveSession(Exception):
 
 class _ReviewBusy(Exception):
     """A review found a turn already running in its thread."""
+
+
+class _CodexReviewDone(Exception):
+    """A review ran (or was deferred) on the Codex path; no Claude session belongs to the turn."""
 
 
 def process_message_async(
@@ -2577,9 +2884,9 @@ def process_message_async(
         limit_paused=_limit_paused(),
         has_openai_session=_get_openai_session(thread_ts) is not None,
     )
-    if review and use_openai:
-        review_admission.refuse("refused_provider", PROVIDER_REPLY)
-        return
+    if review:
+        # A review picks its provider once it holds the review slot (_review_provider).
+        use_openai = False
     if review_notice and use_openai:
         # A Codex turn would run as the peer bot; leave the thread for a person to resume.
         slack_client.chat_postMessage(
@@ -2738,6 +3045,7 @@ def process_message_async(
     audit_session_id = _get_openai_session(thread_ts) if use_openai else None
     turn_admitted = False
     review_slot_held = False
+    review_on_codex = False
     session = None
     handoff_request = None
     handoff_source = None
@@ -2797,11 +3105,29 @@ def process_message_async(
                     if slot == "queued" and not _review_still_runnable(review_admission, room_policy, thread_ts):
                         _clear_eyes(reaction_channel, reaction_msg_ts)
                         return
+                    review_on_codex = _review_provider(thread_ts) == "codex"
+                    if review_on_codex and not _codex_review_ready():
+                        # Deferred before its cap is charged; a replay re-admits it.
+                        _clear_eyes(reaction_channel, reaction_msg_ts)
+                        _defer_review(review_admission)
+                        return
                 # A review already said it was queued, so it waits for a turn without a second note.
                 _turn_admission.acquire(
                     None if review else lambda: _post_queue_notice(channel, thread_ts)
                 )
                 turn_admitted = True
+                if review_on_codex:
+                    if not review_admission.start():
+                        _clear_eyes(reaction_channel, reaction_msg_ts)
+                        return
+                    outcome = _run_codex_review(
+                        review_admission, room_policy, channel=channel, thread_ts=thread_ts,
+                        user_id=user_id, envelope=envelope, on_text=on_text,
+                        max_duration=min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME),
+                    )
+                    if outcome == "unavailable":
+                        _defer_review(review_admission)
+                    raise _CodexReviewDone()
                 session = _get_or_create_live_session(
                     thread_ts, channel, user_id=user_id,
                     review_policy=room_policy if review else None,
@@ -2914,11 +3240,13 @@ def process_message_async(
                 audit_session_id = session.session_id
                 fallback_workspace = None
                 if fallback_requested and review:
-                    # The Codex fallback carries none of the review-only controls.
-                    # A review that already posted its reply needs no "paused" note under it.
+                    # A review that already posted its reply is finished; otherwise it moves to Codex.
                     if not session.review_done:
-                        all_texts.append(PROVIDER_REPLY)
-                        post_response(channel, PROVIDER_REPLY, thread_ts=thread_ts)
+                        _continue_review_after_limit(
+                            review_admission, room_policy, channel=channel, thread_ts=thread_ts,
+                            user_id=user_id, envelope=envelope, on_text=on_text,
+                            max_duration=max(0.001, turn_deadline - time.monotonic()),
+                        )
                 elif fallback_requested and review_notice:
                     # A Codex turn would run as the peer bot.
                     note = REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"])
@@ -2973,6 +3301,8 @@ def process_message_async(
         _clear_eyes(reaction_channel, reaction_msg_ts)
         review_admission.refuse("refused_busy", BUSY_REPLY)
         return
+    except _CodexReviewDone:
+        pass
     except _NoLiveSession:
         _clear_eyes(reaction_channel, reaction_msg_ts)
         try:
@@ -3560,6 +3890,7 @@ def _lookup_review_pr(pr_url: str, root: Path, include_reviews: bool = True):
 
 
 _review_notices = ReviewNoticeStore(STATE_DIR / "review-notices.json")
+_deferred_reviews = DeferredReviewStore(STATE_DIR / "deferred-reviews.json")
 
 REVIEW_NOTICE_MESSAGE = (
     "Your peer agent's review turn on {pr} has ended. Read the verdict and its threads on the PR."
@@ -3662,11 +3993,6 @@ _review_requests = ReviewRequestHandler(
         or _maybe_provider_command(event)
     ),
     turn_running=_review_turn_running,
-    provider_unavailable=lambda thread_ts: use_openai_provider(
-        _get_provider_override(thread_ts),
-        limit_paused=_limit_paused(),
-        has_openai_session=_get_openai_session(thread_ts) is not None,
-    ),
     room_policy=_review_room_policy,
     lookup=_lookup_review_pr,
     start_turn=lambda admission: process_message_async(admission.event, review_admission=admission),
@@ -4246,6 +4572,7 @@ def main():
 
     # Start idle session cleanup thread
     threading.Thread(target=_cleanup_idle_sessions, daemon=True).start()
+    threading.Thread(target=_deferred_review_loop, daemon=True).start()
     threading.Thread(target=_reporter_heartbeat, daemon=True).start()
 
     runtime_ready = False

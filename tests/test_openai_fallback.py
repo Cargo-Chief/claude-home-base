@@ -177,6 +177,29 @@ class OpenAIFallbackTest(unittest.TestCase):
         process.kill.assert_called_once_with()
 
     @patch("openai_fallback.subprocess.Popen")
+    def test_runner_stops_a_timed_out_process_with_the_given_stop(self, popen):
+        process = popen.return_value
+        process.returncode = 0
+        process.poll.return_value = None
+        released = threading.Event()
+
+        def blocked_stdout():
+            released.wait(timeout=1)
+            return
+            yield
+
+        process.stdout = blocked_stdout()
+        process.stderr = iter([])
+        stopped = []
+        result = run_codex_turn(
+            ["wrapper", "--", "codex"], "prompt", cwd="/workspace", env={}, timeout=0.01,
+            stop=lambda proc: (stopped.append(proc), released.set()),
+        )
+        self.assertEqual("Codex fallback timed out", result.error)
+        self.assertEqual([process], stopped)
+        process.kill.assert_not_called()
+
+    @patch("openai_fallback.subprocess.Popen")
     def test_runner_times_out_when_prompt_delivery_blocks(self, popen):
         process = popen.return_value
         process.returncode = 0

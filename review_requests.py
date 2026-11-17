@@ -52,6 +52,14 @@ CAP_REPLY = "This PR has had too many review requests today; try again tomorrow.
 CAP_STORE_REPLY = "Reviews are unavailable: the review pass record is unreadable."
 CONFIG_REPLY = "Review requests are not configured correctly here."
 PROVIDER_REPLY = "Reviews are paused while Claude is unavailable."
+DEFERRED_REPLY = (
+    "Claude is at its usage limit and the OpenAI fallback cannot run this review right now, so I've "
+    "queued it. It starts automatically {when}; there is no need to ask again."
+)
+DEFER_EXPIRED_REPLY = (
+    "The queued review of {pr} waited 24 hours without a provider that could run it, so I dropped it. "
+    "Ask again to retry."
+)
 WRAPPER_REPLY = "Reviews are unavailable: this agent's GitHub wrapper is out of date."
 THROTTLE_REPLY = "Too many review requests right now; try again later."
 ERROR_REPLY = "The review could not start."
@@ -152,24 +160,26 @@ class ReviewPlan:
     pass_no: int
     max_passes: int
     base: str = ""
+    # This agent's marked reviews already on the PR: a higher count later means a pass was posted.
+    marked: int = field(default=0, compare=False)
 
 
 def plan_review_pass(reviews: Iterable[Mapping], self_login: str, max_passes: int) -> ReviewPlan:
     """The next pass from this agent's latest marked review; only its Bot account's reviews count."""
     me = normalize_login(self_login)
-    passes, last_head = 0, ""
+    passes, last_head, marked = 0, "", 0
     for review in reviews:
         if review.get("type") != "Bot" or normalize_login(review.get("login") or "") != me:
             continue
         matches = REVIEW_MARKER_RE.findall(review.get("body") or "")
         if matches:
             pass_no, _, head = matches[-1]
-            passes, last_head = int(pass_no), head
+            passes, last_head, marked = int(pass_no), head, marked + 1
     if passes == 0:
-        return ReviewPlan("full", 1, max_passes)
+        return ReviewPlan("full", 1, max_passes, marked=marked)
     if passes < max_passes:
-        return ReviewPlan("incremental", passes + 1, max_passes, last_head)
-    return ReviewPlan("closeout", passes, max_passes, last_head)
+        return ReviewPlan("incremental", passes + 1, max_passes, last_head, marked=marked)
+    return ReviewPlan("closeout", passes, max_passes, last_head, marked=marked)
 
 
 def lookup_pr(
@@ -514,8 +524,14 @@ _THREAD_WORK = (
 )
 
 
-def build_review_task(pr_url: str, root: Path, plan: ReviewPlan) -> str:
-    """The harness-built task for a review-only turn; the requester's words travel in the envelope."""
+def build_review_task(
+    pr_url: str, root: Path, plan: ReviewPlan, harness_posts: tuple[Path, Path] | None = None,
+) -> str:
+    """The harness-built task for a review-only turn; the requester's words travel in the envelope.
+
+    With ``harness_posts`` (the review file and the post-request file) the turn cannot post: it
+    writes both and the harness posts them after the turn, as on the Codex fallback.
+    """
     post = f"python3 {github_wrapper_path(root)} -- python3 {REVIEW_POST_SCRIPT}"
     if plan.mode == "full":
         work = (
@@ -548,17 +564,38 @@ def build_review_task(pr_url: str, root: Path, plan: ReviewPlan) -> str:
             "settled and nothing you found must change before merge; request changes only for a "
             "new finding that must; otherwise comment."
         )
+    verdicts = (
+        "Choose the verdict: `request_changes` when a finding must be fixed before merge, "
+        "`approve` when nothing needs fixing and every one of your threads is resolved or settled, otherwise "
+        "`comment`. "
+    )
+    if harness_posts is None:
+        posting = (
+            "Write the review to a review.json under work/ (commit_id, body, and comments with path, an "
+            "integer line, side and body). "
+            f"First run `{post} threads {pr_url}` to list your threads, then post with "
+            f"`{post} submit {pr_url} --review <review.json> --verdict <v>`. "
+            + verdicts
+            + "That script is the only way to post; the reviews and GraphQL endpoints are "
+            "blocked here, and if it refuses, say why in the thread. "
+        )
+    else:
+        review_file, post_file = harness_posts
+        posting = (
+            "You cannot post to GitHub from this turn: your GitHub token is read-only. "
+            f"First run `python3 {REVIEW_POST_SCRIPT} threads {pr_url}` to list your threads. Write the "
+            f"review to {review_file} (commit_id, body, and comments with path, an integer line, side "
+            "and body; thread `replies` as above), then write "
+            f'{post_file} as {{"verdict": "<v>", "resolve": [<thread ids>]}}. '
+            + verdicts
+            + "When your turn ends, home-base posts the review with that verdict and says in this "
+            "thread whether it posted. "
+        )
     return (
         "[CARGO_CHIEF_REVIEW_TASK]\n"
         f"Review pull request {pr_url}. {work} "
-        "Write the review to a review.json under work/ (commit_id, body, and comments with path, an "
-        "integer line, side and body). "
-        f"First run `{post} threads {pr_url}` to list your threads, then post with "
-        f"`{post} submit {pr_url} --review <review.json> --verdict <v>`. "
-        "Choose the verdict: `request_changes` when a finding must be fixed before merge, "
-        "`approve` when nothing needs fixing and every one of your threads is resolved or settled, otherwise "
-        "`comment`. That script is the only way to post; the reviews and GraphQL endpoints are "
-        "blocked here, and if it refuses, say why in the thread. Then reply in this Slack thread "
+        + posting
+        + "Then reply in this Slack thread "
         f"with the verdict, a short summary and the PR link {pr_url}. "
         "Wait for every subagent you start before that reply, "
         f"and end the reply with a line containing only `{REVIEW_DONE_MARKER}`. Do nothing else. "
@@ -590,6 +627,8 @@ class ReviewAdmission:
     audit: Callable[[str], None]
     started: bool = False
     closed: bool = False
+    # Queued to run later; its hand-back waits for the replay that actually runs it.
+    deferred: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def _record(self, outcome: str) -> None:
@@ -606,6 +645,16 @@ class ReviewAdmission:
         self._record(outcome)
         if reply:
             self.post(self.event.get("channel", ""), _thread(self.event), reply)
+
+    def defer(self, reply: str) -> None:
+        """Queue the review for later: audited `deferred` (after `accepted`, if its turn had started)."""
+        with self._lock:
+            if self.deferred or (self.closed and not self.started):
+                return
+            self.closed = True
+            self.deferred = True
+        self._record("deferred")
+        self.post(self.event.get("channel", ""), _thread(self.event), reply)
 
     def start(self) -> bool:
         """Charge the cap and audit acceptance; False (already refused) when the turn may not run."""
@@ -643,7 +692,6 @@ class ReviewRequestHandler:
     is_authorized: Callable[[str], bool]
     run_control_command: Callable[[dict], bool]
     turn_running: Callable[[str], bool]
-    provider_unavailable: Callable[[str], bool]
     room_policy: Callable[[str, str], RoomPolicy]
     lookup: Callable[[str, Path], PullRequestInfo]
     start_turn: Callable[[ReviewAdmission], None]
@@ -694,6 +742,22 @@ class ReviewRequestHandler:
         if pr is None:
             self._refuse(event, None, "refused_no_pr", USAGE_HINT if human else None)
             return
+        self._begin(event, pr, peer)
+
+    def replay(self, event: dict) -> None:
+        """Run a deferred request again through every claim and guard, skipping only redelivery."""
+        try:
+            peer = peer_review_config(self.load_config())
+        except SafetyError as exc:
+            logger.error(f"Deferred review dropped: {exc}")
+            return
+        kind = classify_sender(event, bot_user_id=self.bot_user_id, peer_bot_ids=peer.peer_bot_user_ids)
+        pr = single_pr_url(event.get("text", ""))
+        if kind == IGNORE or pr is None:
+            return
+        self._begin(event, pr, peer)
+
+    def _begin(self, event: dict, pr: str, peer: PeerReviewConfig) -> None:
         thread = _thread(event)
         if self.turn_running(thread) or not self.claims.claim(thread):
             self._refuse(event, pr, "refused_busy", BUSY_REPLY)
@@ -761,9 +825,6 @@ class ReviewRequestHandler:
             logger.error(f"Review request refused: {exc}")
             self._refuse(event, pr, "refused_cap_store", CAP_STORE_REPLY)
             return None
-        if self.provider_unavailable(_thread(event)):
-            self._refuse(event, pr, "refused_provider", PROVIDER_REPLY)
-            return None
         try:
             info = self.lookup(pr, policy.root)
         except ReviewGuardError as exc:
@@ -799,7 +860,8 @@ class ReviewRequestHandler:
             finally:
                 # Every admitted request ends in exactly one audit line.
                 admission.refuse("refused_error", ERROR_REPLY)
-            hand_back = admission.started and event.get("user", "") in peer.peer_bot_user_ids
+            hand_back = (admission.started and not admission.deferred
+                         and event.get("user", "") in peer.peer_bot_user_ids)
         finally:
             self.claims.release(thread)
             self.claims.release(_pr_claim(pr))

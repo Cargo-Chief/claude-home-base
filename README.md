@@ -74,11 +74,11 @@ finders) is still running. Any other `result` pauses the turn: its text folds in
 line, and the turn continues when a finder's notification starts the next one. The one exception is
 a usage-limit notice the CLI wrote itself (message model `<synthetic>`, text matching
 `is_claude_limit_notice`, e.g. "You've hit your 5-hour limit"): no finder can progress after it, so
-the turn ends at its next `result` and replies `PROVIDER_REPLY` (unless it already posted its reply)
-rather than idling into the inactivity timeout. Model text that merely quotes such a line, as a
+the turn ends at its next `result` rather than idling into the inactivity timeout, and the review
+moves to the Codex fallback (below) unless it already posted its reply. Model text that merely quotes such a line, as a
 review of this code will, is ordinary text in every turn. The notice also starts the account-wide
 limit pause until the reset, read in the zone the notice names (else the host's local time), so
-further requests are refused at once. A review that
+further reviews start on the Codex fallback. A review that
 already posted its completion line and then times out ends without a timeout note. Background shell tasks and `Monitor`
 timers are not counted; they die with the process. While a finder is tracked (at most 30 minutes
 each) the inactivity limit does not fire, so `REVIEW_MAX_RUNTIME` (45 minutes) is the bound that
@@ -166,7 +166,7 @@ Logs, session maps, forwards, votes, stderr, and temporary artifacts live under 
 (`REVIEW_SESSION_SLOTS`, `session_lifecycle.ReviewSlots`). Reviews never evict. Up to two more
 (`REVIEW_QUEUE_DEPTH`) wait for the slot, with one queued note, for at most an hour
 (`REVIEW_QUEUE_WAIT`); past either bound the request is refused aloud (`refused_queue`). A review that
-waited re-checks the provider and that the PR is still open before it starts. At the work cap the oldest
+waited re-checks that the PR is still open, then picks its provider. At the work cap the oldest
 idle work thread is evicted: a thread whose review hand-back is being delivered (`LiveSession.waking`)
 never, and one that asked a peer for a review in the last two hours (`REVIEW_WAIT_PROTECTION`) last, so
 it is normally still live to be woken; the 3-hour idle cleanup can still close it. A turn stops after at
@@ -468,6 +468,45 @@ You (anywhere) → Slack → Cloudflare Tunnel → Your Mac → Claude Code CLI
                                               + plugins + skills
                                               + full filesystem access
 ```
+
+### Reviews on the OpenAI fallback
+
+A review runs on Claude unless Claude is in its usage-limit pause or the thread is pinned to
+OpenAI (`_review_provider`, decided once the review holds its slot). Then it runs on Codex under
+review-only controls (`review_fallback.py`, `_run_codex_review`):
+
+- **No GitHub write token in the model's process.** The harness launches Codex through the App
+  wrapper with `REVIEW_READ_TOKEN_PERMISSIONS` (contents and pull requests, read). The turn writes
+  `review.json` and `review-post.json` (`{"verdict", "resolve"}`) in its thread workspace; after the
+  turn the harness reads both without following symlinks, copies the review to a file of its own,
+  and posts it through `review_post.py submit` under the usual review write token, then says in
+  the thread whether it posted. Nothing is posted after a stop, a timeout, a failed turn, or a
+  delegate result that was never verified.
+- **A sandbox in place of deny rules.** `approval_policy="never"`, a `cc_review` permissions
+  profile that extends the thread workspace with `work/`, the PR repo's shared clone's `.git` (for
+  fetching its refs; `review_checkout` finds it by origin URL) and CODEX_HOME, while
+  `~/.config/cargo-chief`, `~/.config/gh`, `~/.aws`, `~/.ssh` and `~/.git-credentials` are
+  unreadable, so the turn cannot mint a token of its own. Codex's own config layers, instructions,
+  rules and login stay read-only (`codex_config_paths`), since governed delegates run Codex inside
+  the sandbox and need the rest of CODEX_HOME writable.
+- **No apps, MCP servers, user config or learned rules**: `features.apps=false` (the ChatGPT
+  account's connectors would otherwise appear as tools), `mcp_servers={}`, `--ignore-user-config`,
+  `--ignore-rules`, `--ephemeral`. The environment is `review_turn_env` without Claude's
+  credentials, and the shell inherits it whole so the read-only token reaches `gh` and `git`.
+- Finders go through governed delegation, non-mutating only, on the thread's delegation budget.
+
+A Claude review stopped by a usage limit moves to Codex in the same turn, unless the PR already
+carries a newer marked review from this agent (`ReviewPlan.marked`), which means the pass was posted
+before the limit and running it again would post it twice.
+
+When Codex cannot run the review either (the CLI or profile is missing, or the turn fails before
+posting), the request is deferred: `deferred-reviews.json` in the state directory, one entry per PR,
+file-locked, an unreadable record raises. The thread is told when it will start (the end of the
+limit pause, else 30 minutes) and not to ask again, and the request is audited `deferred`. A loop
+replays due entries through `ReviewRequestHandler.replay`, which runs every claim and guard again
+and skips only the redelivery check. A deferred request hands nothing back to a peer requester
+until a replay actually runs it. An entry first deferred more than 24 hours ago is dropped with a
+note asking for a new request (`deferred_expired`).
 
 ## OpenAI fallback
 

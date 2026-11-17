@@ -46,6 +46,11 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   (`session_lifecycle.BackgroundAgents`), or at the first `result` after a CLI-written usage-limit
   notice (`LiveSession.limit_hit`; only `<synthetic>` messages count, never quoted model text); every
   other `result` is a pause. See README
+- A review on the Codex fallback (`review_fallback.py`, `_run_codex_review`) never holds a GitHub
+  write token: it gets a read-only one and a `cc_review` sandbox (credentials unreadable, apps and
+  MCP off, no approvals), writes `review.json` and `review-post.json`, and the harness posts them.
+  A review neither provider can run is deferred (`DeferredReviewStore`) and replayed through
+  `ReviewRequestHandler.replay`; a deferred admission hands nothing back. See README
 - A review turn writes to GitHub only through `review_post.py` (verdict, inline comments, resolving
   its own threads); approvals need the requester in `peer_review.github_logins`. The review token
   (`REVIEW_TOKEN_PERMISSIONS`) may be refused a resolve, so an approval can post over a thread the

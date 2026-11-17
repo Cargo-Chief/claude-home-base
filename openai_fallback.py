@@ -136,8 +136,14 @@ def run_codex_turn(
     delegate_active: Callable[[], bool] = lambda: False,
     max_duration: float | None = None,
     wait_for_completion: Callable = wait_for_turn_completion,
+    stop: Callable[[subprocess.Popen], None] | None = None,
 ) -> CodexTurnResult:
-    """Run one governed Codex turn with a progress-aware inactivity timeout."""
+    """Run one governed Codex turn with a progress-aware inactivity timeout.
+
+    ``stop`` ends a timed-out or failed turn's process; the default kills it, which leaves a child
+    running when the process is a wrapper that does not forward signals.
+    """
+    stop = stop or (lambda proc: proc.kill())
     process = None
     stdout_lines: list[str] = []
     stdout_done = threading.Event()
@@ -205,12 +211,12 @@ def run_codex_turn(
             return CodexTurnResult(error="Codex fallback could not start")
     except subprocess.TimeoutExpired:
         if process and process.poll() is None:
-            process.kill()
+            stop(process)
             process.wait()
         return CodexTurnResult(error="Codex fallback timed out")
     except OSError:
         if process and process.poll() is None:
-            process.kill()
+            stop(process)
             process.wait()
         return CodexTurnResult(error="Codex fallback could not start")
     finally:
