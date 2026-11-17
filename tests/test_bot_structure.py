@@ -29,7 +29,8 @@ class BotTurnStructureTest(unittest.TestCase):
                     if isinstance(key, ast.Constant) and key.value == "CARGO_CHIEF_DELEGATE_TIMEOUT":
                         values.append(ast.unparse(value))
 
-        # Only the Codex fallback launches governed delegates; Claude sessions delegate natively.
+        # Only the Codex fallback launches governed delegates; Claude sessions delegate natively,
+        # and a review on Codex does not delegate.
         self.assertEqual(["str(DELEGATE_TIMEOUT)"], values)
 
     def _function(self, name):

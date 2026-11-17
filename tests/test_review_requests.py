@@ -333,6 +333,23 @@ class RecentMentionsTest(unittest.TestCase):
         self.assertTrue(recent.first_delivery("C1", "1.1"))
 
 
+class CapRefundTest(unittest.TestCase):
+    def test_refund_removes_only_the_newest_charge(self):
+        with tempfile.TemporaryDirectory() as temp:
+            now = [100.0]
+            caps = ReviewCapStore(Path(temp) / "caps.json", clock=lambda: now[0])
+            caps.admit(PR, 2)
+            now[0] = 200.0
+            caps.admit(PR, 2)
+            self.assertTrue(caps.exhausted(PR, 2))
+            caps.refund(PR)
+            self.assertFalse(caps.exhausted(PR, 2))
+            self.assertTrue(caps.exhausted(PR, 1))
+            caps.refund(PR)
+            caps.refund(PR)
+            self.assertFalse(caps.exhausted(PR, 1))
+
+
 class HandlerTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -348,7 +365,7 @@ class HandlerTest(unittest.TestCase):
         self.info = PullRequestInfo("kfranzenCC", "OPEN")
         self.lookup_error = None
         self.running = False
-        self.provider_down = False
+        self.defer_turn = False
         self.room_error = None
         self.policy = policy()
         self.wrapper_ok = True
@@ -371,7 +388,6 @@ class HandlerTest(unittest.TestCase):
             is_authorized=lambda user: user in self.authorized,
             run_control_command=self.control,
             turn_running=lambda thread: self.running,
-            provider_unavailable=lambda thread: self.provider_down,
             room_policy=self.room_policy,
             lookup=self.lookup,
             start_turn=self.start_turn,
@@ -400,6 +416,9 @@ class HandlerTest(unittest.TestCase):
     def start_turn(self, admission):
         # Stands in for process_message_async: the turn starts (or does not) and returns.
         self.assertIs(self.policy, admission.policy)
+        if self.defer_turn:
+            admission.defer("queued")
+            return
         if self.turn_starts and admission.start():
             self.turns.append((admission.event["user"], admission.pr))
 
@@ -579,11 +598,68 @@ class HandlerTest(unittest.TestCase):
         self.mention(thread_ts="0.7")
         self.assertEqual(["accepted", "accepted", "refused_cap"], self.outcomes())
 
-    def test_provider_fallback_refuses_reviews(self):
-        self.provider_down = True
+    def test_intake_never_refuses_for_the_provider(self):
+        # The provider is chosen once the turn holds its slot; a limit moves it to Codex or defers it.
+        self.assertNotIn(PROVIDER_REPLY, self.replies())
         self.mention()
-        self.assertEqual([PROVIDER_REPLY], self.replies())
-        self.assertEqual(["refused_provider"], self.outcomes())
+        self.assertEqual(["accepted"], self.outcomes())
+
+    def test_a_deferred_request_is_audited_once_and_replies(self):
+        self.defer_turn = True
+        self.mention(user="UNED", bot_id="BNED")
+        self.assertEqual(["deferred"], self.outcomes())
+        self.assertEqual(["queued"], self.replies())
+        self.assertEqual([], self.turns)
+
+    def test_a_deferred_request_hands_nothing_back(self):
+        self.defer_turn = True
+        self.mention(user="UNED", bot_id="BNED")
+        self.assertFalse(any("has ended" in text for _, _, text in self.posts))
+        self.assertTrue(self.claims.claim("1.1"), "claims are released after a deferral")
+
+    def test_a_turn_deferred_after_it_started_hands_nothing_back_and_is_refunded(self):
+        def start_then_defer(admission):
+            admission.start()
+            admission.defer("queued")
+        self.handler.start_turn = start_then_defer
+        self.mention(user="UNED", bot_id="BNED")
+        self.assertEqual(["accepted", "deferred"], self.outcomes())
+        self.assertFalse(any("has ended" in text for _, _, text in self.posts))
+        self.assertFalse(self.caps.exhausted(PR, 1), "the charge is given back")
+
+    def test_a_repeat_deferral_posts_nothing_new(self):
+        def defer_quietly(admission):
+            admission.defer(None)
+        self.handler.start_turn = defer_quietly
+        self.mention(user="UNED", bot_id="BNED")
+        self.assertEqual(["deferred"], self.outcomes())
+        self.assertEqual([], self.replies())
+
+    def test_a_refused_replay_still_hands_back_to_a_peer(self):
+        self.info = PullRequestInfo("kfranzenCC", "MERGED")
+        event = {"user": "UNED", "bot_id": "BNED", "channel": "CREVIEWS", "ts": "9.1",
+                 "text": f"<@ULISA> please review {PR}", "cc_deferred_first_at": 1.0}
+        self.handler.replay(event)
+        self.assertEqual(["refused_state"], self.outcomes())
+        self.assertEqual(("CREVIEWS", "9.1", review_ended_text("UNED", PR)), self.posts[-1])
+
+    def test_replay_runs_every_guard_again_despite_redelivery(self):
+        self.config["peer_review"]["max_reviews_per_pr"] = 2
+        event = self.mention(user="UNED", bot_id="BNED")
+        self.handler.intake(dict(event))
+        self.assertEqual(1, len(self.turns), "a redelivered mention is still dropped")
+        self.handler.replay(dict(event))
+        self.assertEqual(2, len(self.turns))
+        self.info = PullRequestInfo("kfranzenCC", "MERGED")
+        self.handler.replay(dict(event))
+        self.assertEqual(["accepted", "accepted", "refused_state"], self.outcomes())
+
+    def test_replay_ignores_events_that_are_not_requests(self):
+        self.handler.replay({"user": "UOTHER", "bot_id": "BOTHER", "channel": "CREVIEWS", "ts": "9.1",
+                             "text": f"<@ULISA> review {PR}"})
+        self.handler.replay({"user": "UNED", "bot_id": "BNED", "channel": "CREVIEWS", "ts": "9.2",
+                             "text": "no link"})
+        self.assertEqual(([], []), (self.turns, self.audits))
 
 
     def wire_notices(self):

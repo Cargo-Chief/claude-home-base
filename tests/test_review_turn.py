@@ -54,7 +54,7 @@ FUNCTIONS = (
     "process_message_async", "_spawn_claude_process", "_get_or_create_live_session", "_clear_eyes",
     "_review_still_runnable",
 )
-CLASSES = ("_ReviewBusy", "_NoLiveSession")
+CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
 ENV = {"AUTHORIZED_USERS": "UKIRK", "CARGO_CHIEF_APPROVERS": "UKIRK"}
 
@@ -109,6 +109,8 @@ def load(**overrides):
         "_get_session": lambda thread: "saved-session",
         "_review_turn_running": lambda thread: False,
         "use_openai_provider": lambda *args, **kwargs: False,
+        "_review_provider": lambda thread: "claude",
+        "_codex_review_ready": lambda: True,
     })
     namespace.update(overrides)
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -328,7 +330,6 @@ class ProcessReviewTest(unittest.TestCase):
     def test_the_recheck_after_waiting_refuses_what_changed(self):
         check = self.ns["_review_still_runnable"]
         cases = [
-            ("paused", lambda: True, mock.MagicMock(return_value=mock.MagicMock(state="OPEN")), False),
             ("refused_state", lambda: False, mock.MagicMock(return_value=mock.MagicMock(state="MERGED")), False),
             ("refused_lookup", lambda: False, mock.MagicMock(side_effect=RuntimeError("gh")), False),
             (None, lambda: False, mock.MagicMock(return_value=mock.MagicMock(state="OPEN")), True),
@@ -396,12 +397,62 @@ class ProcessReviewTest(unittest.TestCase):
         self.run_turn(self.admission())
         return replies
 
-    def test_a_review_that_hits_the_limit_says_reviews_are_paused(self):
-        self.assertEqual(["paused"], self.limited_turn())
+    def test_a_review_that_hits_the_limit_moves_to_codex(self):
+        self.assertEqual([], self.limited_turn())
+        moved = self.ns["_continue_review_after_limit"]
+        self.assertEqual(1, moved.call_count)
+        (admission, policy), turn = moved.call_args
+        self.assertEqual(PR, admission.pr)
+        self.assertTrue(policy.review_only)
+        self.assertEqual("1.1", turn["thread_ts"])
+        self.assertIn("CARGO_CHIEF_AUTHORITY_ENVELOPE", turn["envelope"])
         self.assertEqual([self.session], self.closed)
 
-    def test_a_review_that_already_replied_gets_no_paused_note(self):
+    def test_a_review_moved_after_a_limit_never_says_it_lost_its_train_of_thought(self):
+        posted = []
+        self.ns["slack_client"].chat_postMessage.side_effect = lambda **kwargs: posted.append(kwargs["text"])
+        self.session.proc.poll.return_value = 0
+        self.ns["TurnReporter"] = lambda **kwargs: mock.MagicMock(noticed_no_reply=False, active=False)
+        self.limited_turn()
+        self.assertFalse(any("train of thought" in text for text in posted))
+
+    def test_a_review_that_already_replied_is_not_rerun(self):
         self.assertEqual([], self.limited_turn(review_done=True))
+        self.ns["_continue_review_after_limit"].assert_not_called()
+
+    def test_a_limited_review_runs_on_codex_without_a_claude_session(self):
+        self.ns["_review_provider"] = lambda thread: "codex"
+        runs = []
+
+        def run(admission, policy, **turn):
+            runs.append(admission.started)
+            turn["on_text"]("summary")
+            return "done"
+
+        self.ns["_run_codex_review"] = run
+        self.run_turn(self.admission())
+        self.assertEqual([True], runs, "the cap is charged before the Codex turn runs")
+        self.assertEqual(["accepted"], self.outcomes())
+        self.assertEqual([], self.sent, "nothing is sent to a Claude process")
+        self.ns["_defer_review"].assert_not_called()
+
+    def test_a_review_codex_cannot_run_is_deferred_before_its_cap_is_charged(self):
+        self.ns["_review_provider"] = lambda thread: "codex"
+        self.ns["_codex_review_ready"] = lambda: False
+        self.ns["_run_codex_review"] = mock.MagicMock()
+        admission = self.admission()
+        self.run_turn(admission)
+        self.ns["_defer_review"].assert_called_once_with(admission)
+        self.assertFalse(admission.started)
+        self.ns["_run_codex_review"].assert_not_called()
+
+    def test_a_codex_review_that_cannot_run_is_deferred(self):
+        self.ns["_review_provider"] = lambda thread: "codex"
+        self.ns["_run_codex_review"] = lambda admission, policy, **turn: "unavailable"
+        admission = self.admission()
+        self.run_turn(admission)
+        self.ns["_defer_review"].assert_called_once_with(admission)
+        self.assertEqual([], self.sent)
 
     def test_a_notice_is_consumed_and_cleared_so_a_later_echo_is_plain_text(self):
         def send(session, text):
@@ -418,7 +469,7 @@ class ProcessReviewTest(unittest.TestCase):
         self.ns["_enter_limit_pause"] = paused.append
         self.run_turn(self.admission())
         self.assertEqual(["LIMIT"], paused)
-        self.assertEqual(["LIMIT", "paused"], replies)
+        self.assertEqual(["LIMIT"], replies)
 
     def test_a_quoted_limit_string_is_not_treated_as_the_notice(self):
         def send(session, text):
