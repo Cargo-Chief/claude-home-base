@@ -68,6 +68,14 @@ DEFER_EXPIRED_REPLY = (
 WRAPPER_REPLY = "Reviews are unavailable: this agent's GitHub wrapper is out of date."
 THROTTLE_REPLY = "Too many review requests right now; try again later."
 ERROR_REPLY = "The review could not start."
+QUEUE_FULL_REPLY = "Too many reviews are waiting here right now; ask again later."
+# The fixed replies that end a request without a review turn, so no hand-back will follow. BUSY_REPLY is
+# left out: it answers a follow-up in a thread whose review is still running, which will hand back.
+REFUSAL_REPLIES = frozenset({
+    PR_BUSY_REPLY, OWN_PR_REPLY, NOT_OPEN_REPLY, LOOKUP_FAILED_REPLY, CAP_REPLY,
+    CAP_STORE_REPLY, CONFIG_REPLY, PROVIDER_REPLY, WRAPPER_REPLY, THROTTLE_REPLY, ERROR_REPLY,
+    QUEUE_FULL_REPLY, CODEX_UNAVAILABLE_REPLY,
+})
 
 # The link must start a token, so a Cargo-Chief URL embedded in another URL never matches.
 _PR_URL_RE = re.compile(
@@ -339,6 +347,8 @@ class ReviewCapStore:
 
 
 NOTICE_WINDOW_SECONDS = 7 * 24 * 3600
+REFUSAL_RECORD_ATTEMPTS = 5  # the sender records its request after its post returns
+REFUSAL_RECORD_WAIT = 2.0
 _SLACK_LINK_RE = re.compile(r"<(https?://[^>|]+)(?:\|[^>]*)?>")
 
 
@@ -346,6 +356,22 @@ def review_ended_text(requester_id: str, pr: str) -> str:
     """The reviewer's fixed hand-back to a peer bot that asked for a review."""
     return (f"<@{requester_id}> my review turn on {pr} has ended. "
             "Any verdict is on the PR; if there is none, the review stopped early.")
+
+
+def _to_requester(event: dict, reply: str) -> str:
+    """A reply to a peer bot mentions it, since a bot hears only its mentions; a person's reply does not."""
+    user = event.get("user", "")
+    return f"<@{user}> {reply}" if event.get("bot_id") and user else reply
+
+
+def refusal_reason(text: str, requester_id: str) -> str | None:
+    """The fixed refusal a peer addressed to this agent, without the mention; None for anything else."""
+    prefix = f"<@{requester_id}> "
+    text = (text or "").strip()
+    if not requester_id or not text.startswith(prefix):
+        return None
+    reason = text[len(prefix):]
+    return reason if reason in REFUSAL_REPLIES else None
 
 
 def is_review_ended(text: str, requester_id: str, pr: str) -> bool:
@@ -408,11 +434,11 @@ class ReviewNoticeStore:
             return {entry.get("thread", "") for entry in data.values() if entry["at"] > cutoff} - {""}, False
         return self._locked(recent)
 
-    def take(self, request_ts: str, pr: str) -> dict | None:
-        """The entry for that request and PR, removed; None if there is none."""
+    def take(self, request_ts: str, pr: str | None = None) -> dict | None:
+        """The entry for that request (and PR, when given), removed; None if there is none."""
         def pop(data: dict) -> tuple[dict | None, bool]:
             entry = data.get(request_ts)
-            if not entry or entry.get("pr") != pr:
+            if not entry or (pr is not None and entry.get("pr") != pr):
                 return None, False
             return data.pop(request_ts), True
         return self._locked(pop)
@@ -661,7 +687,7 @@ class ReviewAdmission:
             self.closed = True
         self._record(outcome)
         if reply:
-            self.post(self.event.get("channel", ""), _thread(self.event), reply)
+            self.post(self.event.get("channel", ""), _thread(self.event), _to_requester(self.event, reply))
 
     def defer(self, reply: str | None) -> None:
         """Queue the review for later: audited `deferred` (after `accepted`, if its turn had started).
@@ -725,6 +751,7 @@ class ReviewRequestHandler:
     wrapper_ready: Callable[[Path], bool] = github_wrapper_downscopes
     notices: "ReviewNoticeStore | None" = None
     start_notice: Callable[[dict, dict], None] | None = None
+    sleep: Callable[[float], None] = time.sleep
 
     def _audit(self, event: dict, pr: str | None, outcome: str) -> None:
         self.audit(format_review_audit(
@@ -733,7 +760,7 @@ class ReviewRequestHandler:
         ))
 
     def _reply(self, event: dict, text: str) -> None:
-        self.post(event.get("channel", ""), _thread(event), text)
+        self.post(event.get("channel", ""), _thread(event), _to_requester(event, text))
 
     def _refuse(self, event: dict, pr: str | None, outcome: str, reply: str | None) -> None:
         self._audit(event, pr, outcome)
@@ -764,6 +791,12 @@ class ReviewRequestHandler:
         if kind == PEER_BOT and pr and is_review_ended(event.get("text", ""), self.bot_user_id, pr):
             # Never a request, matched or not: a missed hand-back must not become an own-PR refusal.
             self._hand_back(event, pr)
+            return
+        reason = refusal_reason(event.get("text", ""), self.bot_user_id)
+        if kind == PEER_BOT and reason:
+            # Never a request: the peer declined one this agent may have sent. Off the ack path, since
+            # a fast refusal can land before the sender has recorded its request.
+            self.spawn(self._refused_back, event, reason)
             return
         if pr is None:
             self._refuse(event, None, "refused_no_pr", USAGE_HINT if human else None)
@@ -826,6 +859,29 @@ class ReviewRequestHandler:
                 self.notices.add(request_ts, pr=pr, channel=entry["channel"], thread=entry["thread"])
             except Exception:
                 pass
+
+    def _refused_back(self, event: dict, reason: str) -> None:
+        """The peer's fixed refusal in the thread of a request this agent sent: tell that thread."""
+        request_ts = event.get("thread_ts") or ""
+        entry = None
+        if request_ts and request_ts != event.get("ts") and self.notices and self.start_notice:
+            for attempt in range(REFUSAL_RECORD_ATTEMPTS):
+                try:
+                    entry = self.notices.take(request_ts)
+                except Exception as exc:
+                    logger.error(f"Review notice record unusable: {type(exc).__name__}")
+                    break
+                if entry is not None or attempt == REFUSAL_RECORD_ATTEMPTS - 1:
+                    break
+                self.sleep(REFUSAL_RECORD_WAIT)
+        self._audit(event, entry.get("pr") if entry else None, "review_refused" if entry else "review_refused_unmatched")
+        if entry is None:
+            return
+        try:
+            self.spawn(self.start_notice, {**entry, "refused": reason}, event)
+        except Exception as exc:
+            # Not restored: no hand-back follows a refusal, so the record would only pin the thread.
+            logger.error(f"Could not notify {entry.get('thread')}: {type(exc).__name__}")
 
     def _guard(self, event: dict, pr: str, peer: PeerReviewConfig) -> tuple[RoomPolicy, ReviewPlan] | None:
         """Every check before the turn; refuses (audit and reply) and returns None on failure."""

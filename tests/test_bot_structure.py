@@ -80,8 +80,12 @@ class BotTurnStructureTest(unittest.TestCase):
     def test_a_review_session_uses_its_own_slot_when_deciding_to_evict(self):
         creation = ast.unparse(self._function("_get_or_create_live_session"))
         self.assertIn("needs_eviction(work, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh)", creation)
-        self.assertIn("if not live.waking", creation)
-        self.assertIn("oldest_evictable_session(candidates, protected=_waiting_threads())", creation)
+        self.assertIn("if not live.waking and (evict_waiting or ts not in waiting)", creation)
+        self.assertIn("oldest_evictable_session(candidates, protected=waiting)", creation)
+        process = ast.unparse(self._function("process_message_async"))
+        self.assertIn("evict_waiting=bool(forward or handoff_from)", process)
+        self.assertIn("raise _SessionsFull()", creation)
+        self.assertNotIn("live session cap reached", creation)
         self.assertNotIn("len(_live_sessions) >= MAX_LIVE_SESSIONS", creation)
         self.assertNotIn("waiting_threads", creation.split("with _live_sessions_lock:")[0], "read only when evicting")
 
@@ -270,7 +274,8 @@ class BotTurnStructureTest(unittest.TestCase):
         start = ast.unparse(self._function("_start_review_notice"))
         self.assertLess(start.index("session = _live_session_for(thread, channel)"), start.index("chat_postMessage("))
         self.assertIn("restore(f'failed_{type(exc).__name__}')", start)
-        self.assertIn("review_notice={'pr': pr, 'room_user': session.user_id}", start)
+        self.assertIn("review_notice={**review_notice, 'room_user': session.user_id}", start)
+        self.assertIn("review_notice = {'pr': pr, 'refused': refused}", start)
 
     def test_escalation_and_forwarding_refuse_review_only_rooms_server_side(self):
         main = ast.unparse(self._function("main"))
