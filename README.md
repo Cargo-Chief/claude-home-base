@@ -473,40 +473,53 @@ You (anywhere) → Slack → Cloudflare Tunnel → Your Mac → Claude Code CLI
 
 A review runs on Claude unless Claude is in its usage-limit pause or the thread is pinned to
 OpenAI (`_review_provider`, decided once the review holds its slot). Then it runs on Codex under
-review-only controls (`review_fallback.py`, `_run_codex_review`):
+review-only controls (`review_fallback.py`, `_run_codex_review`). These replace the Claude path's
+deny rules with an OS sandbox, and in places go further:
 
 - **No GitHub write token in the model's process.** The harness launches Codex through the App
   wrapper with `REVIEW_READ_TOKEN_PERMISSIONS` (contents and pull requests, read). The turn writes
   `review.json` and `review-post.json` (`{"verdict", "resolve"}`) in its thread workspace; after the
   turn the harness reads both without following symlinks, copies the review to a file of its own,
-  and posts it through `review_post.py submit` under the usual review write token, then says in
-  the thread whether it posted. Nothing is posted after a stop, a timeout, a failed turn, or a
-  delegate result that was never verified.
-- **A sandbox in place of deny rules.** `approval_policy="never"`, a `cc_review` permissions
-  profile that extends the thread workspace with `work/`, the PR repo's shared clone's `.git` (for
-  fetching its refs; `review_checkout` finds it by origin URL) and CODEX_HOME, while
-  `~/.config/cargo-chief`, `~/.config/gh`, `~/.aws`, `~/.ssh` and `~/.git-credentials` are
-  unreadable, so the turn cannot mint a token of its own. Codex's own config layers, instructions,
-  rules and login stay read-only (`codex_config_paths`), since governed delegates run Codex inside
-  the sandbox and need the rest of CODEX_HOME writable.
-- **No apps, MCP servers, user config or learned rules**: `features.apps=false` (the ChatGPT
-  account's connectors would otherwise appear as tools), `mcp_servers={}`, `--ignore-user-config`,
-  `--ignore-rules`, `--ephemeral`. The environment is `review_turn_env` without Claude's
-  credentials, and the shell inherits it whole so the read-only token reaches `gh` and `git`.
-- Finders go through governed delegation, non-mutating only, on the thread's delegation budget.
+  and posts it through `review_post.py submit` under the usual review write token, every value bound
+  to its option (`--resolve=<id>`), so no thread id can read as another option. It then says in the
+  thread whether it posted. Nothing is posted after a stop or a timeout; an error after the post
+  request was written still posts.
+- **What the sandbox can write**: only its working directory, the thread workspace, where the
+  review's scratch files go, and in the PR repo's shared clone (`review_checkout`, found by origin
+  URL) only what `git fetch` writes (`GIT_FETCH_PATHS`: objects, refs, logs, `packed-refs`,
+  `FETCH_HEAD`). The clone's `hooks/` and `config`, the rest of `work/`, and CODEX_HOME stay
+  read-only, so nothing the turn writes runs or steers a later turn.
+- **What it cannot read** (`review_denied_paths`): `~/.config/cargo-chief`, `~/.config/gh`,
+  `~/.config/git`, `~/.aws`, `~/.ssh`, `~/.git-credentials`, `~/.netrc`, Claude's credentials, Codex's
+  `auth.json`, and wherever the App key (`GITHUB_APP_PRIVATE_KEY`, read from the App config as a
+  path), the home-base env file and the runtime directory actually live. The turn cannot mint a
+  token of its own.
+- **No approvals, apps, MCP servers, user config, learned rules or delegation**:
+  `approval_policy="never"`, `features.apps=false` (the ChatGPT account's connectors would
+  otherwise appear as tools), `mcp_servers={}`, `--ignore-user-config`, `--ignore-rules`,
+  `--ephemeral`. Governed delegation would start a nested Codex, which needs CODEX_HOME writable, so
+  the review runs `cc-code-review`'s finder angles itself in one context. The environment is
+  `review_turn_env` without Claude's credentials or the env file's path, and the shell inherits it
+  whole so the read-only token reaches `gh` and `git`.
+- `stop` and timeouts stop the wrapper's whole process tree (`_ProcessTree`, `run_codex_turn`'s
+  `stop`): the wrapper runs Codex as a child and does not forward signals.
 
-A Claude review stopped by a usage limit moves to Codex in the same turn, unless the PR already
-carries a newer marked review from this agent (`ReviewPlan.marked`), which means the pass was posted
-before the limit and running it again would post it twice.
+A Claude review stopped by a usage limit moves to Codex in the same turn, with a full review
+runtime of its own, unless the PR already carries a newer marked review from this agent
+(`ReviewPlan.marked`), which means the pass was posted before the limit and running it again would
+post it twice.
 
 When Codex cannot run the review either (the CLI or profile is missing, or the turn fails before
-posting), the request is deferred: `deferred-reviews.json` in the state directory, one entry per PR,
-file-locked, an unreadable record raises. The thread is told when it will start (the end of the
-limit pause, else 30 minutes) and not to ask again, and the request is audited `deferred`. A loop
-replays due entries through `ReviewRequestHandler.replay`, which runs every claim and guard again
-and skips only the redelivery check. A deferred request hands nothing back to a peer requester
-until a replay actually runs it. An entry first deferred more than 24 hours ago is dropped with a
-note asking for a new request (`deferred_expired`).
+writing its post request) during a limit pause, the request is deferred: `deferred-reviews.json`
+in the state directory, one entry per PR and thread, file-locked, an unreadable record raises. A
+started review gives its cap charge back (`ReviewCapStore.refund`). The thread is told once when it
+will start and not to ask again, and the request is audited `deferred`. A loop replays one due entry
+a minute, oldest first, through `ReviewRequestHandler.replay`, which runs every claim and guard
+again and skips only the redelivery check. A deferred request hands nothing back to a peer
+requester until a replay runs it; a replay that is refused, and an entry first deferred more than 24
+hours ago (`deferred_expired`, with a note asking for a new request), hand back so the peer stops
+waiting. Outside a pause, a thread pinned to OpenAI whose review Codex cannot run is refused rather
+than queued (`CODEX_UNAVAILABLE_REPLY`).
 
 ## OpenAI fallback
 

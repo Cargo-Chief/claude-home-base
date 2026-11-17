@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Callable, Iterable, Mapping
 
+from review_fallback import DEFERRED_FIRST_AT_KEY
 from cargo_chief_safety import (
     PeerReviewConfig,
     RoomPolicy,
@@ -53,8 +54,12 @@ CAP_STORE_REPLY = "Reviews are unavailable: the review pass record is unreadable
 CONFIG_REPLY = "Review requests are not configured correctly here."
 PROVIDER_REPLY = "Reviews are paused while Claude is unavailable."
 DEFERRED_REPLY = (
-    "Claude is at its usage limit and the OpenAI fallback cannot run this review right now, so I've "
+    "Claude is at its usage limit and this review could not run on the OpenAI fallback, so I've "
     "queued it. It starts automatically {when}; there is no need to ask again."
+)
+CODEX_UNAVAILABLE_REPLY = (
+    "This thread is pinned to OpenAI, and this review could not run on the OpenAI fallback. "
+    "Ask again in a thread without the pin, or after `provider auto`."
 )
 DEFER_EXPIRED_REPLY = (
     "The queued review of {pr} waited 24 hours without a provider that could run it, so I dropped it. "
@@ -319,6 +324,18 @@ class ReviewCapStore:
                 data.pop(pr_url)
             self._save(data)
             return outcome
+
+    def refund(self, pr_url: str) -> None:
+        """Remove the newest charge for that PR: a review that started and was deferred did not run."""
+        with self._lock:
+            data = self._pruned(self._load())
+            record = data.get(pr_url)
+            if not record or not record["turns"]:
+                return
+            record["turns"].remove(max(record["turns"]))
+            if not record["turns"]:
+                data.pop(pr_url)
+            self._save(data)
 
 
 NOTICE_WINDOW_SECONDS = 7 * 24 * 3600
@@ -646,15 +663,24 @@ class ReviewAdmission:
         if reply:
             self.post(self.event.get("channel", ""), _thread(self.event), reply)
 
-    def defer(self, reply: str) -> None:
-        """Queue the review for later: audited `deferred` (after `accepted`, if its turn had started)."""
+    def defer(self, reply: str | None) -> None:
+        """Queue the review for later: audited `deferred` (after `accepted`, if its turn had started).
+
+        A started review gives its cap charge back, so a replay is not charged twice for one review.
+        """
         with self._lock:
             if self.deferred or (self.closed and not self.started):
                 return
             self.closed = True
             self.deferred = True
+        if self.started:
+            try:
+                self.caps.refund(self.pr)
+            except CapStoreError as exc:
+                logger.error(f"Could not refund the review charge for {self.pr}: {exc}")
         self._record("deferred")
-        self.post(self.event.get("channel", ""), _thread(self.event), reply)
+        if reply:
+            self.post(self.event.get("channel", ""), _thread(self.event), reply)
 
     def start(self) -> bool:
         """Charge the cap and audit acceptance; False (already refused) when the turn may not run."""
@@ -842,6 +868,10 @@ class ReviewRequestHandler:
     def admit(self, event: dict, pr: str, peer: PeerReviewConfig) -> None:
         """The slow part: guards, then the turn. Releases the admission slot and thread claim."""
         thread = _thread(event)
+        peer_requester = event.get("user", "") in peer.peer_bot_user_ids
+        # A replay of a deferred request hands back even when refused, so a peer never waits on a
+        # review that will not run.
+        replayed = DEFERRED_FIRST_AT_KEY in event
         hand_back = False
         try:
             try:
@@ -849,6 +879,7 @@ class ReviewRequestHandler:
             finally:
                 self.throttle.end(event.get("user", ""))
             if guarded is None:
+                hand_back = peer_requester and replayed
                 return
             policy, plan = guarded
             admission = ReviewAdmission(
@@ -860,16 +891,19 @@ class ReviewRequestHandler:
             finally:
                 # Every admitted request ends in exactly one audit line.
                 admission.refuse("refused_error", ERROR_REPLY)
-            hand_back = (admission.started and not admission.deferred
-                         and event.get("user", "") in peer.peer_bot_user_ids)
+            hand_back = peer_requester and not admission.deferred and (admission.started or replayed)
         finally:
             self.claims.release(thread)
             self.claims.release(_pr_claim(pr))
-        if hand_back:
-            try:
-                self.post(event.get("channel", ""), thread, review_ended_text(event.get("user", ""), pr))
-            except Exception as exc:
-                logger.warning(f"Could not hand the review of {pr} back: {type(exc).__name__}")
+            if hand_back:
+                self._hand_back_to(event, pr)
+
+    def _hand_back_to(self, event: dict, pr: str) -> None:
+        """Tell a peer requester its review turn is over, once its claims are released."""
+        try:
+            self.post(event.get("channel", ""), _thread(event), review_ended_text(event.get("user", ""), pr))
+        except Exception as exc:
+            logger.warning(f"Could not hand the review of {pr} back: {type(exc).__name__}")
 
 
 class PeerRequestError(RuntimeError):

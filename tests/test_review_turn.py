@@ -408,6 +408,14 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertIn("CARGO_CHIEF_AUTHORITY_ENVELOPE", turn["envelope"])
         self.assertEqual([self.session], self.closed)
 
+    def test_a_review_moved_after_a_limit_never_says_it_lost_its_train_of_thought(self):
+        posted = []
+        self.ns["slack_client"].chat_postMessage.side_effect = lambda **kwargs: posted.append(kwargs["text"])
+        self.session.proc.poll.return_value = 0
+        self.ns["TurnReporter"] = lambda **kwargs: mock.MagicMock(noticed_no_reply=False, active=False)
+        self.limited_turn()
+        self.assertFalse(any("train of thought" in text for text in posted))
+
     def test_a_review_that_already_replied_is_not_rerun(self):
         self.assertEqual([], self.limited_turn(review_done=True))
         self.ns["_continue_review_after_limit"].assert_not_called()

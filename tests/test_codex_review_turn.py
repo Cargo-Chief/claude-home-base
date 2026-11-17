@@ -31,7 +31,9 @@ from cargo_chief_safety import (
 )
 from openai_fallback import CodexTurnResult, fallback_error_kind
 from review_fallback import (
+    DEFERRED_FIRST_AT_KEY,
     POST_REQUEST_FILE_NAME,
+    git_fetch_paths,
     REVIEW_FILE_NAME,
     PostRequestError,
     build_codex_review_command,
@@ -40,6 +42,7 @@ from review_fallback import (
     review_checkout,
 )
 from review_requests import (
+    CODEX_UNAVAILABLE_REPLY,
     DEFERRED_REPLY,
     REVIEW_DONE_MARKER,
     ReviewAdmission,
@@ -76,6 +79,9 @@ def load(**overrides):
         "PostRequestError": PostRequestError, "fallback_error_kind": fallback_error_kind,
         "REVIEW_FILE_NAME": REVIEW_FILE_NAME, "POST_REQUEST_FILE_NAME": POST_REQUEST_FILE_NAME,
         "DEFERRED_REPLY": DEFERRED_REPLY, "PROVIDER_REPLY": "paused", "WRAPPER_REPLY": "old wrapper",
+        "CODEX_UNAVAILABLE_REPLY": CODEX_UNAVAILABLE_REPLY, "DEFERRED_FIRST_AT_KEY": DEFERRED_FIRST_AT_KEY,
+        "git_fetch_paths": git_fetch_paths, "REVIEW_MAX_RUNTIME": 2700,
+        "_codex_review_denied": lambda: [Path("/home/.config/cargo-chief")],
         "CLAUDE_TIMEOUT": 60, "DELEGATE_TIMEOUT": 30, "LIMIT_PAUSE_FALLBACK": 1800,
         "SOURCE_DIR": Path(__file__).parents[1],
         "logger": logging.getLogger("test-codex-review"),
@@ -172,18 +178,21 @@ class CodexReviewTest(Base):
         self.assertEqual("ned", write_env["CARGO_CHIEF_REVIEW_REQUESTER_LOGIN"])
         self.assertEqual("2", write_env["CARGO_CHIEF_REVIEW_PASS"])
 
-    def test_the_repo_git_dir_is_writable_only_when_the_clone_is_found(self):
+    def test_only_what_git_fetch_writes_in_the_clone_and_nothing_found_means_nothing(self):
         self.review()
         command = self.runs[0][0]
         table = next(arg for arg in command if arg.startswith("permissions.cc_review.filesystem="))
         self.assertNotIn("/repos/", table)
+        self.assertIn('"/home/.config/cargo-chief" = "none"', table)
         self.runs.clear()
         clone = self.root / "repos" / "c4"
         (clone / ".git").mkdir(parents=True)
         (clone / ".git" / "config").write_text('[remote "origin"]\n\turl = https://github.com/Cargo-Chief/c4.git\n')
         self.review()
         table = next(arg for arg in self.runs[0][0] if arg.startswith("permissions.cc_review.filesystem="))
-        self.assertIn(f'"{clone / ".git"}" = "write"', table)
+        self.assertIn(f'"{clone / ".git" / "objects"}" = "write"', table)
+        self.assertNotIn(f'"{clone / ".git"}" = "write"', table)
+        self.assertNotIn("/work\" = \"write\"", table)
 
     def test_codex_that_cannot_start_leaves_the_review_to_be_deferred(self):
         self.ns["validate_codex_runtime"] = mock.MagicMock(side_effect=SafetyError("no codex"))
@@ -191,6 +200,7 @@ class CodexReviewTest(Base):
         self.assertEqual([], self.runs)
         self.result = CodexTurnResult(error="Codex fallback exited with status 1")
         self.ns["validate_codex_runtime"] = lambda: None
+        self.write_request = False
         self.assertEqual("unavailable", self.review())
         self.assertEqual([], self.posted)
         self.assertEqual([], self.texts)
@@ -201,11 +211,17 @@ class CodexReviewTest(Base):
         self.assertEqual([], self.posted)
         self.assertIn("time limit", self.texts[0])
 
-    def test_an_unverified_delegate_withholds_the_review(self):
-        self.ns["delegation_verification_status"] = lambda path: "pending"
+    def test_an_error_after_the_post_request_was_written_still_posts(self):
+        self.result = CodexTurnResult(texts=["Verdict: approve."], error="stream hiccup")
         self.assertEqual("done", self.review())
-        self.assertEqual([], self.posted)
-        self.assertIn("withheld", self.texts[0])
+        self.assertEqual(1, len(self.posted))
+        self.assertEqual("Posted the review on the PR (approve).", self.texts[-1])
+
+    def test_no_delegation_state_reaches_the_turn(self):
+        self.review()
+        command, prompt, cwd, env = self.runs[0]
+        self.assertNotIn("CARGO_CHIEF_DELEGATION_REQUEST_FILE", env)
+        self.assertNotIn("governed_delegation.py", prompt)
 
     def test_no_post_request_or_a_bad_one_posts_nothing(self):
         self.write_request = False
@@ -230,27 +246,37 @@ class CodexReviewTest(Base):
 
 
 class DeferTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.store = mock.MagicMock()
+        self.ns["_deferred_reviews"] = self.store
+
     def test_a_review_is_deferred_to_the_end_of_the_limit_pause(self):
-        store = mock.MagicMock()
-        self.ns["_deferred_reviews"] = store
         self.ns["_limit_pause"]["until"] = time.time() + 3600
-        admission = self.admission()
-        self.ns["_defer_review"](admission)
-        self.assertEqual(self.ns["_limit_pause"]["until"], store.add.call_args.kwargs["not_before"])
-        self.assertEqual(["CREVIEWS | THREAD:1.1 | PR:" + PR + " | OUTCOME:deferred"],
-                         [line.split("CHANNEL:", 1)[1] for line in self.audits])
+        self.ns["_defer_review"](self.admission())
+        self.assertEqual(self.ns["_limit_pause"]["until"], self.store.add.call_args.kwargs["not_before"])
+        self.assertTrue(self.audits[-1].endswith("OUTCOME:deferred"))
         self.assertIn("queued it", self.posts[0])
         self.assertIn("UTC", self.posts[0])
 
-    def test_without_a_pause_it_retries_after_the_fallback_window(self):
-        store = mock.MagicMock()
-        self.ns["_deferred_reviews"] = store
-        before = time.time()
+    def test_a_replay_deferred_again_posts_nothing_new(self):
+        self.ns["_limit_pause"]["until"] = time.time() + 3600
+        admission = self.admission()
+        admission.event[DEFERRED_FIRST_AT_KEY] = 1.0
+        self.ns["_defer_review"](admission)
+        self.store.add.assert_called_once()
+        self.assertEqual([], self.posts)
+        self.assertTrue(self.audits[-1].endswith("OUTCOME:deferred"))
+
+    def test_outside_a_pause_a_pinned_thread_is_refused_not_queued(self):
         self.ns["_defer_review"](self.admission())
-        self.assertGreaterEqual(store.add.call_args.kwargs["not_before"], before + 1800)
+        self.store.add.assert_not_called()
+        self.assertEqual([CODEX_UNAVAILABLE_REPLY], self.posts)
+        self.assertTrue(self.audits[-1].endswith("OUTCOME:refused_provider"))
 
     def test_a_record_that_cannot_be_written_refuses_aloud(self):
-        self.ns["_deferred_reviews"] = mock.MagicMock(**{"add.side_effect": OSError("disk")})
+        self.ns["_limit_pause"]["until"] = time.time() + 3600
+        self.store.add.side_effect = OSError("disk")
         self.ns["_defer_review"](self.admission())
         self.assertEqual(["paused"], self.posts)
         self.assertTrue(self.audits[-1].endswith("OUTCOME:refused_provider"))
@@ -269,12 +295,13 @@ class AfterLimitTest(Base):
         self.ns["_run_codex_review"] = mock.MagicMock(return_value="done")
         self.ns["_continue_review_after_limit"](
             self.admission(plan), self.policy, channel="CREVIEWS", thread_ts="1.1", user_id="UNED",
-            envelope="E", on_text=self.texts.append, max_duration=60,
+            envelope="E", on_text=self.texts.append,
         )
 
-    def test_an_unposted_review_moves_to_codex(self):
+    def test_an_unposted_review_moves_to_codex_with_a_full_runtime(self):
         self.after_limit(marked_now=1)
         self.ns["_run_codex_review"].assert_called_once()
+        self.assertEqual(2700, self.ns["_run_codex_review"].call_args.kwargs["max_duration"])
         self.ns["_defer_review"].assert_not_called()
 
     def test_a_review_already_on_the_pr_is_not_posted_twice(self):
@@ -293,7 +320,7 @@ class AfterLimitTest(Base):
         self.ns["_continue_review_after_limit"](
             self.admission(ReviewPlan("incremental", 2, 3, "a" * 40, marked=1)), self.policy,
             channel="CREVIEWS", thread_ts="1.1", user_id="UNED", envelope="E",
-            on_text=self.texts.append, max_duration=60,
+            on_text=self.texts.append,
         )
         self.ns["_defer_review"].assert_called_once()
 

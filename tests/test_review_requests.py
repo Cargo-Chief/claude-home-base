@@ -333,6 +333,23 @@ class RecentMentionsTest(unittest.TestCase):
         self.assertTrue(recent.first_delivery("C1", "1.1"))
 
 
+class CapRefundTest(unittest.TestCase):
+    def test_refund_removes_only_the_newest_charge(self):
+        with tempfile.TemporaryDirectory() as temp:
+            now = [100.0]
+            caps = ReviewCapStore(Path(temp) / "caps.json", clock=lambda: now[0])
+            caps.admit(PR, 2)
+            now[0] = 200.0
+            caps.admit(PR, 2)
+            self.assertTrue(caps.exhausted(PR, 2))
+            caps.refund(PR)
+            self.assertFalse(caps.exhausted(PR, 2))
+            self.assertTrue(caps.exhausted(PR, 1))
+            caps.refund(PR)
+            caps.refund(PR)
+            self.assertFalse(caps.exhausted(PR, 1))
+
+
 class HandlerTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -600,7 +617,7 @@ class HandlerTest(unittest.TestCase):
         self.assertFalse(any("has ended" in text for _, _, text in self.posts))
         self.assertTrue(self.claims.claim("1.1"), "claims are released after a deferral")
 
-    def test_a_turn_deferred_after_it_started_hands_nothing_back(self):
+    def test_a_turn_deferred_after_it_started_hands_nothing_back_and_is_refunded(self):
         def start_then_defer(admission):
             admission.start()
             admission.defer("queued")
@@ -608,6 +625,23 @@ class HandlerTest(unittest.TestCase):
         self.mention(user="UNED", bot_id="BNED")
         self.assertEqual(["accepted", "deferred"], self.outcomes())
         self.assertFalse(any("has ended" in text for _, _, text in self.posts))
+        self.assertFalse(self.caps.exhausted(PR, 1), "the charge is given back")
+
+    def test_a_repeat_deferral_posts_nothing_new(self):
+        def defer_quietly(admission):
+            admission.defer(None)
+        self.handler.start_turn = defer_quietly
+        self.mention(user="UNED", bot_id="BNED")
+        self.assertEqual(["deferred"], self.outcomes())
+        self.assertEqual([], self.replies())
+
+    def test_a_refused_replay_still_hands_back_to_a_peer(self):
+        self.info = PullRequestInfo("kfranzenCC", "MERGED")
+        event = {"user": "UNED", "bot_id": "BNED", "channel": "CREVIEWS", "ts": "9.1",
+                 "text": f"<@ULISA> please review {PR}", "cc_deferred_first_at": 1.0}
+        self.handler.replay(event)
+        self.assertEqual(["refused_state"], self.outcomes())
+        self.assertEqual(("CREVIEWS", "9.1", review_ended_text("UNED", PR)), self.posts[-1])
 
     def test_replay_runs_every_guard_again_despite_redelivery(self):
         self.config["peer_review"]["max_reviews_per_pr"] = 2

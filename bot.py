@@ -145,15 +145,21 @@ from review_requests import (
     build_review_task,
     ReviewPlan,
     lookup_pr,
+    CODEX_UNAVAILABLE_REPLY,
     DEFERRED_REPLY,
     DEFER_EXPIRED_REPLY,
+    review_ended_text,
     REVIEW_POST_SCRIPT,
     format_review_audit,
     plan_review_pass,
 )
 from review_fallback import (
+    DEFERRED_FIRST_AT_KEY,
     POST_REQUEST_FILE_NAME,
     REVIEW_FILE_NAME,
+    app_key_path,
+    git_fetch_paths,
+    review_denied_paths,
     DeferredReviewStore,
     PostRequestError,
     build_codex_review_command,
@@ -2493,12 +2499,16 @@ class _ProcessTree:
         threading.Thread(target=stop_process_tree, args=(self.proc,), daemon=True).start()
 
 
-_WITHHELD_REVIEW = {
-    "pending": "a delegate's result was never independently verified",
-    "invalid": "a delegate's result was never independently verified",
-    "budget_exhausted": "this thread's delegation budget is exhausted; a named approver can reset it",
-    "allocation_exhausted": "a delegate ran out of its token allocation",
-}
+GITHUB_APP_CONFIG = Path.home() / ".config" / "cargo-chief" / "github-app.env"
+
+
+def _codex_review_denied() -> list[Path]:
+    """What a Codex review may not read, including the App key and env file wherever they live."""
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    return review_denied_paths(
+        Path.home(), codex_home=codex_home,
+        extra=(app_key_path(GITHUB_APP_CONFIG), ENV_FILE, RUNTIME_POLICY.root),
+    )
 
 
 def _run_codex_review(
@@ -2514,9 +2524,10 @@ def _run_codex_review(
 ) -> str:
     """Run an admitted review on the Codex fallback under review-only controls, then post it.
 
-    The model gets a read-only GitHub token and a sandbox that cannot read credentials; it writes
-    review.json and a post request, and the harness posts them through review_post.py. Returns
-    "unavailable" when Codex could not run the review and nothing was posted, else "done".
+    The model gets a read-only GitHub token and a sandbox that cannot read credentials or write
+    outside its own workspace; it writes review.json and a post request, and the harness posts them
+    through review_post.py. Returns "unavailable" when Codex could not run the review and nothing
+    was posted, else "done".
     """
     if not _codex_review_ready():
         return "unavailable"
@@ -2524,37 +2535,26 @@ def _run_codex_review(
         on_text(WRAPPER_REPLY)
         return "done"
     workspace = prepare_thread_workspace(policy.root, channel=channel, thread=thread_ts)
-    prepare_owner_delegation_state(workspace.delegation_budget_file, workspace.delegate_verification_file)
     review_file = workspace.path / REVIEW_FILE_NAME
     post_file = workspace.path / POST_REQUEST_FILE_NAME
-    for stale_path in (
-        workspace.delegation_request_file, workspace.implementation_claim_file, review_file, post_file,
-    ):
+    for stale_path in (review_file, post_file):
         try:
             stale_path.unlink()
         except FileNotFoundError:
             pass
-    cleanup_stale_delegate_pid(workspace.delegate_pid_file)
-    writable = [policy.root.resolve() / "work"]
     checkout = review_checkout(policy.root, admission.pr)
-    if checkout is not None:
-        writable.append(checkout / ".git")
+    writable = git_fetch_paths(checkout / ".git") if checkout is not None else []
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
     command = [
         sys.executable, str(github_wrapper_path(policy.root)), "--",
         *build_codex_review_command(
-            policy, cwd=workspace.path, writable=writable, home=Path.home(), codex_home=codex_home,
+            policy, cwd=workspace.path, writable=writable, denied=_codex_review_denied(),
+            codex_home=codex_home,
         ),
     ]
     task = build_review_task(admission.pr, policy.root, admission.plan, harness_posts=(review_file, post_file))
     prompt = build_codex_review_prompt(
-        policy,
-        inbound_prompt=f"{task}\n\n{envelope}",
-        transport_python=Path(sys.executable),
-        transport_script=SOURCE_DIR / "bot.py",
-        delegation_request_file=workspace.delegation_request_file,
-        implementation_claim_file=workspace.implementation_claim_file,
-        delegate_timeout=DELEGATE_TIMEOUT,
+        policy, inbound_prompt=f"{task}\n\n{envelope}", scratch_dir=workspace.path, checkout=checkout,
         identity_prompt=_identity_prompt(),
     )
     peer = peer_review_config(_load_model_config())
@@ -2569,17 +2569,10 @@ def _run_codex_review(
         "CLAUDE_CHANNEL_ID": channel,
         "CARGO_CHIEF_THREAD_WORK_DIR": str(workspace.path),
         "CARGO_CHIEF_ROOT": str(policy.root),
-        "CARGO_CHIEF_DELEGATION_REQUEST_FILE": str(workspace.delegation_request_file),
-        "CARGO_CHIEF_IMPLEMENTATION_CLAIM_FILE": str(workspace.implementation_claim_file),
-        "CARGO_CHIEF_DELEGATION_BUDGET_FILE": str(workspace.delegation_budget_file),
-        "CARGO_CHIEF_DELEGATE_PID_FILE": str(workspace.delegate_pid_file),
-        "CARGO_CHIEF_DELEGATE_VERIFICATION_FILE": str(workspace.delegate_verification_file),
-        "CARGO_CHIEF_AUDIT_LOG": str(delegation_audit_path(policy.root)),
         "CARGO_CHIEF_OWNER_PROVIDER": "openai",
         "CARGO_CHIEF_OWNER_MODEL": policy.fallback_model,
         "CARGO_CHIEF_OWNER_EFFORT": policy.fallback_effort,
         "CARGO_CHIEF_CURRENT_USER": user_id,
-        "CARGO_CHIEF_DELEGATE_TIMEOUT": str(DELEGATE_TIMEOUT),
     })
     started = time.time()
 
@@ -2592,34 +2585,27 @@ def _run_codex_review(
 
     result = run_codex_turn(
         command, prompt, cwd=str(workspace.path), env=env, timeout=CLAUDE_TIMEOUT,
-        on_process=track_process, stop=stop_process_tree,
-        delegate_active=lambda: governed_delegate_active(workspace.delegate_pid_file),
-        max_duration=max_duration,
+        on_process=track_process, stop=stop_process_tree, max_duration=max_duration,
     )
     with _live_sessions_lock:
         stopped = thread_ts in _openai_stopped
         _openai_stopped.discard(thread_ts)
-    verification = delegation_verification_status(workspace.delegate_verification_file)
     outcome = "done"
+    kind = fallback_error_kind(result.error) if result.error else ""
     if stopped:
         posted = "stopped"
-    elif result.error:
-        kind = fallback_error_kind(result.error)
-        logger.warning("Codex review failed in thread %s (kind=%s)", thread_ts, kind)
-        if kind == "timeout":
-            on_text("The review on the OpenAI fallback reached its time limit and stopped; nothing was "
-                    "posted. Ask again to rerun it.")
-            posted = "timeout"
-        else:
-            outcome, posted = "unavailable", "failed"
-    elif verification in _WITHHELD_REVIEW:
-        if verification == "budget_exhausted":
-            consume_budget_exhaustion(workspace.delegate_verification_file)
-        elif verification == "allocation_exhausted":
-            consume_allocation_exhaustion(workspace.delegate_verification_file)
-        on_text(f"Review withheld, nothing was posted: {_WITHHELD_REVIEW[verification]}.")
-        posted = "withheld"
+    elif kind == "timeout":
+        on_text("The review on the OpenAI fallback reached its time limit and stopped; nothing was "
+                "posted. Ask again to rerun it.")
+        posted = "timeout"
+    elif result.error and not post_file.exists():
+        # Nothing to post: Codex (or the App token the wrapper mints for it) never got that far.
+        logger.warning("Codex review failed in thread %s (kind=%s, session=%s)",
+                       thread_ts, kind, "yes" if result.session_id else "none")
+        outcome, posted = "unavailable", "failed"
     else:
+        if result.error:
+            logger.warning("Codex review reported an error after writing its post request in %s", thread_ts)
         for text_block in _strip_review_marker(result.texts):
             on_text(text_block)
         try:
@@ -2649,22 +2635,33 @@ def _run_codex_review(
 
 
 def _defer_review(admission: ReviewAdmission) -> None:
-    """Queue a review neither provider can run; it replays when Claude's limit pause ends."""
+    """Queue a review neither provider can run; it replays when Claude's limit pause ends.
+
+    Outside a pause (a thread pinned to OpenAI) Claude could run it later only without the pin, so the
+    review is refused rather than queued. A replay deferred again says nothing new in the thread.
+    """
+    channel = admission.event.get("channel", "")
+    thread = admission.event.get("thread_ts") or admission.event.get("ts", "")
     now = time.time()
     until = _limit_pause_until()
-    not_before = until if until > now else now + LIMIT_PAUSE_FALLBACK
+    if until <= now:
+        if admission.started:
+            admission.post(channel, thread, CODEX_UNAVAILABLE_REPLY)
+        else:
+            admission.refuse("refused_provider", CODEX_UNAVAILABLE_REPLY)
+        return
     try:
-        _deferred_reviews.add(admission.event, pr=admission.pr, not_before=not_before)
+        _deferred_reviews.add(admission.event, pr=admission.pr, not_before=until)
     except Exception as exc:
         logger.error(f"Could not defer the review of {admission.pr}: {type(exc).__name__}")
         if admission.started:
-            admission.post(admission.event.get("channel", ""), admission.event.get("thread_ts")
-                           or admission.event.get("ts", ""), PROVIDER_REPLY)
+            admission.post(channel, thread, PROVIDER_REPLY)
         else:
             admission.refuse("refused_provider", PROVIDER_REPLY)
         return
-    when = time.strftime("at about %H:%M UTC", time.gmtime(not_before))
-    admission.defer(DEFERRED_REPLY.format(when=when))
+    repeat = DEFERRED_FIRST_AT_KEY in admission.event
+    admission.defer(None if repeat else DEFERRED_REPLY.format(
+        when=time.strftime("at about %H:%M UTC", time.gmtime(until))))
 
 
 def _continue_review_after_limit(
@@ -2673,7 +2670,7 @@ def _continue_review_after_limit(
     """A Claude review stopped by a usage limit: finish it on Codex, unless it already posted.
 
     A marked review newer than the plan means the pass reached the PR before the limit, so running
-    it again would post it twice.
+    it again would post it twice. The Codex run gets a full review runtime of its own.
     """
     try:
         info = _lookup_review_pr(admission.pr, policy.root)
@@ -2689,7 +2686,7 @@ def _continue_review_after_limit(
             "short. The verdict and threads are on the PR."
         )
         return
-    if _run_codex_review(admission, policy, **turn) == "unavailable":
+    if _run_codex_review(admission, policy, max_duration=REVIEW_MAX_RUNTIME, **turn) == "unavailable":
         _defer_review(admission)
 
 
@@ -2708,17 +2705,24 @@ def _deferred_review_loop() -> None:
         for entry in expired:
             event = entry["event"]
             thread = event.get("thread_ts") or event.get("ts", "")
+            pr = entry.get("pr", "the PR")
             audit_logger.info(format_review_audit(
                 user=event.get("user", ""), channel=event.get("channel", ""), thread=thread,
-                pr=entry.get("pr"), outcome="deferred_expired",
+                pr=pr, outcome="deferred_expired",
             ))
             try:
-                slack_client.chat_postMessage(
-                    channel=event.get("channel", ""), thread_ts=thread,
-                    text=DEFER_EXPIRED_REPLY.format(pr=entry.get("pr", "the PR")),
-                )
-            except Exception as exc:
-                logger.warning(f"Could not post the expired-review note: {type(exc).__name__}")
+                peer_ids = peer_review_config(_load_model_config()).peer_bot_user_ids
+            except SafetyError:
+                peer_ids = frozenset()
+            notes = [DEFER_EXPIRED_REPLY.format(pr=pr)]
+            if event.get("user", "") in peer_ids:
+                # A peer agent waits for the hand-back, which a review that never ran would not send.
+                notes.append(review_ended_text(event["user"], pr))
+            for note in notes:
+                try:
+                    slack_client.chat_postMessage(channel=event.get("channel", ""), thread_ts=thread, text=note)
+                except Exception as exc:
+                    logger.warning(f"Could not post the expired-review note: {type(exc).__name__}")
         for entry in due:
             try:
                 _review_requests.replay(dict(entry["event"]))
@@ -3046,6 +3050,7 @@ def process_message_async(
     turn_admitted = False
     review_slot_held = False
     review_on_codex = False
+    review_continued = False
     session = None
     handoff_request = None
     handoff_source = None
@@ -3245,8 +3250,8 @@ def process_message_async(
                         _continue_review_after_limit(
                             review_admission, room_policy, channel=channel, thread_ts=thread_ts,
                             user_id=user_id, envelope=envelope, on_text=on_text,
-                            max_duration=max(0.001, turn_deadline - time.monotonic()),
                         )
+                        review_continued = True
                 elif fallback_requested and review_notice:
                     # A Codex turn would run as the peer bot.
                     note = REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"])
@@ -3273,7 +3278,7 @@ def process_message_async(
 
                 # Check if the process died without producing a response
                 if (not all_texts and not skip_detected and session.proc.poll() is not None
-                        and not (review and session.stop_done)
+                        and not (review and session.stop_done) and not review_continued
                         and not (session.reporter and session.reporter.noticed_no_reply)):
                     try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
                     except Exception: pass

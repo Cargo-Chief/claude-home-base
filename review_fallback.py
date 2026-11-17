@@ -35,7 +35,12 @@ CODEX_REVIEW_PERMISSIONS = "cc_review"
 # The token the review model's process carries: enough to read the PR, its code and its threads.
 REVIEW_READ_TOKEN_PERMISSIONS = {"contents": "read", "pull_requests": "read"}
 # Paths under $HOME the review sandbox may not read: credentials and the App key that mints tokens.
-REVIEW_DENIED_HOME_PATHS = (".config/cargo-chief", ".config/gh", ".aws", ".ssh", ".git-credentials")
+REVIEW_DENIED_HOME_PATHS = (
+    ".config/cargo-chief", ".config/gh", ".config/git", ".aws", ".ssh", ".git-credentials", ".netrc",
+    ".claude/.credentials.json", ".claude.json",
+)
+# What `git fetch` writes in a clone's git dir; hooks/ and config stay read-only.
+GIT_FETCH_PATHS = ("objects", "refs", "logs", "packed-refs", "FETCH_HEAD")
 
 REVIEW_FILE_NAME = "review.json"
 POST_REQUEST_FILE_NAME = "review-post.json"
@@ -44,7 +49,8 @@ REVIEW_FILE_MAX_BYTES = 1024 * 1024
 MAX_RESOLVE_IDS = 100
 POST_TIMEOUT_SECONDS = 300
 VERDICTS = ("comment", "request_changes", "approve")
-_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_=-]{1,200}$")
+# A GraphQL node id; it never starts with "-", so it cannot read as an option to review_post.py.
+_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_=-]{0,199}$")
 _PR_REPO_RE = re.compile(r"^https://github\.com/Cargo-Chief/([A-Za-z0-9._-]+)/pull/\d+$")
 
 DEFER_WINDOW_SECONDS = 24 * 3600
@@ -120,39 +126,51 @@ def _toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def codex_config_paths(codex_home: Path) -> list[Path]:
-    """Codex's own configuration, which a review sandbox may read but never change.
-
-    A governed delegate runs Codex from inside the sandbox and needs CODEX_HOME writable for its
-    state, so the files that steer later turns (config layers, instructions, learned rules, the
-    login) are carved back out read-only.
-    """
-    paths = [codex_home / "rules", codex_home / "auth.json"]
+def app_key_path(app_config: Path) -> Path | None:
+    """The App private key path named in the wrapper's config, or None; the key itself is never read."""
     try:
-        paths.extend(
-            sorted(path for path in codex_home.iterdir()
-                   if path.suffix in (".toml", ".md") and not path.is_dir())
-        )
-    except OSError:
-        pass
+        text = Path(app_config).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "GITHUB_APP_PRIVATE_KEY":
+            path = Path(value.strip().strip("'\"")).expanduser()
+            return path if path.is_absolute() else None
+    return None
+
+
+def review_denied_paths(home: Path, *, codex_home: Path, extra: Iterable[Path | None] = ()) -> list[Path]:
+    """Everything the review sandbox may not read: credential homes, the App key wherever it lives,
+    the harness's env file and runtime directory, and Codex's own login."""
+    paths = [home / path for path in REVIEW_DENIED_HOME_PATHS]
+    paths.append(codex_home / "auth.json")
+    paths.extend(Path(path) for path in extra if path)
     return list(dict.fromkeys(paths))
 
 
+def git_fetch_paths(git_dir: Path) -> list[Path]:
+    return [git_dir / name for name in GIT_FETCH_PATHS]
+
+
 def build_codex_review_command(
-    policy: RoomPolicy, *, cwd: Path, writable: Iterable[Path], home: Path, codex_home: Path,
+    policy: RoomPolicy, *, cwd: Path, writable: Iterable[Path], denied: Iterable[Path], codex_home: Path,
 ) -> list[str]:
     """A review-only Codex command: no approvals, apps, MCP servers, user config or learned rules.
 
-    The sandbox extends the working directory with ``writable`` and CODEX_HOME, denies reading the
-    paths in REVIEW_DENIED_HOME_PATHS so the turn cannot mint a GitHub token of its own, and keeps
-    Codex's configuration read-only. Network stays on for gh and git reads under the read-only token
-    the harness wrapper passes in.
+    The sandbox extends the working directory with ``writable``, keeps CODEX_HOME read-only so the
+    turn cannot steer later Codex turns, and makes ``denied`` unreadable so it cannot mint a GitHub
+    token of its own. Network stays on for gh and git reads under the read-only token the harness
+    wrapper passes in. Nothing in the turn starts another Codex, so CODEX_HOME need not be writable.
     """
-    filesystem = {str(home / path): "none" for path in REVIEW_DENIED_HOME_PATHS}
-    for path in (*writable, codex_home):
+    filesystem = {str(codex_home): "read"}
+    for path in writable:
         filesystem[str(path)] = "write"
-    for path in codex_config_paths(codex_home):
-        filesystem[str(path)] = "read"
+    for path in denied:
+        filesystem[str(path)] = "none"
     table = "{" + ", ".join(f"{_toml_string(k)} = {_toml_string(v)}" for k, v in filesystem.items()) + "}"
     profile = f"permissions.{CODEX_REVIEW_PERMISSIONS}"
     return [
@@ -171,8 +189,8 @@ def build_codex_review_command(
         "-c", f'{profile}.network.mode="full"',
         # The env is stripped by codex_review_env, so the token the wrapper adds is what reaches gh.
         "-c", "shell_environment_policy.ignore_default_excludes=true",
-        "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--json", "--model", policy.fallback_model,
-        "--cd", str(cwd), "--skip-git-repo-check", "-",
+        "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--json",
+        "--model", policy.fallback_model, "--cd", str(cwd), "--skip-git-repo-check", "-",
     ]
 
 
@@ -180,7 +198,7 @@ def codex_review_env(base: Mapping[str, str], **review: object) -> dict[str, str
     """review_turn_env without Claude's credentials, asking the wrapper for a read-only token."""
     env = {
         key: value for key, value in review_turn_env(base, **review).items()
-        if key != "CLAUDE_CODE_OAUTH_TOKEN" and not key.startswith("ANTHROPIC_")
+        if key not in ("CLAUDE_CODE_OAUTH_TOKEN", "CARGO_CHIEF_ENV_FILE") and not key.startswith("ANTHROPIC_")
     }
     env[TOKEN_PERMISSIONS_ENV] = json.dumps(REVIEW_READ_TOKEN_PERMISSIONS, separators=(",", ":"))
     return env
@@ -257,10 +275,10 @@ def post_review(
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(request.review)
+        # The = form binds each value to its option, so no value can be read as another option.
         command = [python, str(wrapper), "--", python, str(script), "submit", pr,
-                   "--review", copy, "--verdict", request.verdict]
-        if request.resolve:
-            command += ["--resolve", *request.resolve]
+                   f"--review={copy}", f"--verdict={request.verdict}",
+                   *(f"--resolve={thread}" for thread in request.resolve)]
         try:
             completed = runner(command, env=dict(env), capture_output=True, text=True,
                                timeout=POST_TIMEOUT_SECONDS)
@@ -294,8 +312,15 @@ def _write_json_atomically(path: Path, data: object) -> None:
         raise
 
 
+def _first_at(entry: object) -> float:
+    try:
+        return float(entry["first_at"])
+    except (TypeError, KeyError, ValueError):
+        return 0.0
+
+
 class DeferredReviewStore:
-    """Review requests neither provider could run, one per PR, replayed once they are due.
+    """Review requests neither provider could run, one per PR and thread, replayed once they are due.
 
     An entry keeps the time of the first deferral, so a request that keeps failing is dropped after
     ``window`` rather than retried forever. An unreadable record raises rather than being reset.
@@ -329,37 +354,40 @@ class DeferredReviewStore:
         return value
 
     def add(self, event: Mapping, *, pr: str, not_before: float) -> float:
-        """Record the request for that PR, replacing an older one; returns the first-deferral time."""
+        """Record the request, replacing an older one for that PR in that thread; returns the first-deferral time."""
         now = self.clock()
         first = event.get(DEFERRED_FIRST_AT_KEY)
         first = float(first) if isinstance(first, (int, float)) else now
         kept = {key: event[key] for key in _EVENT_FIELDS if isinstance(event.get(key), str)}
         kept[DEFERRED_FIRST_AT_KEY] = first
         entry = {"event": kept, "pr": pr, "first_at": first, "not_before": float(not_before)}
-        self._locked(lambda data: (data.__setitem__(pr, entry), True))
+        key = f"{pr} {kept.get('thread_ts') or kept.get('ts', '')}"
+        self._locked(lambda data: (data.__setitem__(key, entry), True))
         return first
 
-    def take_due(self) -> tuple[list[dict], list[dict]]:
-        """(due, expired): entries removed because they may run now, or waited past the window."""
+    def take_due(self, limit: int = 1) -> tuple[list[dict], list[dict]]:
+        """(due, expired): at most ``limit`` entries that may run now, oldest first, and every entry
+        that waited past the window, each removed. One at a time by default, because a requester holds
+        only one admission slot and a replay refused for that would be lost."""
         now = self.clock()
 
         def split(data: dict) -> tuple[tuple[list[dict], list[dict]], bool]:
             due, expired, changed = [], [], False
-            for pr in list(data):
-                entry = data[pr]
+            for key in sorted(data, key=lambda k: _first_at(data[k])):
+                entry = data[key]
                 try:
                     first_at, not_before = float(entry["first_at"]), float(entry["not_before"])
                     valid = isinstance(entry.get("event"), dict)
                 except (TypeError, KeyError, ValueError):
                     valid = False
                 if not valid:
-                    data.pop(pr)
+                    data.pop(key)
                     changed = True
                 elif now - first_at > self.window:
-                    expired.append(data.pop(pr))
+                    expired.append(data.pop(key))
                     changed = True
-                elif not_before <= now:
-                    due.append(data.pop(pr))
+                elif not_before <= now and len(due) < limit:
+                    due.append(data.pop(key))
                     changed = True
             return (due, expired), changed
 

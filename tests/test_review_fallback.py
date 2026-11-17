@@ -11,7 +11,6 @@ import unittest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from cargo_chief_safety import (
-    CODEX_REVIEW_HARNESS_PROMPT,
     RoomPolicy,
     TOKEN_PERMISSIONS_ENV,
     build_codex_review_prompt,
@@ -24,9 +23,11 @@ from review_fallback import (
     DeferredReviewStore,
     PostRequest,
     PostRequestError,
+    app_key_path,
     build_codex_review_command,
-    codex_config_paths,
     codex_review_env,
+    git_fetch_paths,
+    review_denied_paths,
     post_review,
     pr_repo,
     read_post_request,
@@ -67,19 +68,26 @@ class CommandTest(Temp):
         super().setUp()
         self.home = self.root / "home"
         self.codex_home = self.home / ".codex"
-        (self.codex_home / "rules").mkdir(parents=True)
-        for name in ("config.toml", "cargo-chief.config.toml", "AGENTS.md", "auth.json", "state_5.sqlite"):
-            (self.codex_home / name).write_text("x")
-        (self.codex_home / "sessions").mkdir()
+        self.git = self.root / "repos" / "c4" / ".git"
+        self.denied = review_denied_paths(
+            self.home, codex_home=self.codex_home, extra=(self.root / "keys" / "app.pem", None),
+        )
         self.command = build_codex_review_command(
-            policy(self.root), cwd=self.root / "work" / "thread", writable=[self.root / "work"],
-            home=self.home, codex_home=self.codex_home,
+            policy(self.root), cwd=self.root / "work" / "thread", writable=git_fetch_paths(self.git),
+            denied=self.denied, codex_home=self.codex_home,
         )
 
     def flag(self, prefix):
         values = [arg for arg in self.command if arg.startswith(prefix)]
         self.assertEqual(1, len(values), prefix)
         return values[0][len(prefix):]
+
+    def filesystem(self):
+        table = self.flag("permissions.cc_review.filesystem=")
+        return dict(
+            (json.loads(key), json.loads(value))
+            for key, value in (item.split(" = ") for item in table.strip("{}").split(", "))
+        )
 
     def test_no_approvals_and_no_learned_rules(self):
         self.assertEqual('"never"', self.flag("approval_policy="))
@@ -92,25 +100,23 @@ class CommandTest(Temp):
         self.assertIn("features.multi_agent=false", self.command)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", self.command)
 
-    def test_credentials_are_unreadable_and_codex_config_read_only(self):
-        table = self.flag("permissions.cc_review.filesystem=")
-        filesystem = dict(
-            (json.loads(key), json.loads(value))
-            for key, value in (item.split(" = ") for item in table.strip("{}").split(", "))
-        )
-        for denied in (".config/cargo-chief", ".config/gh", ".aws", ".ssh"):
+    def test_credentials_are_unreadable_and_codex_home_read_only(self):
+        filesystem = self.filesystem()
+        for denied in (".config/cargo-chief", ".config/gh", ".config/git", ".aws", ".ssh", ".netrc",
+                       ".claude/.credentials.json"):
             self.assertEqual("none", filesystem[str(self.home / denied)], denied)
-        self.assertEqual("write", filesystem[str(self.root / "work")])
-        self.assertEqual("write", filesystem[str(self.codex_home)])
-        for kept in ("rules", "auth.json", "config.toml", "cargo-chief.config.toml", "AGENTS.md"):
-            self.assertEqual("read", filesystem[str(self.codex_home / kept)], kept)
-        self.assertNotIn(str(self.codex_home / "state_5.sqlite"), filesystem)
-        self.assertNotIn(str(self.root / "repos"), filesystem)
+        self.assertEqual("none", filesystem[str(self.root / "keys" / "app.pem")])
+        self.assertEqual("read", filesystem[str(self.codex_home)])
+        self.assertEqual("none", filesystem[str(self.codex_home / "auth.json")])
+        self.assertNotIn(str(self.root / "work"), filesystem, "only the cwd (the thread workspace) is writable")
 
-    def test_codex_config_paths_lists_only_files_that_steer_later_turns(self):
-        names = {path.name for path in codex_config_paths(self.codex_home)}
-        self.assertEqual({"rules", "auth.json", "config.toml", "cargo-chief.config.toml", "AGENTS.md"}, names)
-        self.assertEqual({"rules", "auth.json"}, {p.name for p in codex_config_paths(self.root / "absent")})
+    def test_only_what_git_fetch_writes_in_the_clone(self):
+        filesystem = self.filesystem()
+        for name in ("objects", "refs", "logs", "packed-refs", "FETCH_HEAD"):
+            self.assertEqual("write", filesystem[str(self.git / name)], name)
+        self.assertNotIn(str(self.git), filesystem)
+        self.assertNotIn(str(self.git / "hooks"), filesystem)
+        self.assertNotIn(str(self.git / "config"), filesystem)
 
     def test_model_and_cwd(self):
         self.assertEqual("gpt-6-sol", self.command[self.command.index("--model") + 1])
@@ -118,15 +124,27 @@ class CommandTest(Temp):
         self.assertEqual("-", self.command[-1])
 
 
+class AppKeyTest(Temp):
+    def test_the_key_path_is_read_from_the_config_without_the_key(self):
+        config = self.root / "app.env"
+        config.write_text("export GITHUB_APP_ID=1\nGITHUB_APP_PRIVATE_KEY='/keys/app.pem'\n")
+        self.assertEqual(Path("/keys/app.pem"), app_key_path(config))
+        config.write_text("GITHUB_APP_PRIVATE_KEY=relative.pem\n")
+        self.assertIsNone(app_key_path(config))
+        self.assertIsNone(app_key_path(self.root / "absent.env"))
+
+
 class EnvTest(unittest.TestCase):
     def test_read_only_token_and_no_claude_or_service_secrets(self):
         env = codex_review_env(
             {"PATH": "/bin", "CLAUDE_CODE_OAUTH_TOKEN": "c", "ANTHROPIC_API_KEY": "a", "SLACK_BOT_TOKEN": "s",
-             "AWS_PROFILE": "p", "OPENAI_API_KEY": "o", "CODEX_HOME": "/h/.codex"},
+             "AWS_PROFILE": "p", "OPENAI_API_KEY": "o", "CODEX_HOME": "/h/.codex",
+             "CARGO_CHIEF_ENV_FILE": "/elsewhere/home-base.env"},
             self_login="lisa", requester_login="ned", pr=PR, mode="full", pass_no=1, review_base="",
         )
         self.assertEqual({"contents": "read", "pull_requests": "read"}, json.loads(env[TOKEN_PERMISSIONS_ENV]))
-        for gone in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "SLACK_BOT_TOKEN", "AWS_PROFILE", "OPENAI_API_KEY"):
+        for gone in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "SLACK_BOT_TOKEN", "AWS_PROFILE", "OPENAI_API_KEY",
+                     "CARGO_CHIEF_ENV_FILE"):
             self.assertNotIn(gone, env)
         self.assertEqual("/h/.codex", env["CODEX_HOME"])
         self.assertEqual(PR, env["CARGO_CHIEF_REVIEW_PR"])
@@ -178,6 +196,8 @@ class PostRequestTest(Temp):
         cases = [
             dict(verdict="merge"),
             dict(resolve=["has space"]),
+            dict(resolve=["PRRT_x", "--verdict=approve"]),
+            dict(resolve=["-h"]),
             dict(resolve=["x"] * 101),
             dict(extra="field"),
         ]
@@ -218,7 +238,7 @@ class PostReviewTest(Temp):
         def runner(command, **kwargs):
             seen["command"] = command
             seen["env"] = kwargs["env"]
-            seen["review"] = Path(command[command.index("--review") + 1]).read_bytes()
+            seen["review"] = Path(command[7].split("=", 1)[1]).read_bytes()
             return subprocess.CompletedProcess(command, 0, "posted", "")
 
         ok, _ = post_review(
@@ -228,7 +248,8 @@ class PostReviewTest(Temp):
         self.assertTrue(ok)
         command = seen["command"]
         self.assertEqual(["py", "/w.py", "--", "py", "/review_post.py", "submit", PR], command[:7])
-        self.assertEqual(["--verdict", "approve", "--resolve", "T1", "T2"], command[9:])
+        self.assertTrue(command[7].startswith("--review="))
+        self.assertEqual(["--verdict=approve", "--resolve=T1", "--resolve=T2"], command[8:])
         self.assertEqual(b"REVIEW", seen["review"])
         self.assertEqual({"K": "v"}, seen["env"])
         self.assertEqual([], list((self.root / "tmp").iterdir()), "the copy is removed")
@@ -273,15 +294,33 @@ class DeferredStoreTest(Temp):
         self.assertEqual(1000.0, event[DEFERRED_FIRST_AT_KEY])
         self.assertEqual(([], []), self.store.take_due())
 
-    def test_one_entry_per_pr_keeping_the_first_deferral(self):
+    def test_a_repeat_in_the_same_thread_replaces_and_keeps_the_first_deferral(self):
         first = self.store.add(self.event, pr=PR, not_before=1010)
         self.now[0] = 1020
         replayed = dict(self.event, **{DEFERRED_FIRST_AT_KEY: first})
         self.assertEqual(1000.0, self.store.add(replayed, pr=PR, not_before=1030))
         self.now[0] = 1030
-        due, _ = self.store.take_due()
+        due, _ = self.store.take_due(limit=10)
         self.assertEqual(1, len(due))
         self.assertEqual(1000.0, due[0]["first_at"])
+
+    def test_another_thread_asking_for_the_same_pr_keeps_both(self):
+        self.store.add(self.event, pr=PR, not_before=1010)
+        self.now[0] = 1005
+        self.store.add(dict(self.event, ts="2.1"), pr=PR, not_before=1010)
+        self.now[0] = 1010
+        due, _ = self.store.take_due(limit=10)
+        self.assertEqual(["1.1", "2.1"], [entry["event"]["ts"] for entry in due])
+
+    def test_one_due_entry_per_take_oldest_first(self):
+        self.store.add(dict(self.event, ts="2.1"), pr=PR + "0", not_before=1010)
+        self.now[0] = 1001
+        self.store.add(self.event, pr=PR, not_before=1010)
+        self.now[0] = 1010
+        first, _ = self.store.take_due()
+        second, _ = self.store.take_due()
+        self.assertEqual(["2.1", "1.1"], [first[0]["event"]["ts"], second[0]["event"]["ts"]])
+        self.assertEqual(([], []), self.store.take_due())
 
     def test_a_request_deferred_past_the_window_expires(self):
         self.store.add(self.event, pr=PR, not_before=2000)
@@ -311,14 +350,16 @@ class TaskAndPromptTest(Temp):
         claude_task = build_review_task(PR, self.root, plan)
         self.assertIn(" submit ", claude_task)
 
-    def test_codex_review_prompt_is_review_only_and_non_mutating(self):
+    def test_codex_review_prompt_is_review_only_without_delegation(self):
         prompt = build_codex_review_prompt(
-            policy(self.root), inbound_prompt="TASK", transport_python=Path("/py"),
-            transport_script=Path("/hb/bot.py"), delegation_request_file=self.root / "d.json",
-            implementation_claim_file=self.root / "i", delegate_timeout=60,
+            policy(self.root), inbound_prompt="TASK", scratch_dir=self.root / "ws",
+            checkout=self.root / "repos" / "c4",
         )
-        self.assertIn(CODEX_REVIEW_HARNESS_PROMPT, prompt)
-        self.assertIn("mutation=false", prompt)
+        self.assertIn("review-only turn on the OpenAI fallback", prompt)
+        self.assertIn(str(self.root / "ws"), prompt)
+        self.assertIn(str(self.root / "repos" / "c4"), prompt)
+        self.assertIn("no delegation", prompt)
+        self.assertNotIn("governed_delegation.py", prompt)
         self.assertNotIn("--escalate", prompt)
         self.assertNotIn("--request-review", prompt)
         self.assertTrue(prompt.endswith("TASK"))
