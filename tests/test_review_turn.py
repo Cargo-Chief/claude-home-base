@@ -52,9 +52,9 @@ PLAN = ReviewPlan("incremental", 2, 3, "a" * 40)
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "process_message_async", "_spawn_claude_process", "_get_or_create_live_session", "_clear_eyes",
-    "_review_still_runnable",
+    "_review_still_runnable", "_notice_idle_text", "_start_review_notice",
 )
-CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone")
+CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone", "_SessionsFull")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
 ENV = {"AUTHORIZED_USERS": "UKIRK", "CARGO_CHIEF_APPROVERS": "UKIRK"}
 
@@ -267,7 +267,7 @@ class ProcessReviewTest(unittest.TestCase):
         self.session = FakeSession()
 
         def create(thread_ts, channel, user_id="", review_policy=None, review_pr="", review_plan=None,
-                   existing_only=False):
+                   existing_only=False, evict_waiting=False):
             self.created_plans.append(review_plan)
             self.created.append(review_policy)
             self.created_prs.append(review_pr)
@@ -554,6 +554,136 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertEqual([ERROR_REPLY], self.posts)
         self.assertEqual(["refused_error"], self.outcomes())
         self.assertFalse(self.caps.exhausted(PR, 1))
+
+
+class SessionsFullTest(unittest.TestCase):
+    """A new work thread at the cap with nothing evictable is refused, never served by evicting a waiter."""
+
+    def setUp(self):
+        self.room = Room(review_only=False)
+        self.addCleanup(self.room.close)
+        self.slack = mock.MagicMock()
+        self.sent = []
+
+        def create(*args, **kwargs):
+            raise self.ns["_SessionsFull"]()
+
+        self.ns = load(
+            resolve_room_policy=lambda config, channel, user: self.room.policy,
+            _send_to_claude=lambda session, text: self.sent.append(text),
+            slack_client=self.slack,
+            SESSIONS_FULL_REPLY="busy",
+        )
+        self.ns["_get_or_create_live_session"] = create
+
+    def test_the_new_thread_gets_the_busy_reply_and_no_turn(self):
+        event = {"user": "UKIRK", "channel": "DKIRK", "channel_type": "im", "ts": "5.1", "text": "hello"}
+        with mock.patch.dict(os.environ, ENV, clear=True):
+            self.ns["process_message_async"](event)
+        self.assertEqual([], self.sent)
+        texts = [call.kwargs.get("text") for call in self.slack.chat_postMessage.call_args_list]
+        self.assertEqual(["busy"], texts)
+
+
+
+class EvictionTest(unittest.TestCase):
+    """The real eviction rule: waiting and waking threads are spared unless a one-shot turn needs the slot."""
+
+    def setUp(self):
+        from session_lifecycle import needs_eviction, oldest_evictable_session
+        self.closed = []
+        self.waiting = set()
+        self.ns = load(
+            needs_eviction=needs_eviction,
+            oldest_evictable_session=oldest_evictable_session,
+            close_process_tree=lambda proc, *args, **kwargs: self.closed.append(proc.thread),
+            _waiting_threads=lambda: self.waiting,
+            LiveSession=lambda **kwargs: mock.MagicMock(**kwargs),
+            _reader_loop=lambda session: None,
+        )
+        self.ns["_spawn_claude_process"] = lambda **kwargs: (mock.MagicMock(), mock.MagicMock())
+        for thread, at in (("old", 10), ("new", 20)):
+            self.ns["_live_sessions"][thread] = self.session(thread, at)
+
+    def session(self, thread, at):
+        proc = mock.MagicMock(thread=thread)
+        proc.poll.return_value = None
+        return mock.MagicMock(proc=proc, review=False, waking=False, stop_done=None, bundle_moved=False,
+                              last_activity=at, turn_lock=threading.Lock(), channel="D1")
+
+    def create(self, **kwargs):
+        return self.ns["_get_or_create_live_session"]("fresh", "D1", user_id="UKIRK", **kwargs)
+
+    def test_a_waiting_thread_is_spared_and_the_other_goes(self):
+        self.waiting = {"old"}
+        self.create()
+        self.assertEqual(["new"], self.closed)
+
+    def test_when_every_thread_waits_or_wakes_a_new_thread_is_refused(self):
+        self.waiting = {"old"}
+        self.ns["_live_sessions"]["new"].waking = True
+        with self.assertRaises(self.ns["_SessionsFull"]):
+            self.create()
+        self.assertEqual([], self.closed)
+
+    def test_a_one_shot_turn_takes_the_oldest_waiter_but_never_a_waking_one(self):
+        self.waiting = {"old", "new"}
+        self.ns["_live_sessions"]["old"].waking = True
+        self.create(evict_waiting=True)
+        self.assertEqual(["new"], self.closed)
+
+
+
+class NoticeIdleTextTest(unittest.TestCase):
+    def test_a_refusal_says_so_and_a_hand_back_keeps_its_note(self):
+        ns = load(REVIEW_NOTICE_IDLE="ended {pr}", REVIEW_REFUSED_NOTE="declined {pr}: {reason}")
+        self.assertEqual("ended P", ns["_notice_idle_text"]({"pr": "P", "refused": ""}))
+        self.assertEqual("declined P: busy Tell me to continue when ready.",
+                         ns["_notice_idle_text"]({"pr": "P", "refused": "busy"}))
+
+
+
+class StartReviewNoticeTest(unittest.TestCase):
+    ENTRY = {"pr": "P", "channel": "D1", "thread": "5.1"}
+
+    def setUp(self):
+        self.slack = mock.MagicMock()
+        self.slack.chat_postMessage.return_value = {"ts": "9.9"}
+        self.notices = mock.MagicMock()
+        self.turns = []
+        self.live = None
+        self.ns = load(
+            slack_client=self.slack, _review_notices=self.notices, _notice_room=lambda channel: True,
+            _live_session_for=lambda thread, channel: self.live,
+            REVIEW_NOTICE_IDLE="ended {pr}", REVIEW_NOTICE_MESSAGE="read {pr}",
+            REVIEW_REFUSED_NOTE="declined {pr}: {reason}", REVIEW_REFUSED_MESSAGE="declined {pr}: {reason}",
+        )
+        # Compiled from bot.py by load(), so replaced afterwards.
+        self.ns["process_message_async"] = lambda event, **kwargs: self.turns.append((event["text"], kwargs))
+
+    def start(self, **extra):
+        self.ns["_start_review_notice"]({**self.ENTRY, **extra}, {"user": "UPEER", "thread_ts": "7.1"})
+
+    def test_a_failed_note_restores_a_hand_back_but_never_a_refusal(self):
+        self.slack.chat_postMessage.side_effect = RuntimeError("slack down")
+        self.start()
+        self.assertEqual(1, self.notices.add.call_count)
+        self.notices.add.reset_mock()
+        self.start(refused="busy")
+        self.notices.add.assert_not_called()
+
+    def test_a_refusal_wakes_the_live_session_with_the_reason_and_clears_waking(self):
+        self.live = mock.MagicMock(user_id="UKIRK", waking=False)
+        self.start(refused="busy")
+        self.assertEqual("declined P: busy", self.turns[0][0])
+        self.assertEqual({"pr": "P", "refused": "busy", "room_user": "UKIRK"}, self.turns[0][1]["review_notice"])
+        self.assertFalse(self.live.waking)
+
+    def test_an_idle_thread_gets_the_refusal_note(self):
+        self.start(refused="busy")
+        self.assertEqual([], self.turns)
+        self.assertEqual("declined P: busy Tell me to continue when ready.",
+                         self.slack.chat_postMessage.call_args.kwargs["text"])
 
 
 if __name__ == "__main__":

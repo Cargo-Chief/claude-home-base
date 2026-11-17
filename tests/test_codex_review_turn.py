@@ -271,14 +271,14 @@ class DeferTest(Base):
     def test_outside_a_pause_a_pinned_thread_is_refused_not_queued(self):
         self.ns["_defer_review"](self.admission())
         self.store.add.assert_not_called()
-        self.assertEqual([CODEX_UNAVAILABLE_REPLY], self.posts)
+        self.assertEqual([f"<@UNED> {CODEX_UNAVAILABLE_REPLY}"], self.posts)
         self.assertTrue(self.audits[-1].endswith("OUTCOME:refused_provider"))
 
     def test_a_record_that_cannot_be_written_refuses_aloud(self):
         self.ns["_limit_pause"]["until"] = time.time() + 3600
         self.store.add.side_effect = OSError("disk")
         self.ns["_defer_review"](self.admission())
-        self.assertEqual(["paused"], self.posts)
+        self.assertEqual(["<@UNED> paused"], self.posts, "a peer bot requester is mentioned")
         self.assertTrue(self.audits[-1].endswith("OUTCOME:refused_provider"))
 
 

@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 from cargo_chief_safety import REVIEW_ONLY_DENY_RULES, RoomPolicy, SafetyError
 from review_requests import (
     PR_BUSY_REPLY,
+    REFUSAL_REPLIES,
+    _to_requester,
+    refusal_reason,
     ReviewPlan,
     plan_review_pass,
     review_marker,
@@ -393,7 +396,9 @@ class HandlerTest(unittest.TestCase):
             start_turn=self.start_turn,
             spawn=lambda target, *args: target(*args),
             wrapper_ready=lambda root: self.wrapper_ok,
+            sleep=lambda seconds: self.slept.append(seconds),
         )
+        self.slept = []
 
     def tearDown(self):
         self.temp.cleanup()
@@ -499,7 +504,7 @@ class HandlerTest(unittest.TestCase):
     def test_own_pr_is_refused(self):
         self.info = PullRequestInfo("app/lisa-cargochief", "OPEN")
         self.mention(user="UNED", bot_id="BNED")
-        self.assertEqual([OWN_PR_REPLY], self.replies())
+        self.assertEqual([f"<@UNED> {OWN_PR_REPLY}"], self.replies(), "a peer bot hears only its mentions")
         self.assertEqual(["refused_own_pr"], self.outcomes())
         self.assertEqual([], self.turns)
 
@@ -700,6 +705,84 @@ class HandlerTest(unittest.TestCase):
         self.handler.spawn = broken
         self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=review_ended_text("ULISA", PR))
         self.assertIsNotNone(self.notices.take("7.1", PR))
+
+    def test_a_peer_refusal_in_a_recorded_thread_notifies_the_asking_thread_once(self):
+        self.wire_notices()
+        self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1")
+        notified = []
+        self.handler.start_notice = lambda entry, event: notified.append(entry)
+        self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=f"<@ULISA> {PR_BUSY_REPLY}")
+        self.assertEqual([{"pr": PR, "channel": "CWORK", "thread": "5.1", "refused": PR_BUSY_REPLY}],
+                         [{k: v for k, v in entry.items() if k != "at"} for entry in notified])
+        self.assertIsNone(self.notices.take("7.1"), "the thread is no longer waiting")
+        self.assertEqual(([], []), (self.turns, self.posts))
+        self.assertTrue(self.audits[-1].endswith("OUTCOME:review_refused"), self.audits[-1])
+
+    def test_a_refusal_needs_the_peer_the_mention_and_a_recorded_request(self):
+        self.wire_notices()
+        self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1")
+        self.mention(user="UKIRK", thread_ts="7.1", text=f"<@ULISA> {PR_BUSY_REPLY}")
+        self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=PR_BUSY_REPLY)
+        self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=f"<@ULISA> {PR_BUSY_REPLY} please")
+        self.assertEqual([], self.woken)
+        self.mention(user="UNED", bot_id="BNED", thread_ts="8.1", text=f"<@ULISA> {PR_BUSY_REPLY}")
+        self.assertEqual(([], []), (self.woken, self.turns))
+        self.assertTrue(self.audits[-1].endswith("OUTCOME:review_refused_unmatched"), self.audits[-1])
+        self.assertIsNotNone(self.notices.take("7.1", PR))
+
+    def test_a_refusal_that_beats_the_senders_record_still_finds_it(self):
+        self.wire_notices()
+        notified = []
+        self.handler.start_notice = lambda entry, event: notified.append(entry["thread"])
+        self.handler.sleep = lambda seconds: (self.slept.append(seconds),
+                                              self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1"))
+        self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=f"<@ULISA> {PR_BUSY_REPLY}")
+        self.assertEqual(["5.1"], notified)
+        self.assertEqual(1, len(self.slept))
+
+    def test_a_running_reviews_busy_reply_never_ends_its_wait(self):
+        self.wire_notices()
+        self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1")
+        self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=f"<@ULISA> {BUSY_REPLY}")
+        self.assertEqual([], self.woken)
+        self.assertIsNotNone(self.notices.take("7.1", PR))
+
+    def test_every_refusal_a_reviewer_sends_is_in_the_refusal_set(self):
+        import ast
+        import review_requests
+        root = Path(__file__).parents[1]
+        replies = set()
+        for name in ("review_requests.py", "bot.py"):
+            tree = ast.parse((root / name).read_text(encoding="utf-8"))
+            aliases = {
+                node.targets[0].id: node.value.id for node in tree.body
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name)
+                and isinstance(node.targets[0], ast.Name)
+            }
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+                index = {"refuse": 1, "_refuse": 3}.get(func)
+                if index is None or len(node.args) <= index:
+                    continue
+                arg = node.args[index]
+                for value in (arg.body, arg.orelse) if isinstance(arg, ast.IfExp) else (arg,):
+                    if isinstance(value, ast.Name):
+                        replies.add(aliases.get(value.id, value.id))
+        texts = {name: getattr(review_requests, name) for name in replies}
+        # BUSY_REPLY answers a follow-up in a thread whose review is running, which still hands back;
+        # USAGE_HINT goes only to a person.
+        missing = {name for name, text in texts.items() if text not in REFUSAL_REPLIES} - {"BUSY_REPLY", "USAGE_HINT"}
+        self.assertEqual(set(), missing)
+        self.assertIn("QUEUE_FULL_REPLY", replies)
+
+    def test_every_refusal_reply_round_trips_through_the_mention(self):
+        for reply in REFUSAL_REPLIES:
+            sent = _to_requester({"user": "UNED", "bot_id": "BNED"}, reply)
+            self.assertEqual(reply, refusal_reason(sent, "UNED"))
+        self.assertEqual(BUSY_REPLY, _to_requester({"user": "UKIRK"}, BUSY_REPLY), "a person is not mentioned")
+        self.assertIsNone(refusal_reason(review_ended_text("UNED", PR), "UNED"))
 
     def test_only_the_peer_bot_and_only_a_recorded_request(self):
         self.wire_notices()

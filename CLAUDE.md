@@ -62,8 +62,13 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   close-out, which reviews only what goes beyond the fixes and can still approve. See README
 - A peer's review ending wakes the thread that asked (`ReviewNoticeStore`, `_start_review_notice`),
   but only a live session in that channel. Reviews queue (bounded) for their own session slot
-  (`_review_slots`) and never evict; work eviction never takes a `waking` session and takes threads with a
-  recent request (`_waiting_threads`) last, so that session is normally still live. A notice never spawns a
+  (`_review_slots`) and never evict; work eviction never takes a `waking` session or a thread with a
+  recent request (`_waiting_threads`); with nothing evictable a new thread gets `SESSIONS_FULL_REPLY`
+  (`_SessionsFull`), so that session is still live when the hand-back comes. A forwarded reply or a
+  handoff (`evict_waiting`) may still evict a waiter, since refusing a one-shot turn loses it. A peer's
+  refusal mentions a peer-bot requester (`_to_requester`) and ends the wait like a hand-back
+  (`refusal_reason`, `_refused_back`, `refused` in the notice); keep `REFUSAL_REPLIES` complete when a
+  refusal reply is added. A notice never spawns a
   process or runs on the Codex
   fallback, because either would run as the peer bot (`existing_only` in
   `_get_or_create_live_session`). The turn has `review_notice` authority, counts in `turn_senders`,

@@ -109,6 +109,17 @@ only a "tell me to continue" note. A failure before the thread hears anything pu
 back. Each outcome writes a `REVIEW_NOTICE` audit line. If charging the sender cap fails after the
 request posts, the CLI still reports it requested, with a warning not to request again.
 
+A request the peer refuses (busy, queue full, cap, closed PR, and the other fixed replies in
+`review_requests.REFUSAL_REPLIES`) runs no review turn, so no hand-back follows. A refusal sent to a peer
+bot therefore mentions it (`_to_requester`). The requester's intake treats exactly `<@self> <fixed reply>`
+from the peer bot in a recorded request's thread as an end (`refusal_reason`, audited `review_refused`).
+It takes the record (retrying briefly, since a fast refusal can land before the sender records its
+request), so the thread stops counting as waiting, and tells the thread the same way a hand-back does:
+the reason, and no instruction to read the PR. `BUSY_REPLY` is not in the set: it answers a follow-up
+in a thread whose review is still running, and that review will still hand back. A refusal record is never restored,
+because no hand-back would ever take it. Both agents must run this together. An older reviewer sends
+refusals without the mention, and the requester never hears them.
+
 One Slack thread holds one ticket or topic. When a turn is asked for different work, the agent
 writes `{"title": ..., "brief": ...}` to its thread's `handoff-claim.json` and ends the turn,
 adding `"bundle": "CN-####-slug"` when it already created that work's worktree bundle. The
@@ -167,9 +178,13 @@ Logs, session maps, forwards, votes, stderr, and temporary artifacts live under 
 (`REVIEW_QUEUE_DEPTH`) wait for the slot, with one queued note, for at most an hour
 (`REVIEW_QUEUE_WAIT`); past either bound the request is refused aloud (`refused_queue`). A review that
 waited re-checks that the PR is still open, then picks its provider. At the work cap the oldest
-idle work thread is evicted: a thread whose review hand-back is being delivered (`LiveSession.waking`)
-never, and one that asked a peer for a review in the last two hours (`REVIEW_WAIT_PROTECTION`) last, so
-it is normally still live to be woken; the 3-hour idle cleanup can still close it. A turn stops after at
+idle work thread is evicted. Neither a thread whose review hand-back is being delivered (`LiveSession.waking`)
+nor one that asked a peer for a review in the last two hours (`REVIEW_WAIT_PROTECTION`) is ever chosen,
+so the asking thread is still live to be woken. When every work session is mid-turn, being woken or
+waiting, a new thread is refused with `SESSIONS_FULL_REPLY` rather than evicting a waiter. The exceptions
+are one-shot turns, a forwarded approver reply and a handoff, which would be lost if refused: they may
+evict the oldest waiter. A hand-back
+later than two hours, or after a restart, finds the thread closed and gets only the note. A turn stops after at
 most 15
 minutes without owner output; a native subagent's streamed events count as output, and so does an
 owner tool call that is still running (for up to 30 minutes per call), so a quiet test run is not

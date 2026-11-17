@@ -125,6 +125,7 @@ from provider_control import (
 )
 from reply_routing import ReplyRouteStore
 from review_requests import (
+    QUEUE_FULL_REPLY,
     BUSY_REPLY,
     LOOKUP_FAILED_REPLY,
     NOT_OPEN_REPLY,
@@ -715,7 +716,10 @@ _turn_admission = TurnAdmission(MAX_LIVE_SESSIONS)
 # Peer reviews wait for their own session slot instead of evicting a work thread; the queue is bounded.
 REVIEW_QUEUE_DEPTH = 2
 REVIEW_QUEUE_WAIT = 3600  # seconds a review may wait for the slot
-REVIEW_WAIT_PROTECTION = 7200  # seconds a thread that asked for a review is evicted last
+REVIEW_WAIT_PROTECTION = 7200  # seconds a thread that asked for a review is never evicted
+SESSIONS_FULL_REPLY = (
+    "All my sessions are busy or waiting on peer reviews right now. Try again in a few minutes."
+)
 _review_slots = ReviewSlots(REVIEW_SESSION_SLOTS, max_waiting=REVIEW_QUEUE_DEPTH)
 
 
@@ -1074,7 +1078,7 @@ def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
 
 
 REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatically"
-REVIEW_QUEUE_FULL_REPLY = "Too many reviews are waiting here right now; ask again later."
+REVIEW_QUEUE_FULL_REPLY = QUEUE_FULL_REPLY
 
 
 def _post_queue_notice(channel: str, thread_ts: str, note: str = "") -> None:
@@ -1473,11 +1477,13 @@ def _reader_loop(session: LiveSession) -> None:
 def _get_or_create_live_session(
     thread_ts: str, channel: str, user_id: str = "", review_policy: RoomPolicy | None = None,
     review_pr: str = "", review_plan: ReviewPlan | None = None, existing_only: bool = False,
+    evict_waiting: bool = False,
 ) -> LiveSession:
     """Get an existing live session or create a new one.
 
     A review (``review_policy`` set) always gets a fresh, unresumed process under that pinned policy.
-    ``existing_only`` raises _NoLiveSession instead of spawning.
+    ``existing_only`` raises _NoLiveSession instead of spawning. ``evict_waiting`` lets a one-shot turn
+    evict a thread waiting on a peer review as a last resort rather than be refused.
     """
     fresh = review_policy is not None
     with _live_sessions_lock:
@@ -1511,19 +1517,21 @@ def _get_or_create_live_session(
         if existing_only:
             raise _NoLiveSession()
 
-        # At the work cap, evict the oldest idle work thread; one being woken is never chosen, and one waiting on
-        # a peer's review goes last. This thread's own stale entry and exited processes do not count.
+        # At the work cap, evict the oldest idle work thread. One being woken is never chosen, nor one waiting on a
+        # peer's review unless evict_waiting. This thread's own stale entry and exited processes do not count.
         work = {
             ts: live for ts, live in _live_sessions.items()
             if ts != thread_ts and not live.review and live.proc.poll() is None
         }
         if needs_eviction(work, max_work_sessions=MAX_LIVE_SESSIONS, new_is_review=fresh):
-            candidates = {ts: live for ts, live in work.items() if not live.waking}
-            oldest_ts = oldest_evictable_session(candidates, protected=_waiting_threads())
+            waiting = _waiting_threads()
+            candidates = {
+                ts: live for ts, live in work.items()
+                if not live.waking and (evict_waiting or ts not in waiting)
+            }
+            oldest_ts = oldest_evictable_session(candidates, protected=waiting)
             if oldest_ts is None:
-                raise SafetyError(
-                    "live session cap reached; every existing session is processing a turn"
-                )
+                raise _SessionsFull()
             oldest = _live_sessions.pop(oldest_ts)
             logger.info(f"Evicting idle session for thread {oldest_ts} (pid={oldest.proc.pid})")
             try:
@@ -2737,6 +2745,10 @@ def _clear_eyes(channel: str, ts: str) -> None:
         pass
 
 
+class _SessionsFull(Exception):
+    """Every work session is mid-turn, being woken, or waiting on a peer review."""
+
+
 class _NoLiveSession(Exception):
     """A review notice found no live session to wake; it never spawns one."""
 
@@ -2894,7 +2906,7 @@ def process_message_async(
     if review_notice and use_openai:
         # A Codex turn would run as the peer bot; leave the thread for a person to resume.
         slack_client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
+            channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
         )
         return
 
@@ -3094,7 +3106,7 @@ def process_message_async(
                 # A notice only wakes a live session; a fresh process would run as the peer bot.
                 _clear_eyes(reaction_channel, reaction_msg_ts)
                 slack_client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
+                    channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
                 )
                 return
             if not (session and session.turn_lock.locked()):
@@ -3139,6 +3151,8 @@ def process_message_async(
                     review_pr=review_admission.pr if review else "",
                     review_plan=review_admission.plan if review else None,
                     existing_only=bool(review_notice),
+                    # A forwarded reply or a handoff is one-shot: refusing it would lose it.
+                    evict_waiting=bool(forward or handoff_from),
                 )
                 # The cap is charged, and the request audited as accepted, only once its turn starts.
                 if review and not review_admission.start():
@@ -3254,7 +3268,8 @@ def process_message_async(
                         review_continued = True
                 elif fallback_requested and review_notice:
                     # A Codex turn would run as the peer bot.
-                    note = REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"])
+                    note = (REVIEW_REFUSED_LIMIT.format(pr=review_notice["pr"], reason=review_notice["refused"])
+                            if review_notice.get("refused") else REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"]))
                     all_texts.append(note)
                     post_response(channel, note, thread_ts=thread_ts)
                 elif fallback_requested:
@@ -3308,11 +3323,19 @@ def process_message_async(
         return
     except _CodexReviewDone:
         pass
+    except _SessionsFull:
+        _clear_eyes(reaction_channel, reaction_msg_ts)
+        logger.info(f"Refused new session for thread {thread_ts}: every work session is busy or waiting")
+        try:
+            slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=SESSIONS_FULL_REPLY)
+        except Exception as exc:
+            logger.warning(f"Could not post the busy reply in {thread_ts}: {type(exc).__name__}")
+        return
     except _NoLiveSession:
         _clear_eyes(reaction_channel, reaction_msg_ts)
         try:
             slack_client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"]),
+                channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
             )
         except Exception as exc:
             logger.warning(f"Could not post the review notice note in {thread_ts}: {type(exc).__name__}")
@@ -3901,10 +3924,26 @@ REVIEW_NOTICE_MESSAGE = (
     "Your peer agent's review turn on {pr} has ended. Read the verdict and its threads on the PR."
 )
 REVIEW_NOTICE_IDLE = "The peer review of {pr} has ended. Tell me to continue when ready."
+REVIEW_REFUSED_MESSAGE = (
+    "Your peer agent declined to review {pr}: \"{reason}\" No review was posted on the PR."
+)
+REVIEW_REFUSED_NOTE = "The peer declined to review {pr}: {reason}"
 REVIEW_NOTICE_LIMIT = (
     "I hit a usage limit while picking up the peer review of {pr}. Tell me to continue when ready, "
     "and repeat anything you sent during that turn."
 )
+REVIEW_REFUSED_LIMIT = (
+    "The peer declined to review {pr}: {reason} I hit a usage limit before acting on it. Tell me to "
+    "continue when ready, and repeat anything you sent during that turn."
+)
+
+
+def _notice_idle_text(review_notice: dict) -> str:
+    """The note left when a notice cannot wake the thread."""
+    if review_notice.get("refused"):
+        note = REVIEW_REFUSED_NOTE.format(pr=review_notice["pr"], reason=review_notice["refused"])
+        return f"{note} Tell me to continue when ready."
+    return REVIEW_NOTICE_IDLE.format(pr=review_notice["pr"])
 
 
 def _live_session_for(thread: str, channel: str) -> "LiveSession | None":
@@ -3935,6 +3974,8 @@ def _start_review_notice(entry: dict, event: dict) -> None:
     A failure before the thread hears anything puts the record back.
     """
     channel, thread, pr = entry["channel"], entry["thread"], entry["pr"]
+    refused = entry.get("refused") or ""
+    review_notice = {"pr": pr, "refused": refused}
     request_ts = event.get("thread_ts", "")
 
     def audit(outcome: str) -> None:
@@ -3942,11 +3983,15 @@ def _start_review_notice(entry: dict, event: dict) -> None:
 
     def restore(outcome: str) -> None:
         audit(outcome)
+        if refused:
+            # No hand-back follows a refusal, so a restored record would only pin the thread.
+            return
         try:
             _review_notices.add(request_ts, pr=pr, channel=channel, thread=thread)
         except Exception:
             pass
 
+    session = None
     try:
         session = _live_session_for(thread, channel)
         if session is not None:
@@ -3954,13 +3999,15 @@ def _start_review_notice(entry: dict, event: dict) -> None:
             session.waking = True
         if session is None:
             if _notice_room(channel):
-                slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=REVIEW_NOTICE_IDLE.format(pr=pr))
+                slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=_notice_idle_text(review_notice))
             audit("idle")
             return
-        note_ts = slack_client.chat_postMessage(
-            channel=channel, thread_ts=thread, text=f"The peer review of {pr} has ended; picking it up.",
-        )["ts"]
+        note = (REVIEW_REFUSED_NOTE.format(pr=pr, reason=refused) if refused
+                else f"The peer review of {pr} has ended; picking it up.")
+        note_ts = slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=note)["ts"]
     except Exception as exc:
+        if session is not None:
+            session.waking = False
         restore(f"failed_{type(exc).__name__}")
         return
     audit("woken")
@@ -3971,9 +4018,14 @@ def _start_review_notice(entry: dict, event: dict) -> None:
         "channel_type": "im" if channel.startswith("D") else "channel",
         "thread_ts": thread,
         "ts": note_ts,
-        "text": REVIEW_NOTICE_MESSAGE.format(pr=pr),
+        "text": (REVIEW_REFUSED_MESSAGE.format(pr=pr, reason=refused) if refused
+                 else REVIEW_NOTICE_MESSAGE.format(pr=pr)),
     }
-    process_message_async(notice, review_notice={"pr": pr, "room_user": session.user_id})
+    try:
+        process_message_async(notice, review_notice={**review_notice, "room_user": session.user_id})
+    finally:
+        # Also covers process_message_async's early returns, so a refused notice never pins the session.
+        session.waking = False
 
 
 def _spawn_review_admission(target, *args) -> None:
