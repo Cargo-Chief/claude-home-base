@@ -1,0 +1,8 @@
+{
+  "name": "cargo-chief-home-base-notion",
+  "private": true,
+  "description": "Pinned Notion MCP server for agent thread sessions; install with npm ci",
+  "dependencies": {
+    "@notionhq/notion-mcp-server": "2.6.1"
+  }
+}

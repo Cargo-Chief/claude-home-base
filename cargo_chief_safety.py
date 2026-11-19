@@ -1112,6 +1112,9 @@ def preflight_room(policy: RoomPolicy) -> list[str]:
     browser_reason = None if policy.review_only else browser_unavailable_reason()
     if browser_reason is not None:
         warnings.append(f"headless browser unavailable ({browser_reason}); thread sessions start without it")
+    notion_reason = None if policy.review_only else notion_unavailable_reason()
+    if notion_reason is not None:
+        warnings.append(f"Notion unavailable ({notion_reason}); thread sessions start without it")
     return warnings
 
 
@@ -1434,6 +1437,76 @@ def browser_mcp_config(output_dir: Path, cli: Path = BROWSER_MCP_CLI) -> dict | 
     }
 
 
+NOTION_MCP_DIR = Path(__file__).resolve().parent / "mcp" / "notion"
+NOTION_MCP_CLI = NOTION_MCP_DIR / "node_modules" / "@notionhq" / "notion-mcp-server" / "bin" / "cli.mjs"
+NOTION_LAUNCHER = Path(__file__).resolve().parent / "notion_mcp.py"
+# The deny rules and the guard were reviewed against this version's tool list; a bump repeats that.
+NOTION_MCP_REVIEWED_VERSION = "2.6.1"
+NOTION_ENV_RELATIVE = Path(".config") / "cargo-chief" / "notion.env"
+# Deleting a block, changing a database schema and moving a page out of the shared tree; trashing
+# and archiving are flags on ordinary updates, which notion_guard.py refuses.
+NOTION_DENY_RULES = (
+    "mcp__notion__API-delete-a-block",
+    "mcp__notion__API-update-a-data-source",
+    "mcp__notion__API-move-page",
+)
+NOTION_TOOL_MATCHER = "mcp__notion__.*"
+NOTION_PROMPT = (
+    "- Notion is available as the `notion` MCP server, signed in as this agent's own integration. "
+    "It sees only the pages and databases shared with that integration; ask a person to share one "
+    "you cannot find. It can read, create and update pages, but not trash, archive, move or delete "
+    "them, or change a database's columns."
+)
+
+
+def notion_env_file(home: Path | None = None) -> Path:
+    return (home or Path.home()) / NOTION_ENV_RELATIVE
+
+
+def _installed_notion_version(cli: Path) -> str | None:
+    try:
+        return json.loads((cli.parents[1] / "package.json").read_text(encoding="utf-8")).get("version")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def notion_unavailable_reason(cli: Path = NOTION_MCP_CLI, env_file: Path | None = None) -> str | None:
+    """Why the pinned Notion server cannot run here, or None when it can. Never reads the token."""
+    env_file = env_file or notion_env_file()
+    if not cli.is_file():
+        return f"{cli} is missing; install it in {cli.parents[3]}"
+    version = _installed_notion_version(cli)
+    if version != NOTION_MCP_REVIEWED_VERSION:
+        return f"installed @notionhq/notion-mcp-server {version} is not the reviewed {NOTION_MCP_REVIEWED_VERSION}"
+    if not env_file.is_file():
+        return f"{env_file} is missing"
+    node = shutil.which("node")
+    if node is None:
+        return "node is not on PATH"
+    major = _node_major(node)
+    if major is None:
+        return f"could not read the version of {node}"
+    if major < BROWSER_MIN_NODE_MAJOR:
+        return f"{node} is not node {BROWSER_MIN_NODE_MAJOR} or later"
+    return None
+
+
+def notion_mcp_config(
+    transport_python: Path, cli: Path = NOTION_MCP_CLI, env_file: Path | None = None,
+    launcher: Path = NOTION_LAUNCHER,
+) -> dict | None:
+    """The pinned Notion server behind its token launcher, or None when unavailable."""
+    env_file = env_file or notion_env_file()
+    if notion_unavailable_reason(cli, env_file) is not None:
+        return None
+    return {
+        "notion": {
+            "command": str(transport_python),
+            "args": [str(launcher), "--node", shutil.which("node"), "--cli", str(cli), "--env-file", str(env_file)],
+        },
+    }
+
+
 def guard_hook(matcher: str, transport_python: Path, script: Path) -> dict:
     """One PreToolUse entry running a guard script; exit 2 refuses the call."""
     command = f"{shlex.quote(str(transport_python))} {shlex.quote(str(script))}"
@@ -1471,11 +1544,15 @@ def build_claude_command(
     home: Path | None = None,
     browser_output_dir: Path | None = None,
     browser_cli: Path = BROWSER_MCP_CLI,
+    notion_cli: Path = NOTION_MCP_CLI,
 ) -> list[str]:
     overlay = policy.overlay.read_text(encoding="utf-8").strip()
     browser = None
     if browser_output_dir is not None and not policy.review_only:
         browser = browser_mcp_config(browser_output_dir, browser_cli)
+    notion = None
+    if not policy.review_only:
+        notion = notion_mcp_config(transport_python, notion_cli, notion_env_file(home))
     settings = owner_settings(policy.root, home, review_only=policy.review_only)
     pre_tool_use = []
     if not policy.review_only:
@@ -1489,6 +1566,13 @@ def build_claude_command(
         # Refuses browser calls that name a file, which resolve against the cwd.
         pre_tool_use.append(
             guard_hook(BROWSER_TOOL_MATCHER, transport_python, transport_script.parent / "browser_guard.py")
+        )
+    if notion is not None:
+        permissions = settings.setdefault("permissions", {})
+        permissions["deny"] = [*permissions.get("deny", []), *NOTION_DENY_RULES]
+        # Refuses calls that trash, archive or delete content through an ordinary update.
+        pre_tool_use.append(
+            guard_hook(NOTION_TOOL_MATCHER, transport_python, transport_script.parent / "notion_guard.py")
         )
     if pre_tool_use:
         settings["hooks"] = {"PreToolUse": pre_tool_use}
@@ -1508,7 +1592,8 @@ def build_claude_command(
     appended = "\n\n".join(
         part
         for part in (
-            overlay, harness_prompt, BROWSER_PROMPT if browser is not None else "", SLACK_REPORTING_PROMPT,
+            overlay, harness_prompt, BROWSER_PROMPT if browser is not None else "",
+            NOTION_PROMPT if notion is not None else "", SLACK_REPORTING_PROMPT,
             identity_prompt.strip(), model_prompt.strip(),
         )
         if part
@@ -1528,8 +1613,9 @@ def build_claude_command(
         # Only harness-declared MCP servers load; a server the agent adds itself never does.
         "--strict-mcp-config",
     ]
-    if browser is not None:
-        command.extend(["--mcp-config", json.dumps(browser, separators=(",", ":"))])
+    servers = {**(browser or {}).get("mcpServers", {}), **(notion or {})}
+    if servers:
+        command.extend(["--mcp-config", json.dumps({"mcpServers": servers}, separators=(",", ":"))])
     # Every review-only request starts a fresh session.
     if session_id and not policy.review_only:
         command.extend(["--resume", session_id])

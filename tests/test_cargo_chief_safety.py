@@ -15,6 +15,11 @@ from cargo_chief_safety import (
     BROWSER_DENY_RULES,
     BROWSER_MCP_REVIEWED_VERSION,
     BROWSER_PROMPT,
+    NOTION_DENY_RULES,
+    NOTION_MCP_REVIEWED_VERSION,
+    NOTION_PROMPT,
+    notion_mcp_config,
+    notion_unavailable_reason,
     BUNDLE_GUARD_MATCHER,
     guard_hook,
     browser_mcp_config,
@@ -783,16 +788,27 @@ class PreflightTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_accepts_clean_released_inputs(self):
-        with mock.patch("cargo_chief_safety.browser_unavailable_reason", return_value=None):
+        with mock.patch("cargo_chief_safety.browser_unavailable_reason", return_value=None), \
+                mock.patch("cargo_chief_safety.notion_unavailable_reason", return_value=None):
             warnings = preflight_room(self.policy)
         self.assertEqual(2, len(warnings))  # fixtures intentionally have no origin/master refs
 
     def test_warns_when_the_browser_is_unavailable(self):
-        with mock.patch("cargo_chief_safety.browser_unavailable_reason", return_value="node is not on PATH"):
+        with mock.patch("cargo_chief_safety.browser_unavailable_reason", return_value="node is not on PATH"), \
+                mock.patch("cargo_chief_safety.notion_unavailable_reason", return_value=None):
             warnings = preflight_room(self.policy)
             review = preflight_room(dataclasses.replace(self.policy, review_only=True))
         self.assertEqual(3, len(warnings))
         self.assertIn("headless browser unavailable (node is not on PATH)", warnings[-1])
+        self.assertEqual(2, len(review))
+
+    def test_warns_when_notion_is_unavailable_except_on_review_turns(self):
+        with mock.patch("cargo_chief_safety.browser_unavailable_reason", return_value=None), \
+                mock.patch("cargo_chief_safety.notion_unavailable_reason", return_value="token file is missing"):
+            warnings = preflight_room(self.policy)
+            review = preflight_room(dataclasses.replace(self.policy, review_only=True))
+        self.assertEqual(3, len(warnings))
+        self.assertIn("Notion unavailable (token file is missing)", warnings[-1])
         self.assertEqual(2, len(review))
 
     def test_rejects_dirty_clone(self):
@@ -1511,6 +1527,124 @@ class BrowserMcpTest(unittest.TestCase):
         lock = json.loads((source / "package-lock.json").read_text())
         self.assertEqual(BROWSER_MCP_REVIEWED_VERSION, package["dependencies"]["@playwright/mcp"])
         self.assertEqual(BROWSER_MCP_REVIEWED_VERSION, lock["packages"]["node_modules/@playwright/mcp"]["version"])
+
+
+class NotionMcpTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.home = self.root / "home"
+        self.env_file = self.home / ".config" / "cargo-chief" / "notion.env"
+        self.env_file.parent.mkdir(parents=True)
+        self.env_file.write_text("NOTION_TOKEN=placeholder\n")
+        self.cli = self.root / "pkg" / "bin" / "cli.mjs"
+        self.cli.parent.mkdir(parents=True)
+        self.cli.write_text("// stub\n")
+        self.write_version(NOTION_MCP_REVIEWED_VERSION)
+        self.overlay = self.root / "overlay.md"
+        self.overlay.write_text("autonomous\n")
+        node = mock.patch("cargo_chief_safety.shutil.which", return_value="/opt/homebrew/bin/node")
+        major = mock.patch("cargo_chief_safety._node_major", return_value=22)
+        node.start()
+        major.start()
+        self.addCleanup(node.stop)
+        self.addCleanup(major.stop)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_version(self, version):
+        (self.cli.parents[1] / "package.json").write_text(json.dumps({"version": version}))
+
+    def command(self, *, review_only=False, browser=False):
+        policy = RoomPolicy(
+            root=self.root, permission_mode="auto", overlay=self.overlay,
+            escalation_channel="D1", backend="claude", model="claude-opus-5-5",
+            effort="high", role="eng", fallback_backend="codex",
+            fallback_model="gpt-6-sol", fallback_effort="high", review_only=review_only,
+        )
+        browser_cli = self.root / "browser" / "cli.js"
+        if browser:
+            browser_cli.parent.mkdir(exist_ok=True)
+            browser_cli.write_text("// stub\n")
+            (browser_cli.parent / "package.json").write_text(json.dumps({"version": BROWSER_MCP_REVIEWED_VERSION}))
+        return build_claude_command(
+            policy,
+            initial_prompt="",
+            transport_python=Path("/venv/bin/python"),
+            transport_script=Path("/home-base/bot.py"),
+            escalation_message_file=Path("/w/escalation.txt"),
+            bundle_claim_file=Path("/w/bundle.txt"),
+            parking_claim_file=Path("/w/parking.txt"),
+            home=self.home,
+            browser_output_dir=self.root / "browser-out",
+            browser_cli=browser_cli,
+            notion_cli=self.cli,
+        )
+
+    def test_config_runs_the_launcher_not_the_server_and_carries_no_token(self):
+        server = notion_mcp_config(Path("/venv/bin/python"), self.cli, self.env_file)["notion"]
+        self.assertEqual("/venv/bin/python", server["command"])
+        self.assertTrue(server["args"][0].endswith("notion_mcp.py"))
+        self.assertEqual(
+            ["--node", "/opt/homebrew/bin/node", "--cli", str(self.cli), "--env-file", str(self.env_file)],
+            server["args"][1:],
+        )
+        self.assertNotIn("env", server)
+        self.assertNotIn("placeholder", json.dumps(server))
+
+    def test_unavailable_without_package_reviewed_version_env_file_or_node(self):
+        self.assertIsNone(notion_unavailable_reason(self.cli, self.env_file))
+        self.assertIn("missing", notion_unavailable_reason(self.root / "missing.mjs", self.env_file))
+        self.assertIn("is missing", notion_unavailable_reason(self.cli, self.root / "none"))
+        self.write_version("2.7.0")
+        self.assertIn("not the reviewed", notion_unavailable_reason(self.cli, self.env_file))
+        self.assertIsNone(notion_mcp_config(Path("/p"), self.cli, self.env_file))
+        self.write_version(NOTION_MCP_REVIEWED_VERSION)
+        with mock.patch("cargo_chief_safety._node_major", return_value=18):
+            self.assertIn("node 20 or later", notion_unavailable_reason(self.cli, self.env_file))
+        with mock.patch("cargo_chief_safety.shutil.which", return_value=None):
+            self.assertEqual("node is not on PATH", notion_unavailable_reason(self.cli, self.env_file))
+
+    def test_thread_command_declares_notion_denies_and_guards_it(self):
+        command = self.command()
+        config = json.loads(command[command.index("--mcp-config") + 1])
+        self.assertEqual(["notion"], list(config["mcpServers"]))
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(list(NOTION_DENY_RULES), settings["permissions"]["deny"][-len(NOTION_DENY_RULES):])
+        hook = settings["hooks"]["PreToolUse"][-1]
+        self.assertEqual("mcp__notion__.*", hook["matcher"])
+        self.assertEqual("/venv/bin/python /home-base/notion_guard.py", hook["hooks"][0]["command"])
+        self.assertIn(NOTION_PROMPT, command[command.index("--append-system-prompt") + 1])
+
+    def test_browser_and_notion_share_one_mcp_config(self):
+        command = self.command(browser=True)
+        self.assertEqual(1, command.count("--mcp-config"))
+        config = json.loads(command[command.index("--mcp-config") + 1])
+        self.assertEqual({"playwright", "notion"}, set(config["mcpServers"]))
+        settings = json.loads(command[command.index("--settings") + 1])
+        matchers = [h["matcher"] for h in settings["hooks"]["PreToolUse"]]
+        self.assertEqual(["Edit|MultiEdit|Write|NotebookEdit|Bash", "mcp__playwright__.*", "mcp__notion__.*"], matchers)
+
+    def test_review_turn_and_missing_env_file_get_no_notion(self):
+        review = self.command(review_only=True)
+        self.env_file.unlink()
+        missing = self.command()
+        for command in (review, missing):
+            self.assertIn("--strict-mcp-config", command)
+            self.assertNotIn("--mcp-config", command)
+            self.assertNotIn(NOTION_PROMPT, command[command.index("--append-system-prompt") + 1])
+            settings = json.loads(command[command.index("--settings") + 1])
+            self.assertFalse(set(NOTION_DENY_RULES) & set(settings.get("permissions", {}).get("deny", [])))
+
+    def test_lockfile_pins_the_reviewed_version(self):
+        source = Path(__file__).resolve().parents[1] / "mcp" / "notion"
+        package = json.loads((source / "package.json").read_text())
+        lock = json.loads((source / "package-lock.json").read_text())
+        self.assertEqual(NOTION_MCP_REVIEWED_VERSION, package["dependencies"]["@notionhq/notion-mcp-server"])
+        self.assertEqual(
+            NOTION_MCP_REVIEWED_VERSION, lock["packages"]["node_modules/@notionhq/notion-mcp-server"]["version"]
+        )
 
 
 if __name__ == "__main__":
