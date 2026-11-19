@@ -222,6 +222,30 @@ command carries `--strict-mcp-config`, so an MCP server the agent registers itse
 "Never open a production UI" is a prompt rule: the profile holds no credentials, and Playwright's
 origin lists are not a security boundary.
 
+Thread sessions get Notion when it is installed and the principal has a token: the harness
+declares the `@notionhq/notion-mcp-server` pinned in `mcp/notion/` behind `notion_mcp.py`, which
+reads `NOTION_TOKEN` from `~/.config/cargo-chief/notion.env` and passes it only to the server
+process, never to the `claude` command line or environment. The launcher refuses a file that is
+not owned by the principal or that group or others can read, and preflight runs the same checks.
+The server's environment is an allowlist (`INHERITED_KEYS`) plus the token, so an inherited
+`BASE_URL`, proxy or `NODE_OPTIONS` cannot redirect the requests that carry it. Each agent uses its own Notion
+**internal integration**, so its edits are attributed to it and it sees only what is shared with
+that integration. The claude.ai Notion connector is not an option: it loads only under a full
+claude.ai login, which the service avoids (concurrent sessions race its token refresh), and it
+would act as whoever owns that login. Set it up per principal, as that user: create the
+integration (read, update and insert content), share the pages it needs with it, write
+`NOTION_TOKEN=...` to the env file with mode 600, and run `npm ci` in `mcp/notion/`. Until then
+preflight warns with the reason and sessions start without it. Review-only turns never get it.
+`API-delete-a-block`, `API-update-a-data-source` (a schema change can drop a column's data) and
+`API-move-page` are denied. Trashing, archiving and a Markdown rewrite that deletes child pages are
+flags on ordinary updates, so a PreToolUse hook (`notion_guard.py`) refuses any call that sets
+`in_trash`, `archived`, `is_archived`, `allow_deleting_content` or `erase_content` to a true value
+at any depth, and refuses on any failure of its own. It decodes JSON-string arguments at least as
+far as the server does (trimmed, quoted layers unwrapped), since the server forwards undeclared
+keys to Notion. An object under one of those names is a database property, not a flag, and is
+allowed. Overwriting a page's text is an ordinary update and is not blocked. A pin bump changes `NOTION_MCP_REVIEWED_VERSION` with the regenerated lockfile,
+after re-checking the new tool list for tools that delete, move or take local files.
+
 Lifecycle reporting is optional and installation-specific. During setup, create or select the
 Slack channel you want to use, invite the app, and put its stable channel ID in
 `AGENT_STATUS_CHANNEL_ID`. Home-base then posts fixed, privacy-safe ready and fatal-runtime notices;

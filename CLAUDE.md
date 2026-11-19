@@ -101,3 +101,8 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   `cargo_chief_safety.browser_mcp_config`, `BROWSER_DENY_RULES` and the `browser_guard.py` hook.
   A pin bump changes `BROWSER_MCP_REVIEWED_VERSION` with the regenerated lockfile, after
   re-checking the new tool list for tools that run code or take files. See README
+- Notion is `mcp/notion/` (pinned, `npm ci` per checkout) started by `notion_mcp.py`, which reads
+  the principal's `~/.config/cargo-chief/notion.env` so the token never reaches the claude process.
+  It is wired in by `cargo_chief_safety.notion_mcp_config`, `NOTION_DENY_RULES` and the
+  `notion_guard.py` hook, and shares one `--mcp-config` with the browser. A pin bump changes
+  `NOTION_MCP_REVIEWED_VERSION` after re-checking the tool list. See README
