@@ -18,12 +18,22 @@ import sys
 from pathlib import Path
 
 TOKEN_KEY = "NOTION_TOKEN"
-# The server also accepts headers carrying a token; an inherited one must never override ours.
-SCRUBBED_KEYS = (TOKEN_KEY, "OPENAPI_MCP_HEADERS")
+# The server process gets only these from the inherited environment, so nothing such as BASE_URL,
+# a proxy or NODE_OPTIONS can redirect or alter the requests that carry the token.
+INHERITED_KEYS = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ")
 
 
 class LaunchError(Exception):
     pass
+
+
+def _value(raw: str) -> str:
+    """A shell-style value: quoted text, or the first word before any inline comment."""
+    text = raw.strip()
+    if text[:1] in ("'", '"'):
+        end = text.find(text[0], 1)
+        return text[1:end] if end > 0 else ""
+    return text.split()[0] if text.split() else ""
 
 
 def read_token(env_file: Path) -> str:
@@ -49,14 +59,23 @@ def read_token(env_file: Path) -> str:
             text = text[len("export "):].lstrip()
         key, sep, value = text.partition("=")
         if sep and key.strip() == TOKEN_KEY:
-            token = value.strip().strip("'\"")
+            token = _value(value)
     if not token:
         raise LaunchError(f"{TOKEN_KEY} is not set in {env_file}")
     return token
 
 
+def env_file_problem(env_file: Path) -> str | None:
+    """Why the launcher would refuse this file, or None; never returns the token."""
+    try:
+        read_token(env_file)
+    except LaunchError as exc:
+        return str(exc)
+    return None
+
+
 def server_env(base: dict[str, str], token: str) -> dict[str, str]:
-    env = {key: value for key, value in base.items() if key not in SCRUBBED_KEYS}
+    env = {key: base[key] for key in INHERITED_KEYS if key in base}
     env[TOKEN_KEY] = token
     return env
 

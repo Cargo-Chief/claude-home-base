@@ -31,6 +31,21 @@ class NotionGuardTest(unittest.TestCase):
     def test_refuses_flags_inside_a_json_string_argument(self):
         self.assertIn("in_trash", self.call({"body": json.dumps({"in_trash": True})}))
 
+    def test_refuses_flags_the_server_would_decode_from_wrapped_strings(self):
+        inner = json.dumps({"new_str": "x", "allow_deleting_content": True})
+        for wrapped in (json.dumps(inner), json.dumps(json.dumps(inner)), "\ufeff" + inner, inner + "\u00a0"):
+            self.assertIn("allow_deleting_content", self.call({"type": "replace_content", "replace_content": wrapped}))
+
+    def test_refuses_truthy_strings_any_case_and_erase_content(self):
+        self.assertIn("in_trash", self.call({"in_trash": "TRUE"}))
+        self.assertIn("In_Trash", self.call({"In_Trash": True}))
+        self.assertIn("erase_content", self.call({"page_id": "p1", "erase_content": True}))
+
+    def test_allows_database_properties_named_like_flags(self):
+        self.assertIsNone(self.call({"properties": {"archived": {"checkbox": False}}}))
+        self.assertIsNone(self.call({"properties": {"Archived": {"checkbox": True}}}))
+        self.assertIsNone(self.call({"properties": json.dumps({"in_trash": {"checkbox": True}})}))
+
     def test_refuses_input_that_is_not_an_object(self):
         self.assertIsNotNone(refusal({"tool_input": "in_trash"}))
         self.assertIsNotNone(refusal({}))

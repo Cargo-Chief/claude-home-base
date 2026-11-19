@@ -24,7 +24,10 @@ class NotionLauncherTest(unittest.TestCase):
         os.chmod(self.env_file, mode)
 
     def test_reads_plain_exported_and_quoted_tokens(self):
-        for text in ("NOTION_TOKEN=ntn_a\n", "export NOTION_TOKEN=ntn_a\n", "# c\nNOTION_TOKEN='ntn_a'\n"):
+        for text in (
+            "NOTION_TOKEN=ntn_a\n", "export NOTION_TOKEN=ntn_a\n", "# c\nNOTION_TOKEN='ntn_a'\n",
+            "export NOTION_TOKEN=ntn_a  # ned integration\n", 'NOTION_TOKEN="ntn_a" # c\n',
+        ):
             self.write(text)
             self.assertEqual("ntn_a", read_token(self.env_file))
 
@@ -42,9 +45,13 @@ class NotionLauncherTest(unittest.TestCase):
             read_token(self.env_file)
         self.assertNotIn("secret-value", str(caught.exception))
 
-    def test_server_env_replaces_any_inherited_token(self):
-        env = server_env({"PATH": "/bin", "NOTION_TOKEN": "old", "OPENAPI_MCP_HEADERS": "{}"}, "new")
-        self.assertEqual({"PATH": "/bin", "NOTION_TOKEN": "new"}, env)
+    def test_server_env_is_an_allowlist_plus_the_file_token(self):
+        inherited = {
+            "PATH": "/bin", "HOME": "/h", "NOTION_TOKEN": "old", "OPENAPI_MCP_HEADERS": "{}",
+            "BASE_URL": "http://elsewhere", "HTTPS_PROXY": "http://p", "NODE_OPTIONS": "--require x",
+            "NODE_TLS_REJECT_UNAUTHORIZED": "0",
+        }
+        self.assertEqual({"PATH": "/bin", "HOME": "/h", "NOTION_TOKEN": "new"}, server_env(inherited, "new"))
 
     def test_launcher_execs_node_with_only_the_file_token(self):
         self.write("NOTION_TOKEN=from-file\n")

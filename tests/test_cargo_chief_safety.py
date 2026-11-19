@@ -1537,6 +1537,7 @@ class NotionMcpTest(unittest.TestCase):
         self.env_file = self.home / ".config" / "cargo-chief" / "notion.env"
         self.env_file.parent.mkdir(parents=True)
         self.env_file.write_text("NOTION_TOKEN=placeholder\n")
+        os.chmod(self.env_file, 0o600)
         self.cli = self.root / "pkg" / "bin" / "cli.mjs"
         self.cli.parent.mkdir(parents=True)
         self.cli.write_text("// stub\n")
@@ -1596,7 +1597,9 @@ class NotionMcpTest(unittest.TestCase):
     def test_unavailable_without_package_reviewed_version_env_file_or_node(self):
         self.assertIsNone(notion_unavailable_reason(self.cli, self.env_file))
         self.assertIn("missing", notion_unavailable_reason(self.root / "missing.mjs", self.env_file))
-        self.assertIn("is missing", notion_unavailable_reason(self.cli, self.root / "none"))
+        self.assertIn("not readable", notion_unavailable_reason(self.cli, self.root / "none"))
+        self.assertIn("mcp/notion", notion_unavailable_reason(self.root / "missing.mjs", self.env_file))
+        self.assertNotIn("node_modules;", notion_unavailable_reason(self.root / "missing.mjs", self.env_file))
         self.write_version("2.7.0")
         self.assertIn("not the reviewed", notion_unavailable_reason(self.cli, self.env_file))
         self.assertIsNone(notion_mcp_config(Path("/p"), self.cli, self.env_file))
@@ -1605,6 +1608,15 @@ class NotionMcpTest(unittest.TestCase):
             self.assertIn("node 20 or later", notion_unavailable_reason(self.cli, self.env_file))
         with mock.patch("cargo_chief_safety.shutil.which", return_value=None):
             self.assertEqual("node is not on PATH", notion_unavailable_reason(self.cli, self.env_file))
+
+    def test_unavailable_when_the_launcher_would_refuse_the_token_file(self):
+        os.chmod(self.env_file, 0o644)
+        self.assertIn("chmod 600", notion_unavailable_reason(self.cli, self.env_file))
+        self.assertIsNone(notion_mcp_config(Path("/p"), self.cli, self.env_file))
+        os.chmod(self.env_file, 0o600)
+        self.env_file.write_text("OTHER=1\n")
+        reason = notion_unavailable_reason(self.cli, self.env_file)
+        self.assertIn("NOTION_TOKEN is not set", reason)
 
     def test_thread_command_declares_notion_denies_and_guards_it(self):
         command = self.command()

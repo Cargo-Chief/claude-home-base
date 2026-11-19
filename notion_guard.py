@@ -11,26 +11,58 @@ from __future__ import annotations
 import json
 import sys
 
-REMOVAL_FLAGS = {"in_trash", "archived", "is_archived", "allow_deleting_content"}
+# erase_content is not in the pinned spec, but the server forwards undeclared body keys.
+REMOVAL_FLAGS = {"in_trash", "archived", "is_archived", "allow_deleting_content", "erase_content"}
+# The server JS-trims a string argument and JSON-decodes it up to 3 times; decode at least as far.
+MAX_DECODE_PASSES = 8
+TRIMMED = " \t\n\r\f\v                 　﻿"
+
+
+def _decoded(value: str):
+    """The value as the server would deserialize it: unwrapped JSON, or the original string."""
+    current = value
+    for _ in range(MAX_DECODE_PASSES):
+        text = current.strip(TRIMMED)
+        if not (text.startswith(("{", "[")) or (len(text) >= 2 and text[0] == text[-1] == '"')):
+            return current
+        try:
+            current = json.loads(text)
+        except ValueError:
+            return current
+        if not isinstance(current, str):
+            return current
+    return current
+
+
+def _flag_set(value) -> bool:
+    """A flag is set by a true scalar; an object under the same key is a database property value."""
+    if isinstance(value, str):
+        decoded = _decoded(value)
+        if decoded is not value:
+            return _flag_set(decoded)
+        return value.strip(TRIMMED).lower() not in ("", "false", "0", "null", "none")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
 
 
 def _flags_set(value, prefix=""):
     """Dotted names of every removal flag set true, at any depth."""
-    if isinstance(value, dict):
+    if isinstance(value, str):
+        decoded = _decoded(value)
+        if decoded is not value:
+            yield from _flags_set(decoded, prefix)
+    elif isinstance(value, dict):
         for key, item in value.items():
             name = f"{prefix}.{key}" if prefix else str(key)
-            if key in REMOVAL_FLAGS and item not in (False, None, "false", "False", 0):
+            if str(key).lower() in REMOVAL_FLAGS and _flag_set(item):
                 yield name
             yield from _flags_set(item, name)
     elif isinstance(value, list):
         for index, item in enumerate(value):
             yield from _flags_set(item, f"{prefix}[{index}]")
-    elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
-        # Some MCP clients pass a nested object as a JSON string.
-        try:
-            yield from _flags_set(json.loads(value), prefix)
-        except ValueError:
-            return
 
 
 def refusal(event: dict) -> str | None:
