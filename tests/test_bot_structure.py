@@ -276,6 +276,9 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertEqual(2, process.count("record_user=not forward"))
         fallback = ast.unparse(self._function("_run_openai_fallback"))
         self.assertLess(fallback.index("raise _NoLiveSession()"), fallback.index("build_codex_command("))
+        self.assertIn("if resume_only and (not _codex_resumes_as(thread_ts, channel, user_id, session_id)):", fallback)
+        self.assertLess(fallback.index("session_id = saved_session_id if saved_cwd == cwd.resolve() else None"),
+                        fallback.index("if resume_only"))
         self.assertIn("user_id=user_id if record_user else None", fallback)
         self.assertIn("existing_only=bool(review_notice)", process)
         self.assertIn("except _NoLiveSession:", process)

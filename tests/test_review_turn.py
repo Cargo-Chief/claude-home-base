@@ -671,6 +671,7 @@ class StartReviewNoticeTest(unittest.TestCase):
         self.slack.chat_postMessage.side_effect = RuntimeError("slack down")
         self.start()
         self.assertEqual(1, self.notices.add.call_count)
+        self.assertEqual(1.0, self.notices.add.call_args.kwargs["at"])
         self.notices.add.reset_mock()
         self.start(refused="busy")
         self.notices.add.assert_not_called()

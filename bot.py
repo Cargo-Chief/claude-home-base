@@ -4061,7 +4061,7 @@ def _start_review_notice(entry: dict, event: dict) -> None:
             # No hand-back follows a refusal, so a restored record would only pin the thread.
             return
         try:
-            _review_notices.add(request_ts, pr=pr, channel=channel, thread=thread)
+            _review_notices.add(request_ts, pr=pr, channel=channel, thread=thread, at=entry.get("at"))
         except Exception:
             pass
 

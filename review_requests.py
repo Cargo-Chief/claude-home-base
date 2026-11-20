@@ -422,8 +422,10 @@ class ReviewNoticeStore:
             if isinstance(entry, dict) and isinstance(entry.get("at"), (int, float)) and entry["at"] > cutoff
         }
 
-    def add(self, request_ts: str, *, pr: str, channel: str, thread: str) -> None:
-        entry = {"pr": pr, "channel": channel, "thread": thread, "at": self.clock()}
+    def add(self, request_ts: str, *, pr: str, channel: str, thread: str, at: float | None = None) -> None:
+        """Record a request; a restored record passes its original ``at``."""
+        entry = {"pr": pr, "channel": channel, "thread": thread,
+                 "at": at if isinstance(at, (int, float)) else self.clock()}
         self._locked(lambda data: (data.__setitem__(request_ts, entry), True))
 
     def waiting_threads(self, max_age: float) -> set[str]:
@@ -856,7 +858,8 @@ class ReviewRequestHandler:
         except Exception as exc:
             logger.error(f"Could not wake {entry.get('thread')}: {type(exc).__name__}")
             try:
-                self.notices.add(request_ts, pr=pr, channel=entry["channel"], thread=entry["thread"])
+                self.notices.add(request_ts, pr=pr, channel=entry["channel"], thread=entry["thread"],
+                                 at=entry.get("at"))
             except Exception:
                 pass
 
