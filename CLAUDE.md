@@ -61,19 +61,22 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   from local state; the 24-hour cap store is only a rate limit. After the last pass a request runs a
   close-out, which reviews only what goes beyond the fixes and can still approve. See README
 - A peer's review ending wakes the thread that asked (`ReviewNoticeStore`, `_start_review_notice`),
-  but only a live session in that channel. Reviews queue (bounded) for their own session slot
+  but only a live Claude session in that channel, or a Codex fallback session the harness recorded
+  for that channel and person after the request (`_codex_notice_user`). Reviews queue (bounded) for their own session slot
   (`_review_slots`) and never evict; work eviction never takes a `waking` session or a thread with a
   recent request (`_waiting_threads`); with nothing evictable a new thread gets `SESSIONS_FULL_REPLY`
   (`_SessionsFull`), so that session is still live when the hand-back comes. A forwarded reply or a
   handoff (`evict_waiting`) may still evict a waiter, since refusing a one-shot turn loses it. A peer's
   refusal mentions a peer-bot requester (`_to_requester`) and ends the wait like a hand-back
   (`refusal_reason`, `_refused_back`, `refused` in the notice); keep `REFUSAL_REPLIES` complete when a
-  refusal reply is added. A notice never spawns a Claude process or starts a Codex session
-  (`existing_only` in `_get_or_create_live_session`). It resumes an existing Codex session only as
-  the person the harness recorded on it (`_codex_notice_user`, `_get_openai_session_owner`); its
-  Codex process always runs as `process_user` (the thread's person), never as the peer bot. The turn has `review_notice` authority, counts in `turn_senders`,
-  and reuses `from_handoff` to refuse a handoff, so `handoff_refusal` edits reach it too. Its bypasses in `process_message_async`, `is_review_ended`, and the prompt
-  line naming `review_notice_pr` change together. See README
+  refusal reply is added. A notice never spawns a Claude process (`existing_only` in
+  `_get_or_create_live_session`) or starts a Codex session (`resume_only` in `_run_openai_fallback`,
+  checked by `_codex_resumes_as` at run time, mid-turn limit replay included). Its processes run as
+  `process_user`, the thread's person, never as the peer bot; a forwarded reply never re-records
+  that person (`record_user`). The turn has `review_notice` authority, counts in `turn_senders`,
+  and reuses `from_handoff` to refuse a handoff, so `handoff_refusal` edits reach it too. Its
+  bypasses in `process_message_async`, `is_review_ended`, and the prompt line naming
+  `review_notice_pr` change together. See README
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:

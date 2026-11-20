@@ -593,16 +593,23 @@ def _get_session(thread_ts: str) -> str | None:
 
 def _load_openai_sessions() -> dict:
     try:
-        return json.loads(OPENAI_SESSION_FILE.read_text())
+        value = json.loads(OPENAI_SESSION_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    return value if isinstance(value, dict) else {}
 
 
-def _save_openai_session(thread_ts: str, session_id: str, cwd: Path, *, channel: str, user_id: str) -> None:
+def _save_openai_session(thread_ts: str, session_id: str, cwd: Path, *, channel: str, user_id: str | None) -> None:
+    """Record the thread's Codex session; ``user_id=None`` (a forwarded reply) keeps the recorded person."""
     with _session_file_lock:
         sessions = _load_openai_sessions()
+        previous = sessions.get(thread_ts)
+        if user_id is None:
+            same_room = isinstance(previous, dict) and previous.get("channel") == channel
+            user_id = previous.get("user", "") if same_room else ""
         sessions[thread_ts] = {
             "session_id": session_id, "cwd": str(cwd.resolve()), "channel": channel, "user": user_id,
+            "saved_at": time.time(),
         }
         if len(sessions) > MAX_SESSIONS:
             for key in sorted(sessions.keys())[:-MAX_SESSIONS]:
@@ -626,13 +633,13 @@ def _get_openai_session_cwd(thread_ts: str) -> Path | None:
     return None
 
 
-def _get_openai_session_owner(thread_ts: str) -> tuple[str, str]:
-    """The channel and person of the thread's last Codex turn, as the harness recorded them."""
-    value = _load_openai_sessions().get(thread_ts)
-    if not isinstance(value, dict):
-        return "", ""
-    channel, user = value.get("channel"), value.get("user")
-    return (channel if isinstance(channel, str) else "", user if isinstance(user, str) else "")
+def _get_openai_session_record(thread_ts: str) -> dict:
+    """The thread's Codex session record, read under the writers' lock; {} if none or malformed."""
+    with _session_file_lock:
+        value = _load_openai_sessions().get(thread_ts)
+    if not isinstance(value, dict) or not isinstance(value.get("session_id"), str):
+        return {}
+    return value
 
 
 def _clear_openai_session(thread_ts: str) -> None:
@@ -2242,8 +2249,14 @@ def _run_openai_fallback(
     prompt: str,
     on_text,
     max_duration: float = MAX_TURN_RUNTIME,
+    record_user: bool = True,
+    resume_only: bool = False,
 ) -> tuple[str | None, ThreadWorkspace]:
-    """Run one profile-governed Codex turn, apply the shared harness claims, and return the session and workspace."""
+    """Run one profile-governed Codex turn, apply the shared harness claims, and return the session and workspace.
+
+    ``resume_only`` (a review notice) raises ``_NoLiveSession`` unless the thread's recorded Codex
+    session resumes in this cwd as ``user_id``. ``record_user=False`` keeps the recorded person.
+    """
     validate_codex_runtime()
     for warning in preflight_room(policy):
         logger.warning(f"Cargo Chief fallback preflight: {warning}")
@@ -2276,6 +2289,8 @@ def _run_openai_fallback(
     saved_session_id = _get_openai_session(thread_ts)
     saved_cwd = _get_openai_session_cwd(thread_ts)
     session_id = saved_session_id if saved_cwd == cwd.resolve() else None
+    if resume_only and not _codex_resumes_as(thread_ts, channel, user_id, session_id):
+        raise _NoLiveSession()
     command = build_codex_command(policy, cwd=cwd, session_id=session_id)
     governed_prompt = build_codex_prompt(
         policy,
@@ -2342,7 +2357,8 @@ def _run_openai_fallback(
         _openai_stopped.discard(thread_ts)
     if result.session_id:
         session_id = result.session_id
-        _save_openai_session(thread_ts, session_id, cwd, channel=channel, user_id=user_id)
+        _save_openai_session(thread_ts, session_id, cwd, channel=channel,
+                             user_id=user_id if record_user else None)
 
     if workspace.bundle_claim_file.exists():
         try:
@@ -3092,6 +3108,8 @@ def process_message_async(
                     prompt=text,
                     on_text=on_text,
                     max_duration=max(0.001, turn_deadline - time.monotonic()),
+                    record_user=not forward,
+                    resume_only=bool(review_notice),
                 )
                 handoff_request = _take_handoff(
                     fallback_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
@@ -3279,6 +3297,25 @@ def process_message_async(
                             user_id=user_id, envelope=envelope, on_text=on_text,
                         )
                         review_continued = True
+                elif fallback_requested and review_notice:
+                    # A notice replays only by resuming the person's own Codex session; otherwise it says so.
+                    try:
+                        with _openai_turn_lock(thread_ts):
+                            audit_session_id, fallback_workspace = _run_openai_fallback(
+                                policy=room_policy,
+                                channel=channel,
+                                thread_ts=thread_ts,
+                                user_id=process_user,
+                                prompt=text,
+                                on_text=on_text,
+                                max_duration=max(0.001, turn_deadline - time.monotonic()),
+                                resume_only=True,
+                            )
+                    except _NoLiveSession:
+                        note = (REVIEW_REFUSED_LIMIT.format(pr=review_notice["pr"], reason=review_notice["refused"])
+                                if review_notice.get("refused") else REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"]))
+                        all_texts.append(note)
+                        post_response(channel, note, thread_ts=thread_ts)
                 elif fallback_requested:
                     fallback_context = _fetch_thread_context(channel, thread_ts, msg_ts)
                     fallback_prompt = text
@@ -3292,10 +3329,11 @@ def process_message_async(
                             policy=room_policy,
                             channel=channel,
                             thread_ts=thread_ts,
-                            user_id=process_user,
+                            user_id=user_id,
                             prompt=fallback_prompt,
                             on_text=on_text,
                             max_duration=max(0.001, turn_deadline - time.monotonic()),
+                            record_user=not forward,
                         )
 
                 # Check if the process died without producing a response
@@ -3931,6 +3969,14 @@ REVIEW_NOTICE_MESSAGE = (
     "Your peer agent's review turn on {pr} has ended. Read the verdict and its threads on the PR."
 )
 REVIEW_NOTICE_IDLE = "The peer review of {pr} has ended. Tell me to continue when ready."
+REVIEW_NOTICE_LIMIT = (
+    "I hit a usage limit while picking up the peer review of {pr}. Tell me to continue when ready, "
+    "and repeat anything you sent during that turn."
+)
+REVIEW_REFUSED_LIMIT = (
+    "The peer declined to review {pr}: {reason} I hit a usage limit before acting on it. Tell me to "
+    "continue when ready, and repeat anything you sent during that turn."
+)
 REVIEW_REFUSED_MESSAGE = (
     "Your peer agent declined to review {pr}: \"{reason}\" No review was posted on the PR."
 )
@@ -3958,18 +4004,28 @@ def _live_session_for(thread: str, channel: str) -> "LiveSession | None":
     return session
 
 
-def _codex_notice_user(thread: str, channel: str) -> str:
+def _codex_resumes_as(thread: str, channel: str, user: str, session_id: str | None) -> bool:
+    """Whether a notice may run the thread's Codex turn as ``user``: the recorded session, resumed."""
+    record = _get_openai_session_record(thread)
+    return bool(user and session_id and record and record.get("session_id") == session_id
+                and record.get("channel") == channel and record.get("user") == user)
+
+
+def _codex_notice_user(thread: str, channel: str, requested_at: float) -> str:
     """The person a notice may resume the thread's Codex fallback session as, or "" if it may not.
 
-    The owner comes from the harness's own session record, never from the requesting turn.
+    The person comes from the harness's own record of the thread's last Codex turn, which must
+    have ended after the review was requested, so the requesting turn cannot name another thread.
     """
-    if _get_openai_session(thread) is None:
+    record = _get_openai_session_record(thread)
+    if not record:
         return ""
     if not use_openai_provider(_get_provider_override(thread), limit_paused=_limit_paused(),
                                has_openai_session=True):
         return ""
-    owner_channel, user = _get_openai_session_owner(thread)
-    if not user or owner_channel != channel:
+    user, saved_at = record.get("user"), record.get("saved_at")
+    if (not isinstance(user, str) or not user or record.get("channel") != channel
+            or not isinstance(saved_at, (int, float)) or saved_at < requested_at):
         return ""
     try:
         return user if AuthorityPolicy.from_env().allows(user) else ""
@@ -4017,7 +4073,9 @@ def _start_review_notice(entry: dict, event: dict) -> None:
             # Its notice record is gone now, so mark it unevictable until its turn runs.
             session.waking = True
         elif _notice_room(channel):
-            codex_user = _codex_notice_user(thread, channel)
+            requested_at = entry.get("at")
+            if isinstance(requested_at, (int, float)):
+                codex_user = _codex_notice_user(thread, channel, requested_at)
         if session is None and not codex_user:
             if _notice_room(channel):
                 slack_client.chat_postMessage(channel=channel, thread_ts=thread, text=_notice_idle_text(review_notice))
