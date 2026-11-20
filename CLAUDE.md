@@ -68,10 +68,10 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   handoff (`evict_waiting`) may still evict a waiter, since refusing a one-shot turn loses it. A peer's
   refusal mentions a peer-bot requester (`_to_requester`) and ends the wait like a hand-back
   (`refusal_reason`, `_refused_back`, `refused` in the notice); keep `REFUSAL_REPLIES` complete when a
-  refusal reply is added. A notice never spawns a
-  process or runs on the Codex
-  fallback, because either would run as the peer bot (`existing_only` in
-  `_get_or_create_live_session`). The turn has `review_notice` authority, counts in `turn_senders`,
+  refusal reply is added. A notice never spawns a Claude process or starts a Codex session
+  (`existing_only` in `_get_or_create_live_session`). It resumes an existing Codex session only as
+  the person the harness recorded on it (`_codex_notice_user`, `_get_openai_session_owner`); its
+  Codex process always runs as `process_user` (the thread's person), never as the peer bot. The turn has `review_notice` authority, counts in `turn_senders`,
   and reuses `from_handoff` to refuse a handoff, so `handoff_refusal` edits reach it too. Its bypasses in `process_message_async`, `is_review_ended`, and the prompt
   line naming `review_notice_pr` change together. See README
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock

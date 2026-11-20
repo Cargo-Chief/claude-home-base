@@ -102,10 +102,14 @@ from the peer bot as a hand-back, never as a request; a matched one is taken onc
 live in that channel, so a forged origin cannot start a turn elsewhere: home-base posts a note
 there and steers in a turn whose sender is the peer bot with `review_notice` authority (no operator
 or approver authority, no reply routes, no handoff; steered into a running turn it counts as a
-second sender, so that turn cannot hand off either). It never spawns a process, never runs on the
-Codex fallback (at the start or after a mid-turn credit limit), and never takes a stopping or
-review session: in each of those cases a configured work room (a non-review `channels` entry) gets
-only a "tell me to continue" note. A failure before the thread hears anything puts the record
+second sender, so that turn cannot hand off either). A thread on the Codex fallback is woken the same
+way when it has an existing Codex session whose recorded channel and person (written by the harness
+on every Codex turn, never by the requesting turn) match the record, and that person is still
+authorized: the turn's sender is still the peer bot, but its process runs as that person, as a
+live Claude session's does. A Claude notice turn that hits a credit limit mid-turn replays on Codex
+the same way. A notice never spawns a Claude process, never starts a Codex session, and never takes
+a stopping or review session: in each of those cases a configured work room (a non-review
+`channels` entry) gets only a "tell me to continue" note. A failure before the thread hears anything puts the record
 back. Each outcome writes a `REVIEW_NOTICE` audit line. If charging the sender cap fails after the
 request posts, the CLI still reports it requested, with a warning not to request again.
 

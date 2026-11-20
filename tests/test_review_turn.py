@@ -52,7 +52,7 @@ PLAN = ReviewPlan("incremental", 2, 3, "a" * 40)
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "process_message_async", "_spawn_claude_process", "_get_or_create_live_session", "_clear_eyes",
-    "_review_still_runnable", "_notice_idle_text", "_start_review_notice",
+    "_review_still_runnable", "_notice_idle_text", "_start_review_notice", "_codex_notice_user",
 )
 CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone", "_SessionsFull")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
@@ -660,6 +660,8 @@ class StartReviewNoticeTest(unittest.TestCase):
         )
         # Compiled from bot.py by load(), so replaced afterwards.
         self.ns["process_message_async"] = lambda event, **kwargs: self.turns.append((event["text"], kwargs))
+        self.codex_user = ""
+        self.ns["_codex_notice_user"] = lambda thread, channel: self.codex_user
 
     def start(self, **extra):
         self.ns["_start_review_notice"]({**self.ENTRY, **extra}, {"user": "UPEER", "thread_ts": "7.1"})
@@ -684,6 +686,100 @@ class StartReviewNoticeTest(unittest.TestCase):
         self.assertEqual([], self.turns)
         self.assertEqual("declined P: busy Tell me to continue when ready.",
                          self.slack.chat_postMessage.call_args.kwargs["text"])
+
+    def test_a_codex_fallback_thread_is_woken_as_its_recorded_person(self):
+        self.codex_user = "UKIRK"
+        with self.assertLogs("test-review-turn-audit", level="INFO") as logs:
+            self.start()
+        self.assertEqual("read P", self.turns[0][0])
+        self.assertEqual({"pr": "P", "refused": "", "room_user": "UKIRK"}, self.turns[0][1]["review_notice"])
+        self.assertEqual("The peer review of P has ended; picking it up.",
+                         self.slack.chat_postMessage.call_args.kwargs["text"])
+        self.assertIn("OUTCOME:woken_codex", logs.output[-1])
+
+
+class CodexNoticeUserTest(unittest.TestCase):
+    """Who a notice may resume a Codex fallback thread as."""
+
+    def setUp(self):
+        self.session = "codex-1"
+        self.owner = ("D1", "UKIRK")
+        self.on_openai = True
+        self.ns = load(
+            _get_openai_session=lambda thread: self.session,
+            _get_openai_session_owner=lambda thread: self.owner,
+            use_openai_provider=lambda *args, **kwargs: self.on_openai,
+        )
+
+    def user(self, channel="D1"):
+        with mock.patch.dict(os.environ, ENV, clear=True):
+            return self.ns["_codex_notice_user"]("5.1", channel)
+
+    def test_the_recorded_authorized_person_in_the_same_channel(self):
+        self.assertEqual("UKIRK", self.user())
+
+    def test_nothing_without_a_codex_session_or_off_the_fallback(self):
+        self.session = None
+        self.assertEqual("", self.user())
+        self.session, self.on_openai = "codex-1", False
+        self.assertEqual("", self.user())
+
+    def test_nothing_for_another_channel_an_unrecorded_or_unauthorized_person(self):
+        self.assertEqual("", self.user(channel="D2"))
+        for owner in (("D1", ""), ("", "UKIRK"), ("D1", "USTRANGER")):
+            with self.subTest(owner=owner):
+                self.owner = owner
+                self.assertEqual("", self.user())
+
+
+class CodexNoticeTurnTest(unittest.TestCase):
+    """A notice turn on the Codex fallback: the peer bot speaks, the person's identity runs it."""
+
+    def setUp(self):
+        self.room = Room(review_only=False)
+        self.addCleanup(self.room.close)
+        self.runs = []
+        self.posts = []
+        self.session = "codex-1"
+        slack = mock.MagicMock()
+        slack.chat_postMessage.side_effect = lambda **kwargs: self.posts.append(kwargs["text"])
+
+        def run(**kwargs):
+            self.runs.append(kwargs)
+            return "codex-1", mock.MagicMock()
+
+        self.ns = load(
+            resolve_room_policy=lambda config, channel, user: self.room.policy,
+            peer_review_config=lambda config: mock.MagicMock(peer_bot_user_ids=frozenset({"UPEER"})),
+            use_openai_provider=lambda *args, **kwargs: True,
+            _get_openai_session=lambda thread: self.session,
+            _run_openai_fallback=run,
+            _take_handoff=lambda *args, **kwargs: None,
+            slack_client=slack,
+            REVIEW_NOTICE_IDLE="ended {pr}",
+        )
+
+    def notice(self):
+        event = {"type": "review_notice", "user": "UPEER", "channel": "D1", "channel_type": "im",
+                 "thread_ts": "5.1", "ts": "9.9", "text": f"read {PR}"}
+        with mock.patch.dict(os.environ, ENV, clear=True):
+            self.ns["process_message_async"](
+                event, review_notice={"pr": PR, "refused": "", "room_user": "UKIRK"},
+            )
+
+    def test_it_resumes_the_codex_session_as_the_person_with_peer_authority(self):
+        self.notice()
+        self.assertEqual(1, len(self.runs))
+        self.assertEqual("UKIRK", self.runs[0]["user_id"])
+        payload = json.loads(self.runs[0]["prompt"].split("\n\n", 1)[-1].splitlines()[1])
+        self.assertEqual("review_notice", payload["current_sender"]["authority"])
+        self.assertEqual(PR, payload["review_notice_pr"])
+
+    def test_it_never_starts_a_codex_session(self):
+        self.session = None
+        self.notice()
+        self.assertEqual([], self.runs)
+        self.assertEqual([f"ended {PR}"], self.posts)
 
 
 if __name__ == "__main__":
