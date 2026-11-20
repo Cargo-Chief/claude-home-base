@@ -52,7 +52,8 @@ PLAN = ReviewPlan("incremental", 2, 3, "a" * 40)
 BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "process_message_async", "_spawn_claude_process", "_get_or_create_live_session", "_clear_eyes",
-    "_review_still_runnable", "_notice_idle_text", "_start_review_notice",
+    "_review_still_runnable", "_notice_idle_text", "_start_review_notice", "_codex_notice_user", "_codex_resumes_as",
+    "_save_openai_session", "_load_openai_sessions", "_get_openai_session_record",
 )
 CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone", "_SessionsFull")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
@@ -644,7 +645,7 @@ class NoticeIdleTextTest(unittest.TestCase):
 
 
 class StartReviewNoticeTest(unittest.TestCase):
-    ENTRY = {"pr": "P", "channel": "D1", "thread": "5.1"}
+    ENTRY = {"pr": "P", "channel": "D1", "thread": "5.1", "at": 1.0}
 
     def setUp(self):
         self.slack = mock.MagicMock()
@@ -660,6 +661,8 @@ class StartReviewNoticeTest(unittest.TestCase):
         )
         # Compiled from bot.py by load(), so replaced afterwards.
         self.ns["process_message_async"] = lambda event, **kwargs: self.turns.append((event["text"], kwargs))
+        self.codex_user = ""
+        self.ns["_codex_notice_user"] = lambda thread, channel, requested_at: self.codex_user
 
     def start(self, **extra):
         self.ns["_start_review_notice"]({**self.ENTRY, **extra}, {"user": "UPEER", "thread_ts": "7.1"})
@@ -668,6 +671,7 @@ class StartReviewNoticeTest(unittest.TestCase):
         self.slack.chat_postMessage.side_effect = RuntimeError("slack down")
         self.start()
         self.assertEqual(1, self.notices.add.call_count)
+        self.assertEqual(1.0, self.notices.add.call_args.kwargs["at"])
         self.notices.add.reset_mock()
         self.start(refused="busy")
         self.notices.add.assert_not_called()
@@ -684,6 +688,153 @@ class StartReviewNoticeTest(unittest.TestCase):
         self.assertEqual([], self.turns)
         self.assertEqual("declined P: busy Tell me to continue when ready.",
                          self.slack.chat_postMessage.call_args.kwargs["text"])
+
+    def test_a_codex_fallback_thread_is_woken_as_its_recorded_person(self):
+        self.codex_user = "UKIRK"
+        with self.assertLogs("test-review-turn-audit", level="INFO") as logs:
+            self.start()
+        self.assertEqual("read P", self.turns[0][0])
+        self.assertEqual({"pr": "P", "refused": "", "room_user": "UKIRK"}, self.turns[0][1]["review_notice"])
+        self.assertEqual("The peer review of P has ended; picking it up.",
+                         self.slack.chat_postMessage.call_args.kwargs["text"])
+        self.assertIn("OUTCOME:woken_codex", logs.output[-1])
+
+
+class CodexNoticeUserTest(unittest.TestCase):
+    """Who a notice may resume a Codex fallback thread as."""
+
+    def setUp(self):
+        self.record = {"session_id": "codex-1", "channel": "D1", "user": "UKIRK", "saved_at": 100.0}
+        self.on_openai = True
+        self.ns = load(use_openai_provider=lambda *args, **kwargs: self.on_openai)
+        # Compiled from bot.py by load(), so replaced afterwards.
+        self.ns["_get_openai_session_record"] = lambda thread: self.record
+
+    def user(self, channel="D1", requested_at=90.0):
+        with mock.patch.dict(os.environ, ENV, clear=True):
+            return self.ns["_codex_notice_user"]("5.1", channel, requested_at)
+
+    def test_the_recorded_authorized_person_in_the_same_channel(self):
+        self.assertEqual("UKIRK", self.user())
+
+    def test_nothing_without_a_codex_session_or_off_the_fallback(self):
+        self.record = {}
+        self.assertEqual("", self.user())
+        self.record, self.on_openai = {"session_id": "codex-1", "channel": "D1", "user": "UKIRK", "saved_at": 100.0}, False
+        self.assertEqual("", self.user())
+
+    def test_nothing_for_another_channel_an_unrecorded_or_unauthorized_person(self):
+        self.assertEqual("", self.user(channel="D2"))
+        for change in ({"user": ""}, {"channel": ""}, {"user": "USTRANGER"}, {"saved_at": None}):
+            with self.subTest(change=change):
+                self.record = {"session_id": "codex-1", "channel": "D1", "user": "UKIRK", "saved_at": 100.0, **change}
+                self.assertEqual("", self.user())
+
+    def test_nothing_when_the_session_has_not_run_since_the_request(self):
+        # A requesting turn that names another thread finds no Codex turn there after its request.
+        self.assertEqual("", self.user(requested_at=101.0))
+
+    def test_a_run_resumes_only_the_recorded_session_as_its_person(self):
+        resumes = self.ns["_codex_resumes_as"]
+        self.assertTrue(resumes("5.1", "D1", "UKIRK", "codex-1"))
+        self.assertFalse(resumes("5.1", "D1", "UKIRK", None))
+        self.assertFalse(resumes("5.1", "D1", "UKIRK", "codex-2"))
+        self.assertFalse(resumes("5.1", "D1", "UOTHER", "codex-1"))
+        self.assertFalse(resumes("5.1", "D2", "UKIRK", "codex-1"))
+
+
+class CodexSessionRecordTest(unittest.TestCase):
+    """The harness records the thread's person on each Codex turn, except a forwarded reply."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.file = Path(self.temp.name) / "openai-sessions.json"
+        self.ns = load(
+            OPENAI_SESSION_FILE=self.file, _session_file_lock=threading.Lock(), MAX_SESSIONS=200,
+            write_private_json=lambda path, value: path.write_text(json.dumps(value)),
+        )
+
+    def save(self, user, channel="D1"):
+        self.ns["_save_openai_session"]("5.1", "codex-1", Path(self.temp.name), channel=channel, user_id=user)
+
+    def test_a_forwarded_reply_keeps_the_recorded_person(self):
+        self.save("UKIRK")
+        self.save(None)
+        record = self.ns["_get_openai_session_record"]("5.1")
+        self.assertEqual("UKIRK", record["user"])
+        self.assertIsInstance(record["saved_at"], float)
+
+    def test_a_forwarded_reply_into_another_room_records_no_one(self):
+        self.save("UKIRK")
+        self.save(None, channel="D2")
+        self.assertEqual("", self.ns["_get_openai_session_record"]("5.1")["user"])
+
+    def test_a_malformed_file_reads_as_empty(self):
+        self.file.write_text("[1, 2]")
+        self.assertEqual({}, self.ns["_get_openai_session_record"]("5.1"))
+        self.file.write_text('{"5.1": "legacy-id"}')
+        self.assertEqual({}, self.ns["_get_openai_session_record"]("5.1"))
+
+
+class CodexNoticeTurnTest(unittest.TestCase):
+    """A notice turn on the Codex fallback: the peer bot speaks, the person's identity runs it."""
+
+    def setUp(self):
+        self.room = Room(review_only=False)
+        self.addCleanup(self.room.close)
+        self.runs = []
+        self.posts = []
+        self.session = "codex-1"
+        slack = mock.MagicMock()
+        slack.chat_postMessage.side_effect = lambda **kwargs: self.posts.append(kwargs["text"])
+
+        def run(**kwargs):
+            self.runs.append(kwargs)
+            return "codex-1", mock.MagicMock()
+
+        self.ns = load(
+            resolve_room_policy=lambda config, channel, user: self.room.policy,
+            peer_review_config=lambda config: mock.MagicMock(peer_bot_user_ids=frozenset({"UPEER"})),
+            use_openai_provider=lambda *args, **kwargs: True,
+            _get_openai_session=lambda thread: self.session,
+            _run_openai_fallback=run,
+            _take_handoff=lambda *args, **kwargs: None,
+            slack_client=slack,
+            REVIEW_NOTICE_IDLE="ended {pr}",
+        )
+
+    def notice(self):
+        event = {"type": "review_notice", "user": "UPEER", "channel": "D1", "channel_type": "im",
+                 "thread_ts": "5.1", "ts": "9.9", "text": f"read {PR}"}
+        with mock.patch.dict(os.environ, ENV, clear=True):
+            self.ns["process_message_async"](
+                event, review_notice={"pr": PR, "refused": "", "room_user": "UKIRK"},
+            )
+
+    def test_it_resumes_the_codex_session_as_the_person_with_peer_authority(self):
+        self.notice()
+        self.assertEqual(1, len(self.runs))
+        self.assertEqual("UKIRK", self.runs[0]["user_id"])
+        self.assertTrue(self.runs[0]["resume_only"])
+        payload = json.loads(self.runs[0]["prompt"].split("\n\n", 1)[-1].splitlines()[1])
+        self.assertEqual("review_notice", payload["current_sender"]["authority"])
+        self.assertEqual(PR, payload["review_notice_pr"])
+
+    def test_a_refused_resume_leaves_the_note(self):
+        def refuse(**kwargs):
+            self.runs.append(kwargs)
+            raise self.ns["_NoLiveSession"]()
+
+        self.ns["_run_openai_fallback"] = refuse
+        self.notice()
+        self.assertEqual([f"ended {PR}"], self.posts)
+
+    def test_it_never_starts_a_codex_session(self):
+        self.session = None
+        self.notice()
+        self.assertEqual([], self.runs)
+        self.assertEqual([f"ended {PR}"], self.posts)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -697,14 +698,16 @@ class HandlerTest(unittest.TestCase):
 
     def test_a_failed_wake_restores_the_record(self):
         self.wire_notices()
-        self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1")
+        requested_at = time.time() - 60
+        self.notices.add("7.1", pr=PR, channel="CWORK", thread="5.1", at=requested_at)
 
         def broken(*args):
             raise RuntimeError("can't start new thread")
 
         self.handler.spawn = broken
         self.mention(user="UNED", bot_id="BNED", thread_ts="7.1", text=review_ended_text("ULISA", PR))
-        self.assertIsNotNone(self.notices.take("7.1", PR))
+        # The restored record keeps its request time, which the Codex wake compares against.
+        self.assertEqual(requested_at, self.notices.take("7.1", PR)["at"])
 
     def test_a_peer_refusal_in_a_recorded_thread_notifies_the_asking_thread_once(self):
         self.wire_notices()

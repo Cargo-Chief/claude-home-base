@@ -264,9 +264,22 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("if user_id not in peer_ids:", process[notice:notice + 300])
         self.assertIn("review_notice=review_notice['pr'] if review_notice else None", process)
         self.assertEqual(2, process.count("from_handoff=bool(handoff_from or review_notice)"))
-        self.assertLess(process.index("if review_notice and use_openai:"), process.index("_run_openai_fallback("))
+        self.assertLess(process.index("if review_notice and use_openai and (_get_openai_session(thread_ts) is None):"),
+                        process.index("_run_openai_fallback("))
+        self.assertIn("process_user = review_notice['room_user'] if review_notice else user_id", process)
+        # Both notice runs of Codex are resume-only, as the thread's person.
+        self.assertEqual(2, process.count("resume_only="))
+        self.assertIn("resume_only=bool(review_notice)", process)
+        self.assertIn("elif fallback_requested and review_notice:", process)
         self.assertLess(process.index("elif fallback_requested and review_notice:"),
                         process.index("elif fallback_requested:"))
+        self.assertEqual(2, process.count("record_user=not forward"))
+        fallback = ast.unparse(self._function("_run_openai_fallback"))
+        self.assertLess(fallback.index("raise _NoLiveSession()"), fallback.index("build_codex_command("))
+        self.assertIn("if resume_only and (not _codex_resumes_as(thread_ts, channel, user_id, session_id)):", fallback)
+        self.assertLess(fallback.index("session_id = saved_session_id if saved_cwd == cwd.resolve() else None"),
+                        fallback.index("if resume_only"))
+        self.assertIn("user_id=user_id if record_user else None", fallback)
         self.assertIn("existing_only=bool(review_notice)", process)
         self.assertIn("except _NoLiveSession:", process)
         factory = ast.unparse(self._function("_get_or_create_live_session"))
@@ -274,7 +287,10 @@ class BotTurnStructureTest(unittest.TestCase):
         start = ast.unparse(self._function("_start_review_notice"))
         self.assertLess(start.index("session = _live_session_for(thread, channel)"), start.index("chat_postMessage("))
         self.assertIn("restore(f'failed_{type(exc).__name__}')", start)
-        self.assertIn("review_notice={**review_notice, 'room_user': session.user_id}", start)
+        self.assertIn("room_user = codex_user or session.user_id", start)
+        self.assertIn("review_notice={**review_notice, 'room_user': room_user}", start)
+        self.assertLess(start.index("session = _live_session_for(thread, channel)"),
+                        start.index("codex_user = _codex_notice_user(thread, channel, requested_at)"))
         self.assertIn("review_notice = {'pr': pr, 'refused': refused}", start)
 
     def test_escalation_and_forwarding_refuse_review_only_rooms_server_side(self):

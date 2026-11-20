@@ -98,14 +98,24 @@ and that started, the reviewer's harness posts, once its claims are released, ex
 `<@requester> my review turn on <URL> has ended. Any verdict is on the PR; if there is none, the
 review stopped early.` in the request's thread. The requester's intake treats only that exact text
 from the peer bot as a hand-back, never as a request; a matched one is taken once (audited
-`review_ended`, else `review_ended_unmatched`). The thread is woken only while its own session is
-live in that channel, so a forged origin cannot start a turn elsewhere: home-base posts a note
-there and steers in a turn whose sender is the peer bot with `review_notice` authority (no operator
-or approver authority, no reply routes, no handoff; steered into a running turn it counts as a
-second sender, so that turn cannot hand off either). It never spawns a process, never runs on the
-Codex fallback (at the start or after a mid-turn credit limit), and never takes a stopping or
-review session: in each of those cases a configured work room (a non-review `channels` entry) gets
-only a "tell me to continue" note. A failure before the thread hears anything puts the record
+`review_ended`, else `review_ended_unmatched`). The thread is woken only in two cases, so a forged
+origin cannot start a turn elsewhere:
+
+- its own Claude session is live in that channel; or
+- it is on the Codex fallback, and the harness's record of its Codex session names that channel, a
+  person who is still authorized, and a Codex turn that ended after the request was sent. The
+  harness, not the requesting turn, writes that record after every Codex turn; a forwarded reply
+  keeps the person already recorded.
+
+Home-base posts a note there and runs a turn whose sender is the peer bot with `review_notice`
+authority (no operator or approver authority, no reply routes, no handoff; steered into a running
+turn it counts as a second sender, so that turn cannot hand off either). Any process the turn runs,
+runs as the thread's person, never as the peer bot. A notice never spawns a Claude process and never
+starts a Codex session: on Codex it runs only if the recorded session resumes in the thread's current
+directory as that same person, checked again when it runs (`resume_only`). That also holds when a
+Claude notice turn hits a credit limit mid-turn and replays on Codex. In every other case, and for a
+stopping or review session, a configured work room (a non-review `channels` entry) gets only a "tell
+me to continue" note. A failure before the thread hears anything puts the record
 back. Each outcome writes a `REVIEW_NOTICE` audit line. If charging the sender cap fails after the
 request posts, the CLI still reports it requested, with a warning not to request again.
 
