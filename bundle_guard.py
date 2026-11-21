@@ -175,7 +175,9 @@ def _mtime(path: Path) -> float:
 
 def _claimed(root: Path, work_dir: Path, claim_file: Path | None, cap: int) -> set[str]:
     """Bundles this thread may write: its binding, or a pending claim the turn-end check would accept."""
-    from cargo_chief_safety import SafetyError, _bound_bundles, _check_bundle_binding
+    from cargo_chief_safety import (
+        SafetyError, _bound_bundles, _check_bundle_binding, bundle_release_file, read_bundle_release,
+    )
 
     bound = _bound_bundles(root)
     others = {bundle for key, bundle in bound.items() if key != work_dir.name}
@@ -193,8 +195,18 @@ def _claimed(root: Path, work_dir: Path, claim_file: Path | None, cap: int) -> s
             if path.parent != work_dir and _read(path).strip() == pending
             and now - _mtime(path) < RIVAL_CLAIM_MAX_AGE
         }
+        release = bundle_release_file(claim_file)
+        freeing = read_bundle_release(release)
+        # A release frees a slot only if it names a bound bundle no other thread is also releasing.
+        if freeing not in bound.values() or any(
+            path.parent != work_dir and read_bundle_release(path) == freeing
+            for path in work_dir.parent.glob(f"*/{release.name}")
+        ):
+            freeing = None
         try:
-            _check_bundle_binding(root, pending, max_live_bundles=cap, replacing=work_dir.name)
+            _check_bundle_binding(
+                root, pending, max_live_bundles=cap, replacing=work_dir.name, freeing=freeing,
+            )
         except SafetyError:
             rivals.add("refused")
         if not rivals:
@@ -240,7 +252,7 @@ def refusal(event: dict, env: dict) -> str | None:
         f"this thread has not claimed {', '.join(unclaimed)}. If this thread owns that ticket, write "
         f"the bundle name to {claim or 'the bundle claim file'} first (a claim replaces any bundle the "
         "thread holds, and is refused while another thread holds or is claiming it, or the live cap "
-        "is reached); "
+        "is reached: --list-bundles shows the holders, and a release frees one); "
         "otherwise hand the work off"
     )
 

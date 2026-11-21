@@ -55,6 +55,20 @@ class BundleGuardTest(unittest.TestCase):
         ):
             self.assertIsNotNone(self.bash(command, cwd=str(self.mine / "c4")), command)
 
+    def test_a_pending_release_frees_a_slot_for_this_turns_claim(self):
+        self.env["CARGO_CHIEF_MAX_LIVE_BUNDLES"] = "1"
+        self.state("other", "CN-2-other")
+        self.claim.write_text("CN-1-mine")
+        refused = self.edit(str(self.mine / "c4" / "App.scala"))
+        self.assertIn("--list-bundles", refused)
+        (self.work / "bundle-release.txt").write_text("CN-3-third\n")
+        self.assertIsNotNone(self.edit(str(self.mine / "c4" / "App.scala")), "an unbound bundle frees nothing")
+        (self.work / "bundle-release.txt").write_text("CN-2-other\n")
+        self.assertIsNone(self.edit(str(self.mine / "c4" / "App.scala")))
+        rival = self.state("rival", None)
+        (rival / "bundle-release.txt").write_text("CN-2-other")
+        self.assertIsNotNone(self.edit(str(self.mine / "c4" / "App.scala")), "one release frees one slot")
+
     def test_ordinary_shell_forms_do_not_hide_a_git_write(self):
         bundle = f"{self.mine}/c4"
         for command in (

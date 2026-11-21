@@ -32,7 +32,10 @@ from cargo_chief_safety import (
     SafetyError,
     cleanup_thread_workspaces,
     check_bundle_handoff,
+    bundle_release_file,
     consume_bundle_claim,
+    consume_bundle_release,
+    live_bundle_holders,
     handoff_prompt,
     ticket_keys,
     transfer_bundle,
@@ -544,6 +547,115 @@ class RuntimePolicyTest(unittest.TestCase):
         second.bundle_claim_file.write_text("../../escape")
         with self.assertRaisesRegex(SafetyError, "bundle name"):
             consume_bundle_claim(second, max_live_bundles=3)
+
+    def test_cap_refusal_points_at_the_listing_without_naming_other_threads(self):
+        first = prepare_thread_workspace(self.workspace, channel="C1", thread="one")
+        second = prepare_thread_workspace(self.workspace, channel="C1", thread="two")
+        self._make_bundle("CN-1-first")
+        self._make_bundle("CN-2-second")
+        first.bundle_claim_file.write_text("CN-1-first")
+        consume_bundle_claim(first, max_live_bundles=1)
+        second.bundle_claim_file.write_text("CN-2-second")
+        with self.assertRaisesRegex(SafetyError, r"cap reached \(1 held\).*--list-bundles") as refused:
+            consume_bundle_claim(second, max_live_bundles=1)
+        self.assertNotIn("CN-1-first", str(refused.exception), "the refusal is posted in this thread's room")
+
+    def test_release_unbinds_an_idle_holder_and_leaves_the_worktree(self):
+        holder = prepare_thread_workspace(self.workspace, channel="C1", thread="waiting", now=10.0)
+        asker = prepare_thread_workspace(self.workspace, channel="C2", thread="urgent", now=20.0)
+        parked = self._make_bundle("CN-1-parked")
+        (parked / "TASK.md").write_text("# CN-1\n\n**Status:** waiting on the release train\n")
+        (parked / "uncommitted.txt").write_text("keep me")
+        self._make_bundle("CN-2-urgent")
+        holder.bundle_claim_file.write_text("CN-1-parked")
+        consume_bundle_claim(holder, max_live_bundles=1)
+        [listed] = live_bundle_holders(self.workspace)
+        self.assertEqual(("CN-1-parked", "C1", "waiting", "waiting on the release train"),
+                         (listed.bundle, listed.channel, listed.thread, listed.status))
+
+        asked = []
+        bundle_release_file(asker.bundle_claim_file).write_text("CN-1-parked\n")
+        release = consume_bundle_release(asker, busy=lambda channel, thread: asked.append((channel, thread)) or False)
+        self.assertEqual("CN-1-parked", release.bundle)
+        self.assertEqual([holder.key], [h.key for h in release.holders])
+        self.assertEqual([("C1", "waiting")], asked)
+        self.assertFalse(bundle_release_file(asker.bundle_claim_file).exists())
+        self.assertIsNone(resolve_thread_bundle(holder))
+        self.assertEqual("keep me", (parked / "uncommitted.txt").read_text())
+        state = json.loads(holder.state_file.read_text())
+        self.assertEqual(("C1", "waiting"), (state["channel"], state["thread"]))
+
+        asker.bundle_claim_file.write_text("CN-2-urgent")
+        consume_bundle_claim(asker, max_live_bundles=1)
+        holder.bundle_claim_file.write_text("CN-1-parked")
+        with self.assertRaisesRegex(SafetyError, "cap reached"):
+            consume_bundle_claim(holder, max_live_bundles=1)
+
+    def test_release_refuses_a_busy_holder_an_unbound_bundle_and_bad_names(self):
+        holder = prepare_thread_workspace(self.workspace, channel="C1", thread="busy")
+        asker = prepare_thread_workspace(self.workspace, channel="C1", thread="asker")
+        self._make_bundle("CN-1-busy")
+        self._make_bundle("CN-2-free")
+        holder.bundle_claim_file.write_text("CN-1-busy")
+        consume_bundle_claim(holder, max_live_bundles=3)
+        release = bundle_release_file(asker.bundle_claim_file)
+
+        release.write_text("CN-1-busy")
+        with self.assertRaisesRegex(SafetyError, "mid-turn"):
+            consume_bundle_release(asker, busy=lambda channel, thread: True)
+        self.assertEqual("CN-1-busy", resolve_thread_bundle(holder).name)
+        self.assertFalse(release.exists())
+
+        release.write_text("CN-2-free")
+        with self.assertRaisesRegex(SafetyError, "not bound"):
+            consume_bundle_release(asker, busy=lambda channel, thread: False)
+        release.write_text("../CN-1-busy")
+        with self.assertRaisesRegex(SafetyError, "exactly one"):
+            consume_bundle_release(asker, busy=lambda channel, thread: False)
+        self.assertIsNone(consume_bundle_release(asker, busy=lambda channel, thread: True))
+
+        release.write_text("CN-1-busy" + " " * 300)
+        with self.assertRaisesRegex(SafetyError, "unsafe"):
+            consume_bundle_release(asker, busy=lambda channel, thread: False)
+        target = asker.path / "elsewhere.txt"
+        target.write_text("CN-1-busy")
+        release.symlink_to(target)
+        with self.assertRaisesRegex(SafetyError, "unsafe"):
+            consume_bundle_release(asker, busy=lambda channel, thread: False)
+        self.assertFalse(release.is_symlink())
+        self.assertEqual("CN-1-busy", resolve_thread_bundle(holder).name)
+
+    def test_an_agent_never_lists_or_releases_another_agents_bundle(self):
+        theirs = prepare_thread_workspace(self.workspace, channel="C1", thread="other-agent")
+        asker = prepare_thread_workspace(self.workspace, channel="C1", thread="asker")
+        self._make_bundle("CN-1-theirs")
+        theirs.bundle_claim_file.write_text("CN-1-theirs")
+        consume_bundle_claim(theirs, max_live_bundles=3)
+        real_stat = Path.stat
+
+        def other_owner(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == theirs.state_file:
+                return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                                       os.getuid() + 1, *tuple(result)[5:10]))
+            return result
+
+        with mock.patch.object(Path, "stat", other_owner):
+            self.assertEqual([], live_bundle_holders(self.workspace))
+            bundle_release_file(asker.bundle_claim_file).write_text("CN-1-theirs")
+            with self.assertRaisesRegex(SafetyError, "another agent"):
+                consume_bundle_release(asker, busy=lambda channel, thread: False)
+        self.assertEqual("CN-1-theirs", resolve_thread_bundle(theirs).name)
+
+    def test_a_thread_may_release_its_own_bundle_while_its_turn_runs(self):
+        own = prepare_thread_workspace(self.workspace, channel="C1", thread="own")
+        self._make_bundle("CN-1-own")
+        own.bundle_claim_file.write_text("CN-1-own")
+        consume_bundle_claim(own, max_live_bundles=3)
+        bundle_release_file(own.bundle_claim_file).write_text("CN-1-own")
+        release = consume_bundle_release(own, busy=lambda channel, thread: True)
+        self.assertEqual([own.key], [h.key for h in release.holders])
+        self.assertIsNone(resolve_thread_bundle(own))
 
     def test_ticket_keys_reads_whole_cn_keys_only(self):
         self.assertEqual(frozenset({"CN-9532", "CN-12"}), ticket_keys("*CN-9532 — x* see CN-12, not XCN-5 or CN-"))
