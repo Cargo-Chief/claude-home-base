@@ -61,8 +61,13 @@ class BundleGuardTest(unittest.TestCase):
         self.claim.write_text("CN-1-mine")
         refused = self.edit(str(self.mine / "c4" / "App.scala"))
         self.assertIn("--list-bundles", refused)
+        (self.work / "bundle-release.txt").write_text("CN-3-third\n")
+        self.assertIsNotNone(self.edit(str(self.mine / "c4" / "App.scala")), "an unbound bundle frees nothing")
         (self.work / "bundle-release.txt").write_text("CN-2-other\n")
         self.assertIsNone(self.edit(str(self.mine / "c4" / "App.scala")))
+        rival = self.state("rival", None)
+        (rival / "bundle-release.txt").write_text("CN-2-other")
+        self.assertIsNotNone(self.edit(str(self.mine / "c4" / "App.scala")), "one release frees one slot")
 
     def test_ordinary_shell_forms_do_not_hide_a_git_write(self):
         bundle = f"{self.mine}/c4"

@@ -579,8 +579,6 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(2, fallback.count("discard_handoff_claim(workspace.handoff_claim_file)"))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class BundleReleaseTest(unittest.TestCase):
@@ -631,7 +629,7 @@ class BundleReleaseTest(unittest.TestCase):
         [(thread, text)] = self.slack.posts
         self.assertEqual("1.0", thread)
         self.assertIn("claim the bundle again", text)
-        self.assertIn("https://slack/C2/2.0", text)
+        self.assertNotIn("https://slack", text, "a link to another channel's thread would leak it")
         self.assertTrue(any(line.startswith("BUNDLE_RELEASED") and "FROM_THREAD:1.0" in line for line in self.audit.lines))
 
     def test_a_busy_holder_keeps_its_bundle(self):
@@ -649,3 +647,56 @@ class BundleReleaseTest(unittest.TestCase):
         self.assertIn("Released", self.run_release(self.holder, thread="1.0", channel="C1"))
         self.assertEqual(["1.0"], self.retired)
         self.assertEqual([], self.slack.posts)
+
+    def test_a_holder_in_the_same_channel_gets_the_requesters_link(self):
+        from cargo_chief_safety import bundle_release_file
+        asker = prepare_thread_workspace(self.root, channel="C1", thread="3.0")
+        bundle_release_file(asker.bundle_claim_file).write_text("CN-1-waiting")
+        self.run_release(asker, thread="3.0", channel="C1")
+        [(_, text)] = self.slack.posts
+        self.assertIn("https://slack/C1/3.0", text)
+
+
+class ListBundlesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        bundle = self.root / "worktrees" / "CN-1-waiting"
+        bundle.mkdir(parents=True)
+        (bundle / "TASK.md").write_text("# CN-1\n\n**Status:** waiting on CI\n")
+        self.holder = prepare_thread_workspace(self.root, channel="C1", thread="1.0")
+        self.holder.bundle_claim_file.write_text("CN-1-waiting")
+        consume_bundle_claim(self.holder, max_live_bundles=3)
+        from cargo_chief_safety import live_bundle_holders
+        self.listing = _compile(("_thread_link", "_list_bundles_text"), {
+            "Path": Path,
+            "live_bundle_holders": live_bundle_holders,
+            "slack_client": FakeSlack(),
+            "RUNTIME_POLICY": type("RuntimePolicy", (), {"max_live_bundles": 3}),
+        })["_list_bundles_text"]
+
+    def env(self, **extra):
+        return {
+            "CARGO_CHIEF_ROOT": str(self.root),
+            "CARGO_CHIEF_BUNDLE_CLAIM_FILE": str(self.holder.bundle_claim_file),
+            "CARGO_CHIEF_THREAD_WORK_DIR": str(self.holder.path),
+            **extra,
+        }
+
+    def test_lists_each_holder_with_idle_time_link_and_untrusted_status(self):
+        updated = json.loads(self.holder.state_file.read_text())["updated_at"]
+        text = self.listing(self.env(), updated + 3 * 3600 + 5 * 60)
+        self.assertIn("1 of 3 live bundle slots in use", text)
+        self.assertIn("- CN-1-waiting (this thread): idle 3h05m, thread https://slack/C1/1.0", text)
+        self.assertIn("untrusted TASK.md status: waiting on CI", text)
+
+    def test_a_review_turn_without_a_claim_route_may_not_list(self):
+        env = self.env()
+        del env["CARGO_CHIEF_BUNDLE_CLAIM_FILE"]
+        with self.assertRaisesRegex(SystemExit, "unavailable"):
+            self.listing(env, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

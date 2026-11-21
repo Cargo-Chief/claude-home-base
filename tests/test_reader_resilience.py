@@ -314,6 +314,20 @@ class ReviewReaderTest(unittest.TestCase):
         )["_reader_loop"](session)
         self.assertEqual([], consumed)
 
+    def test_a_work_turn_applies_its_release_before_its_claim_and_shows_the_note(self):
+        order, posted = [], []
+        session = FakeSession([result()], on_text=posted.append)
+        session.workspace = type("W", (), {
+            "bundle_claim_file": Path(__file__), "parking_claim_file": Path(__file__ + ".none"), "root": Path("."),
+        })()
+        load_functions(
+            _apply_bundle_release=lambda *args, **kwargs: order.append("release") or "Released X",
+            consume_bundle_claim=lambda *args, **kwargs: order.append("claim"),
+            RUNTIME_POLICY=type("RuntimePolicy", (), {"max_live_bundles": 3}),
+        )["_reader_loop"](session)
+        self.assertEqual(["release", "claim"], order)
+        self.assertIn("Released X", posted)
+
     def test_stopping_a_review_kills_it_and_releases_the_request(self):
         session = self.review_session([])
         session.proc.alive = True

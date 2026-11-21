@@ -548,7 +548,7 @@ class RuntimePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "bundle name"):
             consume_bundle_claim(second, max_live_bundles=3)
 
-    def test_cap_refusal_names_the_bundles_holding_the_slots(self):
+    def test_cap_refusal_points_at_the_listing_without_naming_other_threads(self):
         first = prepare_thread_workspace(self.workspace, channel="C1", thread="one")
         second = prepare_thread_workspace(self.workspace, channel="C1", thread="two")
         self._make_bundle("CN-1-first")
@@ -556,8 +556,9 @@ class RuntimePolicyTest(unittest.TestCase):
         first.bundle_claim_file.write_text("CN-1-first")
         consume_bundle_claim(first, max_live_bundles=1)
         second.bundle_claim_file.write_text("CN-2-second")
-        with self.assertRaisesRegex(SafetyError, r"cap reached \(1\), held by CN-1-first.*--list-bundles"):
+        with self.assertRaisesRegex(SafetyError, r"cap reached \(1 held\).*--list-bundles") as refused:
             consume_bundle_claim(second, max_live_bundles=1)
+        self.assertNotIn("CN-1-first", str(refused.exception), "the refusal is posted in this thread's room")
 
     def test_release_unbinds_an_idle_holder_and_leaves_the_worktree(self):
         holder = prepare_thread_workspace(self.workspace, channel="C1", thread="waiting", now=10.0)
@@ -612,6 +613,17 @@ class RuntimePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "exactly one"):
             consume_bundle_release(asker, busy=lambda channel, thread: False)
         self.assertIsNone(consume_bundle_release(asker, busy=lambda channel, thread: True))
+
+        release.write_text("CN-1-busy" + " " * 300)
+        with self.assertRaisesRegex(SafetyError, "unsafe"):
+            consume_bundle_release(asker, busy=lambda channel, thread: False)
+        target = asker.path / "elsewhere.txt"
+        target.write_text("CN-1-busy")
+        release.symlink_to(target)
+        with self.assertRaisesRegex(SafetyError, "unsafe"):
+            consume_bundle_release(asker, busy=lambda channel, thread: False)
+        self.assertFalse(release.is_symlink())
+        self.assertEqual("CN-1-busy", resolve_thread_bundle(holder).name)
 
     def test_a_thread_may_release_its_own_bundle_while_its_turn_runs(self):
         own = prepare_thread_workspace(self.workspace, channel="C1", thread="own")

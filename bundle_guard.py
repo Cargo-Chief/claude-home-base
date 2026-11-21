@@ -195,10 +195,17 @@ def _claimed(root: Path, work_dir: Path, claim_file: Path | None, cap: int) -> s
             if path.parent != work_dir and _read(path).strip() == pending
             and now - _mtime(path) < RIVAL_CLAIM_MAX_AGE
         }
+        release = bundle_release_file(claim_file)
+        freeing = read_bundle_release(release)
+        # A release frees a slot only if it names a bound bundle no other thread is also releasing.
+        if freeing not in bound.values() or any(
+            path.parent != work_dir and read_bundle_release(path) == freeing
+            for path in work_dir.parent.glob(f"*/{release.name}")
+        ):
+            freeing = None
         try:
             _check_bundle_binding(
-                root, pending, max_live_bundles=cap, replacing=work_dir.name,
-                freeing=read_bundle_release(bundle_release_file(claim_file)),
+                root, pending, max_live_bundles=cap, replacing=work_dir.name, freeing=freeing,
             )
         except SafetyError:
             rivals.add("refused")
