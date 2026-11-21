@@ -612,8 +612,16 @@ def _task_status(root: Path, bundle: str) -> str:
     return ""
 
 
+def _owned_by_this_agent(state_file: Path) -> bool:
+    """Whether this Unix principal (this agent) owns a thread state file."""
+    try:
+        return state_file.stat().st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 def live_bundle_holders(root: Path) -> list[BundleHolder]:
-    """Every live bundle binding, least recently active first."""
+    """This agent's live bundle bindings, least recently active first; another agent's never appear."""
     holders = [
         BundleHolder(
             bundle=str(state["bundle"]),
@@ -624,6 +632,7 @@ def live_bundle_holders(root: Path) -> list[BundleHolder]:
             status=_task_status(root, str(state["bundle"])),
         )
         for key, state in _bound_states(root).items()
+        if _owned_by_this_agent(_thread_work_root(root) / key / "state.json")
     ]
     return sorted(holders, key=lambda holder: holder.updated_at)
 
@@ -758,6 +767,8 @@ def consume_bundle_release(
         with _BUNDLE_LOCK:
             holders = tuple(h for h in live_bundle_holders(workspace.root) if h.bundle == bundle)
             if not holders:
+                if bundle in _bound_bundles(workspace.root).values():
+                    raise SafetyError(f"{bundle} is held by another agent; an agent releases only its own bundles")
                 raise SafetyError(f"{bundle} is not bound to any thread")
             for holder in holders:
                 if holder.key != workspace.key and busy(holder.channel, holder.thread):
@@ -1869,9 +1880,10 @@ def _build_harness_prompt(
         "any bundle this thread already holds, so never claim a second ticket's bundle: hand that "
         "work off. Edits and git writes in a bundle this thread has not claimed are refused.\n"
         "- When the live-bundle cap blocks a claim, do not ask a person to clean up. Run this exact "
-        "command to see which threads hold the slots, least recently active first:\n"
+        "command to see which of your threads hold the slots, least recently active first:\n"
         f"  {shlex.quote(str(transport_python))} {shlex.quote(str(transport_script))} --list-bundles\n"
-        "  Any bundle idle and waiting on something outside a turn (a release, a deploy, CI, a "
+        "  You may release only your own bundles, never another agent's (the harness refuses). "
+        "Any bundle idle and waiting on something outside a turn (a release, a deploy, CI, a "
         "review, a timed recheck) may be released, this thread's own included, once its TASK.md "
         "says where the work stands and what resumes it. Uncommitted changes and unpushed commits "
         "are kept but are not saved anywhere else, so name them in that TASK.md. To release, "

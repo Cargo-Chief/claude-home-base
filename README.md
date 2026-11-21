@@ -427,7 +427,10 @@ parked waiting on a release, a deploy, CI or a review. Any work turn can free su
 prints the live bindings, least recently active first, with each holder's thread link, idle time and
 the `Status:` line of its `TASK.md`, labelled untrusted. Writing one bundle name to the thread's
 one-shot `bundle-release.txt` (beside `bundle-claim.txt`) asks the harness to unbind it at turn end,
-before that turn's claim is consumed. Only the thread-to-bundle mapping changes: the worktree,
+before that turn's claim is consumed. An agent releases only its own bundles: the listing and the
+release consider only thread state files this Unix principal owns, so even on a root shared by two
+agents one can never release the other's (`BUNDLE_RELEASE_REFUSED`, "held by another agent").
+Only the thread-to-bundle mapping changes: the worktree,
 branch, commits and any uncommitted files stay where they are. The harness refuses a holder that is
 busy: a Claude or Codex turn running, a background subagent still running, a review hand-back
 queued, or a live session for the same `thread_ts` in another channel. It closes the holder's idle

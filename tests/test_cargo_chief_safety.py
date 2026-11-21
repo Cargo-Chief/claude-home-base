@@ -625,6 +625,28 @@ class RuntimePolicyTest(unittest.TestCase):
         self.assertFalse(release.is_symlink())
         self.assertEqual("CN-1-busy", resolve_thread_bundle(holder).name)
 
+    def test_an_agent_never_lists_or_releases_another_agents_bundle(self):
+        theirs = prepare_thread_workspace(self.workspace, channel="C1", thread="other-agent")
+        asker = prepare_thread_workspace(self.workspace, channel="C1", thread="asker")
+        self._make_bundle("CN-1-theirs")
+        theirs.bundle_claim_file.write_text("CN-1-theirs")
+        consume_bundle_claim(theirs, max_live_bundles=3)
+        real_stat = Path.stat
+
+        def other_owner(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == theirs.state_file:
+                return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                                       os.getuid() + 1, *tuple(result)[5:10]))
+            return result
+
+        with mock.patch.object(Path, "stat", other_owner):
+            self.assertEqual([], live_bundle_holders(self.workspace))
+            bundle_release_file(asker.bundle_claim_file).write_text("CN-1-theirs")
+            with self.assertRaisesRegex(SafetyError, "another agent"):
+                consume_bundle_release(asker, busy=lambda channel, thread: False)
+        self.assertEqual("CN-1-theirs", resolve_thread_bundle(theirs).name)
+
     def test_a_thread_may_release_its_own_bundle_while_its_turn_runs(self):
         own = prepare_thread_workspace(self.workspace, channel="C1", thread="own")
         self._make_bundle("CN-1-own")
