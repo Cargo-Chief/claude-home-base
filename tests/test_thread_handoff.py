@@ -581,3 +581,71 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BundleReleaseTest(unittest.TestCase):
+    def setUp(self):
+        from cargo_chief_safety import bundle_release_file, consume_bundle_release
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for name in ("CN-1-waiting", "CN-2-mine"):
+            (self.root / "worktrees" / name).mkdir(parents=True)
+            (self.root / "worktrees" / name / "TASK.md").write_text("task\n")
+        self.holder = prepare_thread_workspace(self.root, channel="C1", thread="1.0")
+        self.holder.bundle_claim_file.write_text("CN-1-waiting")
+        consume_bundle_claim(self.holder, max_live_bundles=3)
+        self.asker = prepare_thread_workspace(self.root, channel="C2", thread="2.0")
+        self.release_file = bundle_release_file(self.asker.bundle_claim_file)
+        self.retired = []
+        self.busy = set()
+        self.slack = FakeSlack()
+        self.audit = RecordingLog()
+        audit_logger = logging.getLogger("test-bundle-release")
+        audit_logger.addHandler(self.audit)
+        audit_logger.propagate = False
+        audit_logger.setLevel(logging.INFO)
+        self.apply = _compile(("_thread_link", "_apply_bundle_release"), {
+            "ThreadWorkspace": ThreadWorkspace,
+            "SafetyError": SafetyError,
+            "consume_bundle_release": consume_bundle_release,
+            "_thread_busy": lambda channel, thread: thread in self.busy,
+            "_retire_source_session": lambda thread_ts: self.retired.append(thread_ts),
+            "audit_logger": audit_logger,
+            "logger": logging.getLogger("test-bundle-release-log"),
+            "slack_client": self.slack,
+        })["_apply_bundle_release"]
+
+    def run_release(self, workspace=None, thread="2.0", channel="C2"):
+        return self.apply(workspace or self.asker, user_id="U1", channel=channel, thread_ts=thread)
+
+    def test_without_a_claim_nothing_happens(self):
+        self.assertIsNone(self.run_release())
+        self.assertEqual(([], []), (self.slack.posts, self.retired))
+
+    def test_another_threads_idle_bundle_is_released_with_a_note_there(self):
+        self.release_file.write_text("CN-1-waiting")
+        self.assertIn("Released worktree bundle CN-1-waiting", self.run_release())
+        self.assertIsNone(resolve_thread_bundle(self.holder))
+        self.assertEqual(["1.0"], self.retired)
+        [(thread, text)] = self.slack.posts
+        self.assertEqual("1.0", thread)
+        self.assertIn("claim the bundle again", text)
+        self.assertIn("https://slack/C2/2.0", text)
+        self.assertTrue(any(line.startswith("BUNDLE_RELEASED") and "FROM_THREAD:1.0" in line for line in self.audit.lines))
+
+    def test_a_busy_holder_keeps_its_bundle(self):
+        self.busy.add("1.0")
+        self.release_file.write_text("CN-1-waiting")
+        self.assertIn("refused", self.run_release())
+        self.assertEqual("CN-1-waiting", resolve_thread_bundle(self.holder).name)
+        self.assertEqual(([], []), (self.slack.posts, self.retired))
+        self.assertTrue(any(line.startswith("BUNDLE_RELEASE_REFUSED") for line in self.audit.lines))
+
+    def test_releasing_this_threads_own_bundle_posts_no_note(self):
+        from cargo_chief_safety import bundle_release_file
+        bundle_release_file(self.holder.bundle_claim_file).write_text("CN-1-waiting")
+        self.busy.add("1.0")
+        self.assertIn("Released", self.run_release(self.holder, thread="1.0", channel="C1"))
+        self.assertEqual(["1.0"], self.retired)
+        self.assertEqual([], self.slack.posts)

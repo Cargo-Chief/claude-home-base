@@ -100,6 +100,10 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   `_spawn_claude_process`) except the ticket check, also refuses a rival pending claim, and it
   reuses `_validated_bundle_path`, `_bound_bundles` and `_check_bundle_binding`: a change to how
   bundles bind changes it too. It fails open. See README
+- A bundle release (`bundle-release.txt`, `consume_bundle_release`, `_apply_bundle_release`) unbinds
+  an idle thread's bundle at turn end, before the claim, at both the Claude and Codex turn-end
+  sites; `bundle_guard.py` counts a pending release as freed (`freeing` in `_check_bundle_binding`).
+  It never touches the worktree. `--list-bundles` reads the same bindings. See README
 - The headless browser is `mcp/playwright/` (pinned, `npm ci` per checkout) wired in by
   `cargo_chief_safety.browser_mcp_config`, `BROWSER_DENY_RULES` and the `browser_guard.py` hook.
   A pin bump changes `BROWSER_MCP_REVIEWED_VERSION` with the regenerated lockfile, after

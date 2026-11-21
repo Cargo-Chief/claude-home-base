@@ -79,6 +79,7 @@ def load_functions(**overrides):
         "contains_private_escalation_action": lambda *args: False,
         "private_escalation_status": lambda **kwargs: "escalated",
         "consume_bundle_claim": lambda *args, **kwargs: None,
+        "_apply_bundle_release": lambda *args, **kwargs: None,
         "_thread_ticket_keys": lambda *args: frozenset(),
         "consume_parking_claim": lambda *args, **kwargs: None,
         "prepare_thread_workspace": lambda *args, **kwargs: None,
@@ -308,6 +309,7 @@ class ReviewReaderTest(unittest.TestCase):
         })()
         load_functions(
             consume_bundle_claim=lambda *args, **kwargs: consumed.append("bundle"),
+            _apply_bundle_release=lambda *args, **kwargs: consumed.append("release"),
             consume_parking_claim=lambda *args, **kwargs: consumed.append("parking"),
         )["_reader_loop"](session)
         self.assertEqual([], consumed)

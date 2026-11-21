@@ -58,6 +58,8 @@ from cargo_chief_safety import (
     cleanup_thread_workspaces,
     check_bundle_handoff,
     consume_bundle_claim,
+    consume_bundle_release,
+    live_bundle_holders,
     consume_parking_claim,
     find_workspace_root,
     format_audit_metadata,
@@ -1415,7 +1417,14 @@ def _reader_loop(session: LiveSession) -> None:
                         channel=session.channel,
                         thread=session.thread_ts,
                     ))
-                # A review turn has no bundle binding or parking claim.
+                # A review turn has no bundle binding or parking claim. A release frees its slot first.
+                if not session.review and session.workspace:
+                    release_note = _apply_bundle_release(
+                        session.workspace, user_id=session.user_id, channel=session.channel,
+                        thread_ts=session.thread_ts,
+                    )
+                    if release_note and session._on_text:
+                        _deliver_text(session, release_note)
                 if not session.review and session.workspace and session.workspace.bundle_claim_file.exists():
                     try:
                         bundle = consume_bundle_claim(
@@ -2360,6 +2369,7 @@ def _run_openai_fallback(
         _save_openai_session(thread_ts, session_id, cwd, channel=channel,
                              user_id=user_id if record_user else None)
 
+    _apply_bundle_release(workspace, user_id=user_id, channel=channel, thread_ts=thread_ts, provider="openai")
     if workspace.bundle_claim_file.exists():
         try:
             claimed = consume_bundle_claim(
@@ -3492,6 +3502,54 @@ def _thread_ticket_keys(channel: str, thread_ts: str) -> frozenset[str]:
         return frozenset()
 
 
+def _thread_busy(channel: str, thread_ts: str) -> bool:
+    """Whether a Claude or Codex turn is running in this thread now (read without taking locks)."""
+    session = _live_sessions.get(thread_ts)
+    if session is not None and session.turn_lock.locked():
+        return True
+    openai_lock = _openai_turn_locks.get(thread_ts)
+    return bool(openai_lock and openai_lock.locked())
+
+
+def _apply_bundle_release(
+    workspace: ThreadWorkspace, *, user_id: str, channel: str, thread_ts: str, provider: str = "",
+) -> str | None:
+    """Consume this turn's bundle release claim; the line to show the turn, or None without a claim."""
+    via = f" | PROVIDER:{provider}" if provider else ""
+    try:
+        release = consume_bundle_release(workspace, busy=_thread_busy)
+    except (SafetyError, OSError, ValueError) as exc:
+        reason = str(exc) if isinstance(exc, SafetyError) else type(exc).__name__
+        audit_logger.warning(
+            "BUNDLE_RELEASE_REFUSED%s | USER:%s | CHANNEL:%s | THREAD:%s | REASON:%s",
+            via, user_id, channel, thread_ts, reason,
+        )
+        return f"Worktree bundle release refused: {reason}"
+    if release is None:
+        return None
+    requester = _thread_link(channel, thread_ts, "another thread")
+    for holder in release.holders:
+        audit_logger.info(
+            "BUNDLE_RELEASED%s | USER:%s | CHANNEL:%s | THREAD:%s | BUNDLE:%s | FROM_THREAD:%s",
+            via, user_id, channel, thread_ts, release.bundle, holder.thread,
+        )
+        _retire_source_session(holder.thread)
+        if holder.key == workspace.key:
+            continue
+        try:
+            slack_client.chat_postMessage(
+                channel=holder.channel, thread_ts=holder.thread,
+                text=(
+                    f"Released worktree bundle `{release.bundle}` from this thread to free a live-bundle "
+                    f"slot for {requester}. The worktree, branch and commits are untouched; claim the "
+                    "bundle again to continue here."
+                ),
+            )
+        except Exception as exc:
+            logger.warning(f"Could not post the release note in {holder.thread}: {type(exc).__name__}")
+    return f"Released worktree bundle {release.bundle}; its worktree is untouched."
+
+
 def _move_handoff_bundle(
     request: HandoffRequest, source: ThreadWorkspace, *, user_id: str, channel: str,
     source_thread: str, new_ts: str,
@@ -4477,6 +4535,10 @@ def main():
         help="When a reply lands in this new DM thread, route it into the live session for THREAD_TS instead of starting a new conversation. Requires the running bot server to have a live session for THREAD_TS.",
     )
     parser.add_argument(
+        "--list-bundles", action="store_true", dest="list_bundles",
+        help="List the live worktree bundle bindings (least recently active first) to choose one to release.",
+    )
+    parser.add_argument(
         "--request-review", metavar="PR_URL", dest="request_review",
         help="Ask the configured peer agent to review this agent's own open Cargo-Chief PR",
     )
@@ -4490,6 +4552,22 @@ def main():
         parser.error("--request-reboot-status accepts no other argument")
 
     # CLI modes — send and exit
+    if args.list_bundles:
+        root_value = os.environ.get("CARGO_CHIEF_ROOT", "")
+        if not root_value:
+            raise SystemExit("bundle listing route is unavailable")
+        own = Path(os.environ.get("CARGO_CHIEF_THREAD_WORK_DIR", "")).name
+        holders = live_bundle_holders(Path(root_value))
+        cap = os.environ.get("CARGO_CHIEF_MAX_LIVE_BUNDLES") or str(RUNTIME_POLICY.max_live_bundles)
+        print(f"{len(holders)} of {cap} live bundle slots in use")
+        now = time.time()
+        for holder in holders:
+            idle = max(0, int(now - holder.updated_at)) // 60
+            link = _thread_link(holder.channel, holder.thread, f"{holder.channel}/{holder.thread}")
+            mine = " (this thread)" if own and holder.key == own else ""
+            print(f"- {holder.bundle}{mine}: idle {idle // 60}h{idle % 60:02d}m, thread {link}")
+            print(f"    Status: {holder.status or '(none in TASK.md)'}")
+        return
     if args.request_review is not None:
         try:
             room = request_peer_review(

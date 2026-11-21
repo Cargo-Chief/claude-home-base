@@ -421,6 +421,18 @@ ticket key, or one Slack cannot return, does not restrict it), and caps live map
 the thread's private state and survives daemon/session restart; a resumed process starts in the
 validated bundle. A removed or invalid bundle safely falls back to the thread scratch directory.
 
+A bundle holds its slot for as long as a thread is bound to it, including while that thread is
+parked waiting on a release, a deploy, CI or a review. Any non-review turn can free such a slot
+itself. `bot.py --list-bundles` prints the live bindings, least recently active first, with each
+holder's thread link, idle time and the `Status:` line of its `TASK.md`. Writing one bundle name to
+the thread's one-shot `bundle-release.txt` (beside `bundle-claim.txt`) asks the harness to unbind
+it at turn end, before that turn's claim is consumed. Only the thread-to-bundle mapping changes:
+the worktree, branch, commits and any uncommitted files stay where they are. The harness refuses a
+holder with a Claude or Codex turn running, closes the holder's idle process (its next turn resumes
+outside the bundle, like a handoff source), posts a note in the holder's thread, and audits
+`BUNDLE_RELEASED` or `BUNDLE_RELEASE_REFUSED`. The released thread continues by claiming the bundle
+again, under the same cap. A cap refusal names the bundles holding the slots.
+
 A claim only binds at turn end, so a thread could otherwise work in a bundle by its path and never
 claim it, and none of these checks would see that bundle. The `bundle_guard.py` PreToolUse hook,
 installed on every non-review Claude turn, refuses `Edit`, `MultiEdit`, `Write` and `NotebookEdit`
@@ -432,7 +444,7 @@ GitHub App token script, subshells, backticks, `bash -c`, `$VAR` paths (includin
 in the same command) and `--work-tree=` are all seen; the cost
 is that a command mixing a write elsewhere with a mere mention of another bundle is refused too.
 The thread's bound bundle is allowed unless another thread also holds it, and so is a pending claim
-the turn-end check would accept (no other holder, under the live cap) and no other thread claimed
+the turn-end check would accept (no other holder, under the live cap after any pending release) and no other thread claimed
 in the last hour, so a bundle
 can be created, claimed and worked in the same turn; the ticket check still runs only when the claim
 is consumed. Other shell writes are not checked, and a guard fault lets the call through: it keeps the
