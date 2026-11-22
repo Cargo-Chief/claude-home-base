@@ -178,6 +178,7 @@ from session_lifecycle import (
     REVIEW_SESSION_SLOTS,
     ReviewSlots,
     TurnAdmission,
+    hold_thread_turn,
     needs_eviction,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -1100,6 +1101,10 @@ def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
 
 
 REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatically"
+# A Codex fallback turn cannot take input mid-run, so a message sent during one waits for it.
+FALLBACK_TURN_QUEUE_NOTE = (
+    "queued behind my current turn in this thread; it starts when that finishes. Reply `stop` to interrupt"
+)
 REVIEW_QUEUE_FULL_REPLY = QUEUE_FULL_REPLY
 
 
@@ -3117,8 +3122,12 @@ def process_message_async(
 
     try:
         if use_openai:
-            turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
-            with _openai_turn_lock(thread_ts):
+            # A harness-driven review notice has nobody waiting on it, so it queues silently.
+            queue_notice = None if review_notice else (
+                lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)
+            )
+            with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):
+                turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
                 audit_session_id, fallback_workspace = _run_openai_fallback(
                     policy=room_policy,
                     channel=channel,

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any, Callable
 
 
@@ -27,6 +28,20 @@ class TurnAdmission:
 
     def release(self) -> None:
         self._semaphore.release()
+
+
+@contextmanager
+def hold_thread_turn(lock: threading.Lock, on_queued: Callable[[], None] | None = None) -> Iterator[bool]:
+    """Hold a thread's turn lock, calling on_queued once if another turn already holds it."""
+    queued = not lock.acquire(blocking=False)
+    if queued:
+        if on_queued is not None:
+            on_queued()
+        lock.acquire()
+    try:
+        yield queued
+    finally:
+        lock.release()
 
 
 REVIEW_SESSION_SLOTS = 1  # peer-review sessions, held outside the work-session cap
