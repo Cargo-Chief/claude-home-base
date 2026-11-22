@@ -54,6 +54,13 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("claude_owner_env(os.environ)", ast.unparse(spawn))
         self.assertNotIn("{**os.environ}", ast.unparse(spawn))
 
+    def test_fallback_queue_note_is_only_for_a_persons_own_dm_message(self):
+        source = ast.unparse(self._function("process_message_async"))
+        self.assertIn(
+            "notify = is_dm and (not (review_notice or handoff_from or forward))", source,
+        )
+        self.assertIn("hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice)", source)
+
     def test_claude_stop_paths_stop_the_whole_process_tree(self):
         for name in ("_stop_unread_process", "_interrupt_session", "_stop_background_delegates"):
             source = ast.unparse(self._function(name))

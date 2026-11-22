@@ -1103,7 +1103,8 @@ def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
 REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatically"
 # A Codex fallback turn cannot take input mid-run, so a message sent during one waits for it.
 FALLBACK_TURN_QUEUE_NOTE = (
-    "queued behind my current turn in this thread; it starts when that finishes. Reply `stop` to interrupt"
+    "queued behind work already running in this thread; it starts automatically. "
+    "Reply `stop` to interrupt the running turn"
 )
 REVIEW_QUEUE_FULL_REPLY = QUEUE_FULL_REPLY
 
@@ -3122,9 +3123,10 @@ def process_message_async(
 
     try:
         if use_openai:
-            # A harness-driven review notice has nobody waiting on it, so it queues silently.
-            queue_notice = None if review_notice else (
-                lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)
+            # Only a person's own 1:1 DM message gets the note; shared rooms and harness turns stay silent.
+            notify = is_dm and not (review_notice or handoff_from or forward)
+            queue_notice = (
+                (lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)) if notify else None
             )
             with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):
                 turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
