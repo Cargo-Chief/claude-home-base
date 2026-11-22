@@ -88,6 +88,7 @@ from cargo_chief_safety import (
 )
 from agent_identity import canonical_identity_root, load_identity_context, validate_store
 from slack_prompting import (
+    addressed_to_bot,
     contains_private_escalation_action,
     needs_relevance_prefix,
     relevance_prefix,
@@ -3123,8 +3124,10 @@ def process_message_async(
 
     try:
         if use_openai:
-            # Only a person's own 1:1 DM message gets the note; shared rooms and harness turns stay silent.
-            notify = is_dm and not (review_notice or handoff_from or forward)
+            # Only a person's own message to the bot (DM or @mention) gets the note; harness turns stay silent.
+            notify = addressed_to_bot(event_type=event.get("type", ""), is_dm=is_dm) and not (
+                review_notice or handoff_from or forward
+            )
             queue_notice = (
                 (lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)) if notify else None
             )

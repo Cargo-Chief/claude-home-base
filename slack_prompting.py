@@ -35,6 +35,11 @@ def contains_private_escalation_action(
     return False
 
 
+def addressed_to_bot(*, event_type: str, is_dm: bool) -> bool:
+    """Whether Slack itself establishes the message is for this bot: a 1:1 DM or an @mention."""
+    return is_dm or event_type == "app_mention"
+
+
 def needs_relevance_prefix(
     *,
     event_type: str,
