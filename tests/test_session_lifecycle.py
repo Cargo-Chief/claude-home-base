@@ -8,6 +8,7 @@ from session_lifecycle import (
     PendingTools,
     ReviewSlots,
     TurnAdmission,
+    hold_thread_turn,
     needs_eviction,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -81,6 +82,45 @@ class SessionLifecycleTests(unittest.TestCase):
         waiter.join(timeout=1)
         self.assertFalse(waiter.is_alive())
         self.assertEqual([True], waited)
+
+    def test_hold_thread_turn_runs_at_once_without_notice_when_free(self):
+        lock = threading.Lock()
+        notices = []
+        with hold_thread_turn(lock, lambda: notices.append(1)) as queued:
+            self.assertFalse(queued)
+            self.assertTrue(lock.locked())
+        self.assertEqual([], notices)
+        self.assertFalse(lock.locked())
+
+    def test_hold_thread_turn_notices_once_and_waits_behind_a_running_turn(self):
+        lock = threading.Lock()
+        lock.acquire()
+        noticed = threading.Event()
+        entered = threading.Event()
+        results = []
+
+        def second_message():
+            with hold_thread_turn(lock, noticed.set) as queued:
+                results.append(queued)
+                entered.set()
+
+        waiter = threading.Thread(target=second_message)
+        waiter.start()
+        self.assertTrue(noticed.wait(timeout=1))
+        self.assertFalse(entered.is_set())
+        lock.release()
+        self.assertTrue(entered.wait(timeout=1))
+        waiter.join(timeout=1)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual([True], results)
+        self.assertFalse(lock.locked())
+
+    def test_hold_thread_turn_releases_when_the_turn_raises(self):
+        lock = threading.Lock()
+        with self.assertRaises(RuntimeError):
+            with hold_thread_turn(lock):
+                raise RuntimeError("turn failed")
+        self.assertFalse(lock.locked())
 
     def test_turn_admission_rejects_non_positive_limit(self):
         with self.assertRaisesRegex(ValueError, "positive"):

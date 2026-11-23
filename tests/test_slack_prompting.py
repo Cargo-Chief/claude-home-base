@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 
 from slack_prompting import (
+    addressed_to_bot,
     contains_private_escalation_action,
     needs_relevance_prefix,
     relevance_prefix,
@@ -50,6 +51,14 @@ class RelevancePrefixTests(unittest.TestCase):
                 content(f"{python} {Path(tmp) / 'other.py'} --escalate"),
                 target, python, transport
             ))
+
+    def test_dm_and_app_mention_are_addressed_to_the_bot(self):
+        self.assertTrue(addressed_to_bot(event_type="message", is_dm=True))
+        self.assertTrue(addressed_to_bot(event_type="app_mention", is_dm=False))
+
+    def test_unmentioned_shared_room_message_is_not_addressed_to_the_bot(self):
+        self.assertFalse(addressed_to_bot(event_type="message", is_dm=False))
+        self.assertFalse(addressed_to_bot(event_type="", is_dm=False))
 
     def test_explicit_app_mention_bypasses_model_relevance_filter(self):
         self.assertFalse(needs_relevance_prefix(

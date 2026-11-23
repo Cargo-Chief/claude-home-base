@@ -615,6 +615,11 @@ OpenAI rather than oscillating when Claude credits return.
 The approved routing equivalents are Sol/high for the owning thread, Sol/medium for bounded
 engineering, Terra/high for mechanical or high-volume work, and Luna/medium for read-only search.
 Fallback turns are serialized per Slack thread; the Claude path retains its live mid-turn steering.
+A Codex turn cannot take input mid-run, so a message that arrives during one waits for it and then
+gets its own full turn runtime. A person's message to the bot (a 1:1 DM, or an @mention in a shared
+room) also gets a one-line queued note (`FALLBACK_TURN_QUEUE_NOTE`, naming `stop`). Unaddressed
+shared-room messages, forwarded escalation replies, handoff briefs and review hand-back notices
+queue silently.
 Governed delegation metadata is written to
 `$CARGO_CHIEF_ROOT/work/home-base/delegation-audit.log`. Keeping this audit inside the workspace
 lets both Claude and OpenAI owning sessions append it without a filesystem-permission retry; the

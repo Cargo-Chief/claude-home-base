@@ -88,6 +88,7 @@ from cargo_chief_safety import (
 )
 from agent_identity import canonical_identity_root, load_identity_context, validate_store
 from slack_prompting import (
+    addressed_to_bot,
     contains_private_escalation_action,
     needs_relevance_prefix,
     relevance_prefix,
@@ -178,6 +179,7 @@ from session_lifecycle import (
     REVIEW_SESSION_SLOTS,
     ReviewSlots,
     TurnAdmission,
+    hold_thread_turn,
     needs_eviction,
     oldest_evictable_session,
     owner_stream_event_is_activity,
@@ -1100,6 +1102,11 @@ def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
 
 
 REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatically"
+# A Codex fallback turn cannot take input mid-run, so a message sent during one waits for it.
+FALLBACK_TURN_QUEUE_NOTE = (
+    "queued behind work already running in this thread; it starts automatically. "
+    "Reply `stop` to interrupt the running turn"
+)
 REVIEW_QUEUE_FULL_REPLY = QUEUE_FULL_REPLY
 
 
@@ -3117,8 +3124,15 @@ def process_message_async(
 
     try:
         if use_openai:
-            turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
-            with _openai_turn_lock(thread_ts):
+            # Only a person's own message to the bot (DM or @mention) gets the note; harness turns stay silent.
+            notify = addressed_to_bot(event_type=event.get("type", ""), is_dm=is_dm) and not (
+                review_notice or handoff_from or forward
+            )
+            queue_notice = (
+                (lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)) if notify else None
+            )
+            with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):
+                turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
                 audit_session_id, fallback_workspace = _run_openai_fallback(
                     policy=room_policy,
                     channel=channel,
