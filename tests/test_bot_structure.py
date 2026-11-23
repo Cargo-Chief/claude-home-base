@@ -78,7 +78,8 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertLess(source.index(race), source.index("with session.turn_lock:"))
         helper = self._flat("_take_thread_turn")
         self.assertIn("if not lock.acquire(blocking=False): raise _RerouteAfterTurn()", helper)
-        self.assertIn("if _thread_uses_openai(thread_ts): lock.release() raise _RerouteAfterTurn()", helper)
+        self.assertIn("try: moved = _thread_uses_openai(thread_ts) except BaseException: lock.release() raise", helper)
+        self.assertIn("if moved: lock.release() raise _RerouteAfterTurn()", helper)
 
     def test_a_claude_turn_takes_no_work_slot_while_another_turn_holds_the_thread(self):
         source = self._flat("process_message_async")
@@ -131,7 +132,11 @@ class BotTurnStructureTest(unittest.TestCase):
 
     def test_a_provider_switch_says_when_a_turn_is_still_running(self):
         source = ast.unparse(self._function("_maybe_provider_command"))
-        self.assertIn("if action != 'status' and _thread_turn_running(thread_ts):", source)
+        self.assertIn("before = _get_provider_override(thread_ts)", source)
+        self.assertIn(
+            "if (action == 'openai new' or (action != 'status' and before != _get_provider_override(thread_ts)))"
+            " and _thread_turn_running(thread_ts):", source,
+        )
 
     def test_claude_stop_paths_stop_the_whole_process_tree(self):
         for name in ("_stop_unread_process", "_interrupt_session", "_stop_background_delegates"):

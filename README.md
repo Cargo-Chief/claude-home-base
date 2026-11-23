@@ -617,16 +617,18 @@ OpenAI rather than oscillating when Claude credits return.
 The approved routing equivalents are Sol/high for the owning thread, Sol/medium for bounded
 engineering, Terra/high for mechanical or high-volume work, and Luna/medium for read-only search.
 One provider works a Slack thread at a time. A Codex turn and a non-review Claude turn each hold
-the thread's turn lock while they run, so a Claude turn never starts beside a running Codex turn,
-whether it was started by a message, a provider switch or a review hand-back notice. A message that
+the thread's turn lock while they run, so a message, a provider switch or a review hand-back notice
+does not start a Claude turn beside a running Codex turn. Three gaps remain: a message steered into
+a Claude turn just as it ends, a Claude process a timeout could not kill, and Claude background
+subagents still running after their turn. A message that
 finds the other provider's turn running waits for it without holding a work slot, then is routed
 again, so its provider and session are chosen after the wait. A review hand-back notice stays on
 the provider, and for Claude the session, it was first sent to; if that is gone it leaves the
 usual note. The Claude path keeps its live mid-turn steering. A Codex
 turn cannot take input mid-run, so a message that arrives during one waits for it and then gets
 its own full turn runtime. A person's message to the bot (a 1:1 DM, or an @mention in a shared
-room) that has to wait also gets a one-line queued note, once (`FALLBACK_TURN_QUEUE_NOTE`, naming
-`stop`). Unaddressed
+room) that waits behind a running Codex turn, or goes to Codex and waits behind any turn, also gets
+a one-line queued note, once (`FALLBACK_TURN_QUEUE_NOTE`, naming `stop`). Unaddressed
 shared-room messages, forwarded escalation replies, handoff briefs and review hand-back notices
 queue silently.
 Governed delegation metadata is written to

@@ -2849,7 +2849,12 @@ def _take_thread_turn(thread_ts: str) -> threading.Lock:
     lock = _openai_turn_lock(thread_ts)
     if not lock.acquire(blocking=False):
         raise _RerouteAfterTurn()
-    if _thread_uses_openai(thread_ts):
+    try:
+        moved = _thread_uses_openai(thread_ts)
+    except BaseException:
+        lock.release()
+        raise
+    if moved:
         lock.release()
         raise _RerouteAfterTurn()
     return lock
@@ -3188,9 +3193,12 @@ def process_message_async(
                 if woken is not None:
                     woken.waking = False
                 _clear_eyes(reaction_channel, reaction_msg_ts)
-                slack_client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
-                )
+                try:
+                    slack_client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
+                    )
+                except Exception as exc:
+                    logger.warning(f"Could not post the review notice note in {thread_ts}: {type(exc).__name__}")
                 return
         audit_session_id = _get_openai_session(thread_ts) if use_openai else None
         turn_admitted = False
@@ -4123,6 +4131,7 @@ def _maybe_provider_command(event: dict) -> bool:
         authority = AuthorityPolicy.from_env()
         if not authority.can_approve(user_id):
             raise SafetyError("named approver required")
+        before = _get_provider_override(thread_ts)
         if action == "auto":
             _set_provider_override(thread_ts, None)
         elif action == "openai new":
@@ -4138,7 +4147,9 @@ def _maybe_provider_command(event: dict) -> bool:
         )
         return True
     text = "Thread provider: openai (new session)" if action == "openai new" else f"Thread provider: {selected}"
-    if action != "status" and _thread_turn_running(thread_ts):
+    if (action == "openai new" or (action != "status" and before != _get_provider_override(thread_ts))) and (
+        _thread_turn_running(thread_ts)
+    ):
         text += f". {PROVIDER_SWITCH_WAIT_NOTE}"
     slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
     audit_logger.info(format_provider_audit(

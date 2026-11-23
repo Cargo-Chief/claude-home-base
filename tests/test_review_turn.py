@@ -915,10 +915,26 @@ class OneProviderPerThreadTest(unittest.TestCase):
     def test_a_claude_message_queued_for_a_slot_reroutes_when_the_thread_moved_to_codex(self):
         answers = iter([False, True, True, True])
         self.ns["_thread_uses_openai"] = lambda thread: next(answers)
+        admission = mock.MagicMock()
+        self.ns["_turn_admission"] = admission
         self.message()
         self.assertEqual([], self.sent)
         self.assertEqual(1, len(self.runs))
         self.assertFalse(self.lock.locked())
+        # The slot it waited for is given back before it waits for the thread.
+        self.assertEqual(1, admission.acquire.call_count)
+        self.assertEqual(1, admission.release.call_count)
+
+    def test_a_provider_lookup_error_never_leaks_the_thread_lock(self):
+        def broken(thread):
+            if self.lock.locked():
+                raise OSError("state file unreadable")
+            return False
+
+        self.ns["_thread_uses_openai"] = broken
+        self.message()
+        self.assertFalse(self.lock.locked())
+        self.assertEqual([], self.sent)
 
     def notice_setup(self):
         self.session.channel = "DKIRK"
