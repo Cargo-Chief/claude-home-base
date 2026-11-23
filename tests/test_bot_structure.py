@@ -63,6 +63,40 @@ class BotTurnStructureTest(unittest.TestCase):
         )
         self.assertIn("hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice)", source)
 
+    def test_a_claude_work_turn_holds_the_thread_turn_lock(self):
+        # AI-090: a Claude turn must never run beside the thread's Codex turn.
+        source = ast.unparse(self._function("process_message_async"))
+        enter = "thread_turn.enter_context(hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice))"
+        # Before the work slot, and again before turn_lock in case the steered-into turn ended.
+        self.assertEqual(2, source.count(enter))
+        self.assertLess(source.index(enter), source.index("_turn_admission.acquire("))
+        self.assertLess(source.rindex(enter), source.index("with session.turn_lock:"))
+        # The mid-turn limit replays already hold it; a non-reentrant lock must not be taken twice.
+        self.assertEqual(
+            2, source.count("with contextlib.nullcontext() if holds_thread_turn else _openai_turn_lock(thread_ts):")
+        )
+        self.assertNotIn("\n                    with _openai_turn_lock(thread_ts):", source)
+        finally_body = source[source.rindex("finally:"):]
+        self.assertIn("thread_turn.close()", finally_body)
+
+    def test_a_review_turn_never_takes_the_thread_turn_lock(self):
+        function = self._function("process_message_async")
+        guards = [
+            ast.unparse(node.test) for node in ast.walk(function)
+            if isinstance(node, ast.If) and any(
+                isinstance(statement, ast.Expr) and "thread_turn.enter_context(" in ast.unparse(statement)
+                for statement in node.body
+            )
+        ]
+        self.assertEqual(2, len(guards))
+        for guard in guards:
+            self.assertTrue(guard.startswith("not review"), guard)
+
+    def test_a_provider_switch_says_when_a_turn_is_still_running(self):
+        source = ast.unparse(self._function("_maybe_provider_command"))
+        self.assertIn("if _thread_turn_running(thread_ts):", source)
+        self.assertIn("PROVIDER_SWITCH_WAIT_NOTE", source)
+
     def test_claude_stop_paths_stop_the_whole_process_tree(self):
         for name in ("_stop_unread_process", "_interrupt_session", "_stop_background_delegates"):
             source = ast.unparse(self._function(name))
@@ -192,8 +226,10 @@ class BotTurnStructureTest(unittest.TestCase):
         )
 
         self.assertIs(parents[steering], parents[normal])
-        self.assertIsInstance(normal.body[0], ast.With)
-        turn_body = normal.body[0].body
+        # The first statement may take the thread turn lock (AI-090); the turn itself is the With.
+        turn = next(statement for statement in normal.body if isinstance(statement, ast.With))
+        self.assertIn("session.turn_lock", ast.unparse(turn.items[0]))
+        turn_body = turn.body
         calls = {node.func.id for statement in turn_body for node in ast.walk(statement)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertIn("_send_to_claude", calls)

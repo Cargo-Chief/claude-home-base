@@ -77,6 +77,11 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   and reuses `from_handoff` to refuse a handoff, so `handoff_refusal` edits reach it too. Its
   bypasses in `process_message_async`, `is_review_ended`, and the prompt line naming
   `review_notice_pr` change together. See README
+- One provider works a thread at a time. Every Codex turn and every non-review Claude turn holds the
+  thread's turn lock (`_openai_turn_lock`, entered through `thread_turn` in `process_message_async`
+  before the work slot), so a provider switch, a review notice or a message waits for the running
+  turn. Steering into a running Claude turn takes no lock, and the mid-turn limit replays reuse the
+  lock already held (the lock is not reentrant). Review turns never take it
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:

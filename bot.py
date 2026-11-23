@@ -20,6 +20,7 @@ Also supports proactive messaging and read access via CLI:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import logging.handlers
@@ -821,8 +822,15 @@ _openai_models_notified: dict[str, str] = {}
 
 
 def _openai_turn_lock(thread_ts: str) -> threading.Lock:
+    """The thread's turn lock. Every Codex turn and every Claude work turn holds it, so only one runs."""
     with _live_sessions_lock:
         return _openai_turn_locks.setdefault(thread_ts, threading.Lock())
+
+
+def _thread_turn_running(thread_ts: str | None) -> bool:
+    """Whether a work turn on either provider holds the thread now (lock-free read)."""
+    lock = _openai_turn_locks.get(thread_ts or "")
+    return bool(lock and lock.locked())
 
 # thread_ts → count of inbound messages seen in multi-person spaces (public
 # channels + group DMs). Used to re-inject the relevance reminder every
@@ -1106,6 +1114,10 @@ REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatic
 FALLBACK_TURN_QUEUE_NOTE = (
     "queued behind work already running in this thread; it starts automatically. "
     "Reply `stop` to interrupt the running turn"
+)
+PROVIDER_SWITCH_WAIT_NOTE = (
+    "A turn is still running in this thread; the next one starts on this provider after it ends. "
+    "Reply `stop` to interrupt it"
 )
 REVIEW_QUEUE_FULL_REPLY = QUEUE_FULL_REPLY
 
@@ -3121,16 +3133,19 @@ def process_message_async(
     session = None
     handoff_request = None
     handoff_source = None
+    # One provider at a time: a Claude work turn holds the same thread lock as a Codex turn.
+    thread_turn = contextlib.ExitStack()
+    holds_thread_turn = False
+    # Only a person's own message to the bot (DM or @mention) gets the note; harness turns stay silent.
+    notify = addressed_to_bot(event_type=event.get("type", ""), is_dm=is_dm) and not (
+        review_notice or handoff_from or forward
+    )
+    queue_notice = (
+        (lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)) if notify else None
+    )
 
     try:
         if use_openai:
-            # Only a person's own message to the bot (DM or @mention) gets the note; harness turns stay silent.
-            notify = addressed_to_bot(event_type=event.get("type", ""), is_dm=is_dm) and not (
-                review_notice or handoff_from or forward
-            )
-            queue_notice = (
-                (lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)) if notify else None
-            )
             with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):
                 turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
                 audit_session_id, fallback_workspace = _run_openai_fallback(
@@ -3174,6 +3189,10 @@ def process_message_async(
                 )
                 return
             if not (session and session.turn_lock.locked()):
+                if not review:
+                    # Wait out a running Codex turn before taking a work slot.
+                    thread_turn.enter_context(hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice))
+                    holds_thread_turn = True
                 if review:
                     slot = _review_slots.acquire(
                         REVIEW_QUEUE_WAIT, lambda: _post_queue_notice(channel, thread_ts, REVIEW_QUEUE_NOTE),
@@ -3247,6 +3266,10 @@ def process_message_async(
         # Acquire turn_lock — this serializes the send→wait cycle.
         # If another message is already being processed, we block here.
         if session:
+            if not review and not holds_thread_turn:
+                # The turn it would have steered into ended in between, so this starts a new turn.
+                thread_turn.enter_context(hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice))
+                holds_thread_turn = True
             with session.turn_lock:
                 turn_limit = min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME) if review else MAX_TURN_RUNTIME
                 turn_deadline = time.monotonic() + turn_limit
@@ -3334,7 +3357,7 @@ def process_message_async(
                 elif fallback_requested and review_notice:
                     # A notice replays only by resuming the person's own Codex session; otherwise it says so.
                     try:
-                        with _openai_turn_lock(thread_ts):
+                        with contextlib.nullcontext() if holds_thread_turn else _openai_turn_lock(thread_ts):
                             audit_session_id, fallback_workspace = _run_openai_fallback(
                                 policy=room_policy,
                                 channel=channel,
@@ -3358,7 +3381,7 @@ def process_message_async(
                             "\n\n[UNTRUSTED_FAILOVER_THREAD_CONTEXT]\n"
                             f"{fallback_context}\n[/UNTRUSTED_FAILOVER_THREAD_CONTEXT]"
                         )
-                    with _openai_turn_lock(thread_ts):
+                    with contextlib.nullcontext() if holds_thread_turn else _openai_turn_lock(thread_ts):
                         audit_session_id, fallback_workspace = _run_openai_fallback(
                             policy=room_policy,
                             channel=channel,
@@ -3440,6 +3463,7 @@ def process_message_async(
             _review_slots.release()
         if review_notice and session is not None:
             session.waking = False
+        thread_turn.close()
 
     duration = time.time() - start
 
@@ -3558,8 +3582,7 @@ def _thread_busy(channel: str, thread_ts: str) -> bool:
         session.turn_lock.locked() or session.waking or session.background_agents.running()
     ):
         return True
-    openai_lock = _openai_turn_locks.get(thread_ts)
-    return bool(openai_lock and openai_lock.locked())
+    return _thread_turn_running(thread_ts)
 
 
 def _apply_bundle_release(
@@ -4034,13 +4057,10 @@ def _maybe_provider_command(event: dict) -> bool:
             text=f"Provider control refused: {exc}",
         )
         return True
-    slack_client.chat_postMessage(
-        channel=channel, thread_ts=thread_ts,
-        text=(
-            "Thread provider: openai (new session)"
-            if action == "openai new" else f"Thread provider: {selected}"
-        ),
-    )
+    text = "Thread provider: openai (new session)" if action == "openai new" else f"Thread provider: {selected}"
+    if _thread_turn_running(thread_ts):
+        text += f". {PROVIDER_SWITCH_WAIT_NOTE}"
+    slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
     audit_logger.info(format_provider_audit(
         user=user_id, channel=channel, thread=thread_ts or "unknown",
         action=action, provider=selected,
