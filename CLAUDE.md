@@ -77,11 +77,16 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   and reuses `from_handoff` to refuse a handoff, so `handoff_refusal` edits reach it too. Its
   bypasses in `process_message_async`, `is_review_ended`, and the prompt line naming
   `review_notice_pr` change together. See README
-- One provider works a thread at a time. Every Codex turn and every non-review Claude turn holds the
-  thread's turn lock (`_openai_turn_lock`, entered through `thread_turn` in `process_message_async`
-  before the work slot), so a provider switch, a review notice or a message waits for the running
-  turn. Steering into a running Claude turn takes no lock, and the mid-turn limit replays reuse the
-  lock already held (the lock is not reentrant). Review turns never take it
+- One provider works a thread at a time. A Codex turn and a non-review Claude turn each hold the
+  thread's turn lock (`_openai_turn_lock`) while they run: the Claude path takes it non-blocking
+  just before `session.turn_lock` (`held_thread_lock`, released first in `finally`), and the
+  mid-turn limit replays reuse it (the lock is not reentrant). A message that finds it held raises
+  `_RerouteAfterTurn` before any work slot, waits in `_wait_for_thread_turn`, then runs
+  `process_message_async` again so provider and session are chosen after the wait; a Codex turn
+  re-checks the provider once it holds the lock. A reroute carries its claimed forward route
+  (`rerouted_forward`) and, for a notice, the session it woke (`woken`). Steering takes no lock;
+  review turns never take it. Not covered: a Claude process a timeout could not kill, and Claude
+  background subagents still running after their turn ended
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:

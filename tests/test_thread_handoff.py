@@ -554,7 +554,7 @@ class WiringTest(unittest.TestCase):
 
     def test_a_handoff_turn_skips_reply_routes_and_the_relevance_filter_and_marks_its_envelope(self):
         process = ast.unparse(_bot_function("process_message_async"))
-        self.assertIn("if not review and (not handoff_from) and (not review_notice):", process)
+        self.assertIn("if not review and (not handoff_from) and (not review_notice) and (forward is None):", process)
         self.assertIn("if not review and (not handoff_from) and (not review_notice) and needs_relevance_prefix(", process)
         self.assertIn("handoff_from=handoff_from", process)
 

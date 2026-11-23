@@ -6,6 +6,7 @@ test_reader_resilience.py. Every module global they read is stubbed.
 """
 
 import ast
+import contextlib
 import builtins
 import json
 import logging
@@ -55,7 +56,7 @@ FUNCTIONS = (
     "_review_still_runnable", "_notice_idle_text", "_start_review_notice", "_codex_notice_user", "_codex_resumes_as",
     "_save_openai_session", "_load_openai_sessions", "_get_openai_session_record",
 )
-CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone", "_SessionsFull")
+CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone", "_SessionsFull", "_RerouteAfterTurn")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
 ENV = {"AUTHORIZED_USERS": "UKIRK", "CARGO_CHIEF_APPROVERS": "UKIRK"}
 
@@ -112,6 +113,9 @@ def load(**overrides):
         "use_openai_provider": lambda *args, **kwargs: False,
         "_review_provider": lambda thread: "claude",
         "_codex_review_ready": lambda: True,
+        "contextlib": contextlib,
+        "_thread_turn_running": lambda thread: False,
+        "_thread_uses_openai": lambda thread: True,
     })
     namespace.update(overrides)
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -834,6 +838,97 @@ class CodexNoticeTurnTest(unittest.TestCase):
         self.session = None
         self.notice()
         self.assertEqual([], self.runs)
+        self.assertEqual([f"ended {PR}"], self.posts)
+
+
+class OneProviderPerThreadTest(unittest.TestCase):
+    """A Claude work turn never runs beside the thread's Codex turn; a message that finds one waits, then reroutes."""
+
+    def setUp(self):
+        self.room = Room(review_only=False)
+        self.addCleanup(self.room.close)
+        self.slack = mock.MagicMock()
+        self.posts = []
+        self.slack.chat_postMessage.side_effect = lambda **kwargs: self.posts.append(kwargs["text"])
+        self.lock = threading.Lock()
+        self.state = {"codex_running": False, "openai": False}
+        self.sent = []
+        self.runs = []
+        self.waits = []
+        self.session = FakeSession()
+
+        def send(session, text):
+            self.sent.append((text, self.lock.locked()))
+
+        def wait(thread_ts, queue_notice):
+            self.waits.append(thread_ts)
+            self.state["codex_running"] = False
+
+        def run(**kwargs):
+            self.runs.append(kwargs)
+            return "codex-1", mock.MagicMock()
+
+        self.ns = load(
+            resolve_room_policy=lambda config, channel, user: self.room.policy,
+            _send_to_claude=send,
+            slack_client=self.slack,
+            wait_for_turn_completion=lambda *args, **kwargs: True,
+            _take_handoff=lambda *args, **kwargs: None,
+            _openai_turn_lock=lambda thread: self.lock,
+            _thread_turn_running=lambda thread: self.state["codex_running"] or self.lock.locked(),
+            _wait_for_thread_turn=wait,
+            use_openai_provider=lambda *args, **kwargs: self.state["openai"],
+            _run_openai_fallback=run,
+            REVIEW_NOTICE_IDLE="ended {pr}",
+        )
+        self.ns["_get_or_create_live_session"] = lambda *args, **kwargs: self.session
+
+    def message(self, **kwargs):
+        event = {"user": "UKIRK", "channel": "DKIRK", "channel_type": "im", "thread_ts": "5.1", "ts": "6.1",
+                 "text": "carry on"}
+        with mock.patch.dict(os.environ, ENV, clear=True):
+            self.ns["process_message_async"](event, **kwargs)
+
+    def test_a_message_during_a_codex_turn_waits_then_runs_on_claude(self):
+        self.state["codex_running"] = True
+        self.message()
+        self.assertEqual(["5.1"], self.waits)
+        self.assertEqual(1, len(self.sent))
+        self.assertEqual([], self.runs)
+
+    def test_a_claude_turn_holds_the_thread_lock_while_it_runs_and_releases_it(self):
+        self.message()
+        self.assertEqual([True], [held for _, held in self.sent])
+        self.assertFalse(self.lock.locked())
+
+    def test_a_queued_codex_turn_reroutes_when_the_thread_moved_to_claude(self):
+        self.state["openai"] = True
+
+        def switched(thread):
+            self.state["openai"] = False
+            return False
+
+        self.ns["_thread_uses_openai"] = switched
+        self.message()
+        self.assertEqual([], self.runs)
+        self.assertEqual(1, len(self.sent))
+        self.assertFalse(self.lock.locked())
+
+    def test_a_rerouted_notice_wakes_only_the_session_it_was_sent_to(self):
+        woken = FakeSession()
+        woken.waking = True
+        self.session.channel = "DKIRK"
+        self.session.review = False
+        self.ns["_live_sessions"]["5.1"] = self.session
+        event = {"type": "review_notice", "user": "UPEER", "channel": "DKIRK", "channel_type": "im",
+                 "thread_ts": "5.1", "ts": "9.9", "text": f"read {PR}"}
+        self.ns["peer_review_config"] = lambda config: mock.MagicMock(peer_bot_user_ids=frozenset({"UPEER"}))
+        with mock.patch.dict(os.environ, ENV, clear=True):
+            self.ns["process_message_async"](
+                event, review_notice={"pr": PR, "refused": "", "room_user": "UKIRK", "woken": woken},
+            )
+        self.assertEqual([], self.sent)
+        self.assertFalse(woken.waking)
         self.assertEqual([f"ended {PR}"], self.posts)
 
 

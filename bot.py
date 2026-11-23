@@ -822,15 +822,29 @@ _openai_models_notified: dict[str, str] = {}
 
 
 def _openai_turn_lock(thread_ts: str) -> threading.Lock:
-    """The thread's turn lock. Every Codex turn and every Claude work turn holds it, so only one runs."""
+    """The thread's turn lock. A Codex turn and a non-review Claude turn each hold it while they run."""
     with _live_sessions_lock:
         return _openai_turn_locks.setdefault(thread_ts, threading.Lock())
 
 
 def _thread_turn_running(thread_ts: str | None) -> bool:
-    """Whether a work turn on either provider holds the thread now (lock-free read)."""
+    """Whether a turn on either provider holds the thread now (lock-free read)."""
     lock = _openai_turn_locks.get(thread_ts or "")
     return bool(lock and lock.locked())
+
+
+def _codex_turn_running(thread_ts: str) -> bool:
+    """Whether a Codex process is running for the thread now (lock-free read)."""
+    return _openai_processes.get(thread_ts) is not None
+
+
+def _thread_uses_openai(thread_ts: str) -> bool:
+    """The thread's provider as it resolves now."""
+    return use_openai_provider(
+        _get_provider_override(thread_ts),
+        limit_paused=_limit_paused(),
+        has_openai_session=_get_openai_session(thread_ts) is not None,
+    )
 
 # thread_ts → count of inbound messages seen in multi-person spaces (public
 # channels + group DMs). Used to re-inject the relevance reminder every
@@ -1110,14 +1124,14 @@ def _post_progress_notice(channel: str, thread_ts: str, note: str) -> None:
 
 
 REVIEW_QUEUE_NOTE = "queued behind another review; this one will start automatically"
-# A Codex fallback turn cannot take input mid-run, so a message sent during one waits for it.
+# A Codex fallback turn cannot take input mid-run, so a message sent during one waits for it, on either path.
 FALLBACK_TURN_QUEUE_NOTE = (
     "queued behind work already running in this thread; it starts automatically. "
     "Reply `stop` to interrupt the running turn"
 )
 PROVIDER_SWITCH_WAIT_NOTE = (
-    "A turn is still running in this thread; the next one starts on this provider after it ends. "
-    "Reply `stop` to interrupt it"
+    "A turn is still running in this thread. It finishes on its current provider; "
+    "the next turn uses the new one. Reply `stop` to interrupt it"
 )
 REVIEW_QUEUE_FULL_REPLY = QUEUE_FULL_REPLY
 
@@ -2826,11 +2840,25 @@ class _CodexReviewDone(Exception):
     """A review ran (or was deferred) on the Codex path; no Claude session belongs to the turn."""
 
 
+class _RerouteAfterTurn(Exception):
+    """Another provider's turn holds the thread; wait for it, then route the message again."""
+
+
+def _wait_for_thread_turn(thread_ts: str, queue_notice) -> None:
+    """Block until the thread's running turn ends, telling a person once if a Codex turn is what it waits on."""
+    lock = _openai_turn_lock(thread_ts)
+    if queue_notice is not None and _codex_turn_running(thread_ts):
+        queue_notice()
+    with lock:
+        pass
+
+
 def process_message_async(
     event: dict,
     review_admission: ReviewAdmission | None = None,
     handoff_from: str | None = None,
     review_notice: dict | None = None,
+    rerouted_forward: dict | None = None,
 ) -> None:
     """Process a message in a background thread.
 
@@ -2850,6 +2878,10 @@ def process_message_async(
     ``review_notice`` marks a turn home-base started because the peer's review of a PR this thread
     requested has ended. The sender is the peer bot with no operator or approver authority; the
     room is resolved for the person who owned the requesting turn.
+
+    A message that finds another provider's turn holding the thread waits for it, then runs this
+    function again (``rerouted_forward`` carries a route it already claimed), so the provider and
+    session are chosen after the wait. A rerouted notice carries the session it woke as ``woken``.
     """
     user_id = event.get("user", "")
     text = event.get("text", "").strip()
@@ -2893,9 +2925,10 @@ def process_message_async(
     # Escalation routes are approver-only and terminal: unauthorized replies
     # do not consume them, while duplicate/stale replies never fall through
     # into a new DM session. A review turn never consumes or creates a route.
-    forward = None
+    # A rerouted message already claimed its route; claiming again would find it consumed.
+    forward = rerouted_forward
     original_thread = None
-    if not review and not handoff_from and not review_notice:
+    if not review and not handoff_from and not review_notice and forward is None:
         route_result = _reply_routes.claim(
             from_channel=channel,
             from_thread=thread_ts,
@@ -3133,9 +3166,11 @@ def process_message_async(
     session = None
     handoff_request = None
     handoff_source = None
-    # One provider at a time: a Claude work turn holds the same thread lock as a Codex turn.
-    thread_turn = contextlib.ExitStack()
-    holds_thread_turn = False
+    # One provider works a thread at a time; a Claude work turn holds this lock while it runs.
+    held_thread_lock = None
+    reroute = False
+    # A rerouted notice wakes only the session it was first sent to.
+    woken = review_notice.get("woken") if review_notice else None
     # Only a person's own message to the bot (DM or @mention) gets the note; harness turns stay silent.
     notify = addressed_to_bot(event_type=event.get("type", ""), is_dm=is_dm) and not (
         review_notice or handoff_from or forward
@@ -3147,6 +3182,9 @@ def process_message_async(
     try:
         if use_openai:
             with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):
+                if not _thread_uses_openai(thread_ts):
+                    # The thread moved to Claude while this waited.
+                    raise _RerouteAfterTurn()
                 turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
                 audit_session_id, fallback_workspace = _run_openai_fallback(
                     policy=room_policy,
@@ -3177,6 +3215,8 @@ def process_message_async(
                 session = None
             if session and session.proc.poll() is not None:
                 session = None
+            if woken is not None and session is not woken:
+                session = None
             if review and session and session.turn_lock.locked():
                 # A review is never steered into a running process, and that process is not ours.
                 session = None
@@ -3189,10 +3229,9 @@ def process_message_async(
                 )
                 return
             if not (session and session.turn_lock.locked()):
-                if not review:
-                    # Wait out a running Codex turn before taking a work slot.
-                    thread_turn.enter_context(hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice))
-                    holds_thread_turn = True
+                if not review and _thread_turn_running(thread_ts):
+                    # A Codex turn (or a Claude turn finishing) holds the thread; take no slot while it runs.
+                    raise _RerouteAfterTurn()
                 if review:
                     slot = _review_slots.acquire(
                         REVIEW_QUEUE_WAIT, lambda: _post_queue_notice(channel, thread_ts, REVIEW_QUEUE_NOTE),
@@ -3266,10 +3305,11 @@ def process_message_async(
         # Acquire turn_lock — this serializes the send→wait cycle.
         # If another message is already being processed, we block here.
         if session:
-            if not review and not holds_thread_turn:
-                # The turn it would have steered into ended in between, so this starts a new turn.
-                thread_turn.enter_context(hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice))
-                holds_thread_turn = True
+            if not review:
+                lock = _openai_turn_lock(thread_ts)
+                if not lock.acquire(blocking=False):
+                    raise _RerouteAfterTurn()
+                held_thread_lock = lock
             with session.turn_lock:
                 turn_limit = min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME) if review else MAX_TURN_RUNTIME
                 turn_deadline = time.monotonic() + turn_limit
@@ -3357,7 +3397,7 @@ def process_message_async(
                 elif fallback_requested and review_notice:
                     # A notice replays only by resuming the person's own Codex session; otherwise it says so.
                     try:
-                        with contextlib.nullcontext() if holds_thread_turn else _openai_turn_lock(thread_ts):
+                        with contextlib.nullcontext() if held_thread_lock else _openai_turn_lock(thread_ts):
                             audit_session_id, fallback_workspace = _run_openai_fallback(
                                 policy=room_policy,
                                 channel=channel,
@@ -3381,7 +3421,7 @@ def process_message_async(
                             "\n\n[UNTRUSTED_FAILOVER_THREAD_CONTEXT]\n"
                             f"{fallback_context}\n[/UNTRUSTED_FAILOVER_THREAD_CONTEXT]"
                         )
-                    with contextlib.nullcontext() if holds_thread_turn else _openai_turn_lock(thread_ts):
+                    with contextlib.nullcontext() if held_thread_lock else _openai_turn_lock(thread_ts):
                         audit_session_id, fallback_workspace = _run_openai_fallback(
                             policy=room_policy,
                             channel=channel,
@@ -3425,6 +3465,8 @@ def process_message_async(
         return
     except _CodexReviewDone:
         pass
+    except _RerouteAfterTurn:
+        reroute = True
     except _SessionsFull:
         _clear_eyes(reaction_channel, reaction_msg_ts)
         logger.info(f"Refused new session for thread {thread_ts}: every work session is busy or waiting")
@@ -3455,15 +3497,28 @@ def process_message_async(
         )
         return
     finally:
+        if held_thread_lock is not None:
+            held_thread_lock.release()
         if review and session is not None:
             _close_review_session(session)
         if turn_admitted:
             _turn_admission.release()
         if review_slot_held:
             _review_slots.release()
-        if review_notice and session is not None:
+        if review_notice and session is not None and not reroute:
             session.waking = False
-        thread_turn.close()
+        if woken is not None and woken is not session:
+            woken.waking = False
+
+    if reroute:
+        _wait_for_thread_turn(thread_ts, queue_notice)
+        if review_notice and session is not None:
+            review_notice = {**review_notice, "woken": session}
+        process_message_async(
+            event, review_admission=review_admission, handoff_from=handoff_from, review_notice=review_notice,
+            rerouted_forward=forward,
+        )
+        return
 
     duration = time.time() - start
 
@@ -4058,7 +4113,7 @@ def _maybe_provider_command(event: dict) -> bool:
         )
         return True
     text = "Thread provider: openai (new session)" if action == "openai new" else f"Thread provider: {selected}"
-    if _thread_turn_running(thread_ts):
+    if action != "status" and _thread_turn_running(thread_ts):
         text += f". {PROVIDER_SWITCH_WAIT_NOTE}"
     slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
     audit_logger.info(format_provider_audit(
