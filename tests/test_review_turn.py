@@ -54,7 +54,7 @@ BOT = Path(__file__).parents[1] / "bot.py"
 FUNCTIONS = (
     "process_message_async", "_spawn_claude_process", "_get_or_create_live_session", "_clear_eyes",
     "_review_still_runnable", "_notice_idle_text", "_start_review_notice", "_codex_notice_user", "_codex_resumes_as",
-    "_save_openai_session", "_load_openai_sessions", "_get_openai_session_record",
+    "_save_openai_session", "_load_openai_sessions", "_get_openai_session_record", "_take_thread_turn",
 )
 CLASSES = ("_ReviewBusy", "_NoLiveSession", "_CodexReviewDone", "_SessionsFull", "_RerouteAfterTurn")
 PR = "https://github.com/Cargo-Chief/c4/pull/123"
@@ -115,7 +115,8 @@ def load(**overrides):
         "_codex_review_ready": lambda: True,
         "contextlib": contextlib,
         "_thread_turn_running": lambda thread: False,
-        "_thread_uses_openai": lambda thread: True,
+        "_thread_uses_openai": lambda thread: False,
+        "_openai_turn_lock": lambda thread: threading.Lock(),
     })
     namespace.update(overrides)
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(BOT), "exec"), namespace)
@@ -801,6 +802,7 @@ class CodexNoticeTurnTest(unittest.TestCase):
             resolve_room_policy=lambda config, channel, user: self.room.policy,
             peer_review_config=lambda config: mock.MagicMock(peer_bot_user_ids=frozenset({"UPEER"})),
             use_openai_provider=lambda *args, **kwargs: True,
+            _thread_uses_openai=lambda thread: True,
             _get_openai_session=lambda thread: self.session,
             _run_openai_fallback=run,
             _take_handoff=lambda *args, **kwargs: None,
@@ -878,6 +880,7 @@ class OneProviderPerThreadTest(unittest.TestCase):
             _thread_turn_running=lambda thread: self.state["codex_running"] or self.lock.locked(),
             _wait_for_thread_turn=wait,
             use_openai_provider=lambda *args, **kwargs: self.state["openai"],
+            _thread_uses_openai=lambda thread: self.state["openai"],
             _run_openai_fallback=run,
             REVIEW_NOTICE_IDLE="ended {pr}",
         )
@@ -902,35 +905,109 @@ class OneProviderPerThreadTest(unittest.TestCase):
         self.assertFalse(self.lock.locked())
 
     def test_a_queued_codex_turn_reroutes_when_the_thread_moved_to_claude(self):
-        self.state["openai"] = True
-
-        def switched(thread):
-            self.state["openai"] = False
-            return False
-
-        self.ns["_thread_uses_openai"] = switched
+        answers = iter([True, False, False, False])
+        self.ns["_thread_uses_openai"] = lambda thread: next(answers)
         self.message()
         self.assertEqual([], self.runs)
         self.assertEqual(1, len(self.sent))
         self.assertFalse(self.lock.locked())
 
-    def test_a_rerouted_notice_wakes_only_the_session_it_was_sent_to(self):
-        woken = FakeSession()
-        woken.waking = True
+    def test_a_claude_message_queued_for_a_slot_reroutes_when_the_thread_moved_to_codex(self):
+        answers = iter([False, True, True, True])
+        self.ns["_thread_uses_openai"] = lambda thread: next(answers)
+        self.message()
+        self.assertEqual([], self.sent)
+        self.assertEqual(1, len(self.runs))
+        self.assertFalse(self.lock.locked())
+
+    def notice_setup(self):
         self.session.channel = "DKIRK"
         self.session.review = False
+        self.session.waking = True
         self.ns["_live_sessions"]["5.1"] = self.session
+        self.ns["peer_review_config"] = lambda config: mock.MagicMock(peer_bot_user_ids=frozenset({"UPEER"}))
+
+    def notice(self):
         event = {"type": "review_notice", "user": "UPEER", "channel": "DKIRK", "channel_type": "im",
                  "thread_ts": "5.1", "ts": "9.9", "text": f"read {PR}"}
-        self.ns["peer_review_config"] = lambda config: mock.MagicMock(peer_bot_user_ids=frozenset({"UPEER"}))
         with mock.patch.dict(os.environ, ENV, clear=True):
-            self.ns["process_message_async"](
-                event, review_notice={"pr": PR, "refused": "", "room_user": "UKIRK", "woken": woken},
-            )
+            self.ns["process_message_async"](event, review_notice={"pr": PR, "refused": "", "room_user": "UKIRK"})
+
+    def test_a_notice_waits_for_the_codex_turn_then_wakes_its_session(self):
+        self.notice_setup()
+        self.state["codex_running"] = True
+        self.notice()
+        self.assertEqual(["5.1"], self.waits)
+        self.assertEqual(1, len(self.sent))
+        self.assertFalse(self.session.waking)
+
+    def test_a_notice_wakes_only_the_session_it_was_sent_to(self):
+        self.notice_setup()
+        self.state["codex_running"] = True
+        other = FakeSession()
+        other.channel, other.review, other.waking = "DKIRK", False, False
+
+        def replaced(thread_ts, queue_notice):
+            self.waits.append(thread_ts)
+            self.assertTrue(self.session.waking)
+            self.ns["_live_sessions"]["5.1"] = other
+            self.state["codex_running"] = False
+
+        self.ns["_wait_for_thread_turn"] = replaced
+        self.notice()
         self.assertEqual([], self.sent)
-        self.assertFalse(woken.waking)
+        self.assertFalse(self.session.waking)
         self.assertEqual([f"ended {PR}"], self.posts)
 
+    def test_a_notice_never_moves_provider_while_it_waits(self):
+        self.notice_setup()
+        self.state["codex_running"] = True
+
+        def switched(thread_ts, queue_notice):
+            self.waits.append(thread_ts)
+            self.state["codex_running"] = False
+            self.state["openai"] = True
+
+        self.ns["_wait_for_thread_turn"] = switched
+        self.notice()
+        self.assertEqual([], self.sent)
+        self.assertEqual([], self.runs)
+        self.assertFalse(self.session.waking)
+        self.assertEqual([f"ended {PR}"], self.posts)
+
+    def test_a_limit_replay_inside_a_claude_turn_reuses_the_held_lock(self):
+        class NoReentry:
+            def __init__(self):
+                self.inner = threading.Lock()
+
+            def acquire(self, blocking=True):
+                if blocking and self.inner.locked():
+                    raise AssertionError("the thread lock was taken twice")
+                return self.inner.acquire(blocking)
+
+            def release(self):
+                self.inner.release()
+
+            def locked(self):
+                return self.inner.locked()
+
+            __enter__ = lambda self: self.acquire()
+            __exit__ = lambda self, *exc: self.release()
+
+        self.lock = NoReentry()
+        self.ns["_openai_turn_lock"] = lambda thread: self.lock
+        self.session.limit_notices = set()
+
+        def limited(session, text):
+            session.limit_notices.add("limit")
+            session._on_text("limit")
+
+        self.ns["_send_to_claude"] = limited
+        self.ns["_enter_limit_pause"] = lambda text: None
+        self.ns["_fetch_thread_context"] = lambda *args: None
+        self.message()
+        self.assertEqual(1, len(self.runs))
+        self.assertFalse(self.lock.locked())
 
 if __name__ == "__main__":
     unittest.main()

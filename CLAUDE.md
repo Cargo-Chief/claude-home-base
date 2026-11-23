@@ -78,15 +78,19 @@ preflight. Keep broadly useful transport improvements separable so they can be p
   bypasses in `process_message_async`, `is_review_ended`, and the prompt line naming
   `review_notice_pr` change together. See README
 - One provider works a thread at a time. A Codex turn and a non-review Claude turn each hold the
-  thread's turn lock (`_openai_turn_lock`) while they run: the Claude path takes it non-blocking
-  just before `session.turn_lock` (`held_thread_lock`, released first in `finally`), and the
-  mid-turn limit replays reuse it (the lock is not reentrant). A message that finds it held raises
-  `_RerouteAfterTurn` before any work slot, waits in `_wait_for_thread_turn`, then runs
-  `process_message_async` again so provider and session are chosen after the wait; a Codex turn
-  re-checks the provider once it holds the lock. A reroute carries its claimed forward route
-  (`rerouted_forward`) and, for a notice, the session it woke (`woken`). Steering takes no lock;
-  review turns never take it. Not covered: a Claude process a timeout could not kill, and Claude
-  background subagents still running after their turn ended
+  thread's turn lock (`_openai_turn_lock`) while they run. The Claude path takes it with
+  `_take_thread_turn` (non-blocking, then a provider re-check) after its work slot and before any
+  session is spawned or evicted, or just before `session.turn_lock` when a steer missed its turn
+  (`held_thread_lock`, released first in `finally`); the mid-turn limit replays reuse it (the lock
+  is not reentrant). A message that finds it held raises `_RerouteAfterTurn`, releases any slot,
+  waits in `_wait_for_thread_turn`, and goes round the `while` loop in `process_message_async`, so
+  provider and session are chosen after the wait while the route claim, attachments and envelope
+  happen once, before the loop. A Codex turn re-checks the provider once it holds the lock. A
+  notice stays on the provider it was first routed to (`notice_on_codex`) and, on Claude, on the
+  session it woke (`woken`, kept `waking` through the wait); otherwise it leaves the idle note.
+  Steering takes no lock; review turns never take it. Not covered: a message steered in as a turn
+  ends, a Claude process a timeout could not kill, and Claude background subagents still running
+  after their turn ended
 - A turn's handoff claim (`thread_handoff.py`) is taken by `_take_handoff` inside the turn lock
   and acted on by `_start_handoff` after the turn completes. The handoff turn is never an approver
   and cannot hand off again. The coupled pieces are:

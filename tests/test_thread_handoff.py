@@ -554,7 +554,7 @@ class WiringTest(unittest.TestCase):
 
     def test_a_handoff_turn_skips_reply_routes_and_the_relevance_filter_and_marks_its_envelope(self):
         process = ast.unparse(_bot_function("process_message_async"))
-        self.assertIn("if not review and (not handoff_from) and (not review_notice) and (forward is None):", process)
+        self.assertIn("if not review and (not handoff_from) and (not review_notice):", process)
         self.assertIn("if not review and (not handoff_from) and (not review_notice) and needs_relevance_prefix(", process)
         self.assertIn("handoff_from=handoff_from", process)
 
@@ -567,7 +567,7 @@ class WiringTest(unittest.TestCase):
 
     def test_steering_records_the_sender_and_never_steers_a_handoff(self):
         process = ast.unparse(_bot_function("process_message_async"))
-        steer = process.index("if session and session.turn_lock.locked():\n            if handoff_from:")
+        steer = process.index("if session and session.turn_lock.locked():\n                if handoff_from:")
         self.assertLess(steer, process.index("session.turn_senders.add(user_id)"))
         self.assertIn("session.turn_senders = {user_id}", process)
 

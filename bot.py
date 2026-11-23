@@ -2844,6 +2844,17 @@ class _RerouteAfterTurn(Exception):
     """Another provider's turn holds the thread; wait for it, then route the message again."""
 
 
+def _take_thread_turn(thread_ts: str) -> threading.Lock:
+    """Take the thread's turn lock for a Claude turn, or reroute if another turn holds it or the thread moved to Codex."""
+    lock = _openai_turn_lock(thread_ts)
+    if not lock.acquire(blocking=False):
+        raise _RerouteAfterTurn()
+    if _thread_uses_openai(thread_ts):
+        lock.release()
+        raise _RerouteAfterTurn()
+    return lock
+
+
 def _wait_for_thread_turn(thread_ts: str, queue_notice) -> None:
     """Block until the thread's running turn ends, telling a person once if a Codex turn is what it waits on."""
     lock = _openai_turn_lock(thread_ts)
@@ -2858,7 +2869,6 @@ def process_message_async(
     review_admission: ReviewAdmission | None = None,
     handoff_from: str | None = None,
     review_notice: dict | None = None,
-    rerouted_forward: dict | None = None,
 ) -> None:
     """Process a message in a background thread.
 
@@ -2879,9 +2889,9 @@ def process_message_async(
     requested has ended. The sender is the peer bot with no operator or approver authority; the
     room is resolved for the person who owned the requesting turn.
 
-    A message that finds another provider's turn holding the thread waits for it, then runs this
-    function again (``rerouted_forward`` carries a route it already claimed), so the provider and
-    session are chosen after the wait. A rerouted notice carries the session it woke as ``woken``.
+    A message that finds another turn holding the thread waits for it without a work slot, then
+    routes again (the loop around the turn), so its provider and session are chosen after the wait.
+    A notice stays on the provider, and for Claude the session, it was first routed to.
     """
     user_id = event.get("user", "")
     text = event.get("text", "").strip()
@@ -2925,10 +2935,9 @@ def process_message_async(
     # Escalation routes are approver-only and terminal: unauthorized replies
     # do not consume them, while duplicate/stale replies never fall through
     # into a new DM session. A review turn never consumes or creates a route.
-    # A rerouted message already claimed its route; claiming again would find it consumed.
-    forward = rerouted_forward
+    forward = None
     original_thread = None
-    if not review and not handoff_from and not review_notice and forward is None:
+    if not review and not handoff_from and not review_notice:
         route_result = _reply_routes.claim(
             from_channel=channel,
             from_thread=thread_ts,
@@ -2993,11 +3002,7 @@ def process_message_async(
             )
         return
 
-    use_openai = use_openai_provider(
-        _get_provider_override(thread_ts),
-        limit_paused=_limit_paused(),
-        has_openai_session=_get_openai_session(thread_ts) is not None,
-    )
+    use_openai = _thread_uses_openai(thread_ts)
     if review:
         # A review picks its provider once it holds the review slot (_review_provider).
         use_openai = False
@@ -3158,367 +3163,387 @@ def process_message_async(
         first_text_sent = True
 
     start = time.time()
-    audit_session_id = _get_openai_session(thread_ts) if use_openai else None
-    turn_admitted = False
-    review_slot_held = False
-    review_on_codex = False
-    review_continued = False
-    session = None
-    handoff_request = None
-    handoff_source = None
-    # One provider works a thread at a time; a Claude work turn holds this lock while it runs.
-    held_thread_lock = None
-    reroute = False
-    # A rerouted notice wakes only the session it was first sent to.
-    woken = review_notice.get("woken") if review_notice else None
-    # Only a person's own message to the bot (DM or @mention) gets the note; harness turns stay silent.
+    # Only a person's own message to the bot (DM or @mention) gets the note, once; harness turns stay silent.
     notify = addressed_to_bot(event_type=event.get("type", ""), is_dm=is_dm) and not (
         review_notice or handoff_from or forward
     )
-    queue_notice = (
-        (lambda: _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)) if notify else None
-    )
+    queue_notice = None
+    if notify:
+        noted = threading.Event()
 
-    try:
-        if use_openai:
-            with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):
-                if not _thread_uses_openai(thread_ts):
-                    # The thread moved to Claude while this waited.
-                    raise _RerouteAfterTurn()
-                turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
-                audit_session_id, fallback_workspace = _run_openai_fallback(
-                    policy=room_policy,
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    user_id=process_user,
-                    prompt=text,
-                    on_text=on_text,
-                    max_duration=max(0.001, turn_deadline - time.monotonic()),
-                    record_user=not forward,
-                    resume_only=bool(review_notice),
-                )
-                handoff_request = _take_handoff(
-                    fallback_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
-                    review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
-                )
-                handoff_source = fallback_workspace
-            session = None
-        else:
-            # Preserve same-thread steering while a turn is active. A request for
-            # another thread waits for bounded turn capacity instead of being
-            # discarded when every live session is busy.
-            with _live_sessions_lock:
-                session = _live_sessions.get(thread_ts)
-            if session and session.stop_done:
-                # Never steer into a process being killed; once the stop ends, start a fresh one.
-                session.stop_done.wait(timeout=STOP_WAIT_SECONDS)
-                session = None
-            if session and session.proc.poll() is not None:
-                session = None
-            if woken is not None and session is not woken:
-                session = None
-            if review and session and session.turn_lock.locked():
-                # A review is never steered into a running process, and that process is not ours.
-                session = None
-                raise _ReviewBusy()
-            if review_notice and session is None:
-                # A notice only wakes a live session; a fresh process would run as the peer bot.
+        def queue_notice():
+            if not noted.is_set():
+                noted.set()
+                _post_queue_notice(channel, thread_ts, FALLBACK_TURN_QUEUE_NOTE)
+
+    # A turn that finds the thread held waits without a work slot, then routes again.
+    first_route = True
+    notice_on_codex = use_openai
+    woken = None
+    while True:
+        if not first_route and not review:
+            use_openai = _thread_uses_openai(thread_ts)
+            if review_notice and use_openai != notice_on_codex:
+                # A notice runs only on the provider it was routed to; otherwise it leaves the note.
+                if woken is not None:
+                    woken.waking = False
                 _clear_eyes(reaction_channel, reaction_msg_ts)
                 slack_client.chat_postMessage(
                     channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
                 )
                 return
-            if not (session and session.turn_lock.locked()):
-                if not review and _thread_turn_running(thread_ts):
-                    # A Codex turn (or a Claude turn finishing) holds the thread; take no slot while it runs.
-                    raise _RerouteAfterTurn()
-                if review:
-                    slot = _review_slots.acquire(
-                        REVIEW_QUEUE_WAIT, lambda: _post_queue_notice(channel, thread_ts, REVIEW_QUEUE_NOTE),
-                    )
-                    if slot in ("full", "timeout"):
-                        _clear_eyes(reaction_channel, reaction_msg_ts)
-                        review_admission.refuse("refused_queue", REVIEW_QUEUE_FULL_REPLY)
-                        return
-                    review_slot_held = True
-                    if slot == "queued" and not _review_still_runnable(review_admission, room_policy, thread_ts):
-                        _clear_eyes(reaction_channel, reaction_msg_ts)
-                        return
-                    review_on_codex = _review_provider(thread_ts) == "codex"
-                    if review_on_codex and not _codex_review_ready():
-                        # Deferred before its cap is charged; a replay re-admits it.
-                        _clear_eyes(reaction_channel, reaction_msg_ts)
-                        _defer_review(review_admission)
-                        return
-                # A review already said it was queued, so it waits for a turn without a second note.
-                _turn_admission.acquire(
-                    None if review else lambda: _post_queue_notice(channel, thread_ts)
-                )
-                turn_admitted = True
-                if review_on_codex:
-                    if not review_admission.start():
-                        _clear_eyes(reaction_channel, reaction_msg_ts)
-                        return
-                    outcome = _run_codex_review(
-                        review_admission, room_policy, channel=channel, thread_ts=thread_ts,
-                        user_id=user_id, envelope=envelope, on_text=on_text,
-                        max_duration=min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME),
-                    )
-                    if outcome == "unavailable":
-                        _defer_review(review_admission)
-                    raise _CodexReviewDone()
-                session = _get_or_create_live_session(
-                    thread_ts, channel, user_id=user_id,
-                    review_policy=room_policy if review else None,
-                    review_pr=review_admission.pr if review else "",
-                    review_plan=review_admission.plan if review else None,
-                    existing_only=bool(review_notice),
-                    # A forwarded reply or a handoff is one-shot: refusing it would lose it.
-                    evict_waiting=bool(forward or handoff_from),
-                )
-                # The cap is charged, and the request audited as accepted, only once its turn starts.
-                if review and not review_admission.start():
-                    _clear_eyes(reaction_channel, reaction_msg_ts)
-                    return
+        audit_session_id = _get_openai_session(thread_ts) if use_openai else None
+        turn_admitted = False
+        review_slot_held = False
+        review_on_codex = False
+        review_continued = False
+        session = None
+        handoff_request = None
+        handoff_source = None
+        # One provider works a thread at a time; a Claude work turn holds this lock while it runs.
+        held_thread_lock = None
+        reroute = False
 
-        # Real-time steering: a Claude turn is already running in this thread — don't
-        # hold the message until it finishes. Write it to stdin now; the CLI
-        # delivers it at the next tool-call boundary inside the running turn,
-        # exactly like typing without Esc in interactive Claude Code. The
-        # running turn's on_text posts to this same thread, so replies route
-        # correctly. If the turn ends in the race window the message simply
-        # starts the next turn, and its eyes reaction is still drained by the
-        # reader on that turn's result. `stop`/`esc` remains the hard
-        # interrupt for aborting a slow tool call outright.
-        if session and session.turn_lock.locked():
-            if handoff_from:
-                # A person already started a turn in the new thread; the brief is its opening message.
-                _clear_eyes(reaction_channel, reaction_msg_ts)
-                return
-            session.turn_senders.add(user_id)
-            _send_to_claude(session, text)
-            session.pending_reactions.append((reaction_channel, reaction_msg_ts))
-            audit_interaction(event, "(steered into running turn)", 0.0, session.session_id)
-            logger.info(f"Steering message injected mid-turn in thread {thread_ts}")
-            return
-
-        # Acquire turn_lock — this serializes the send→wait cycle.
-        # If another message is already being processed, we block here.
-        if session:
-            if not review:
-                lock = _openai_turn_lock(thread_ts)
-                if not lock.acquire(blocking=False):
-                    raise _RerouteAfterTurn()
-                held_thread_lock = lock
-            with session.turn_lock:
-                turn_limit = min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME) if review else MAX_TURN_RUNTIME
-                turn_deadline = time.monotonic() + turn_limit
-                session._on_text = on_text
-                if session.reporter and session.reporter.active:
-                    session.reporter.finish(state="stopped")
-                session.after_turn_noticed = False
-                session.reporter = TurnReporter(
-                    post=on_text,
-                    post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
-                    post_status=lambda line: _post_status_line(channel, thread_ts, line),
-                    update_status=lambda ts, line: _update_status_line(channel, ts, line),
-                )
-                session.reporter.begin()
-                session.pending_tools.clear()
-                session._turn_done.clear()
-                session.turn_senders = {user_id}
-                session.limit_notices.clear()
-                session.waking = False
+        try:
+            if use_openai:
+                with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):
+                    if not _thread_uses_openai(thread_ts):
+                        # The thread moved to Claude while this waited; a notice stays on Codex.
+                        if review_notice:
+                            raise _NoLiveSession()
+                        raise _RerouteAfterTurn()
+                    turn_deadline = time.monotonic() + MAX_TURN_RUNTIME
+                    audit_session_id, fallback_workspace = _run_openai_fallback(
+                        policy=room_policy,
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        user_id=process_user,
+                        prompt=text,
+                        on_text=on_text,
+                        max_duration=max(0.001, turn_deadline - time.monotonic()),
+                        record_user=not forward,
+                        resume_only=bool(review_notice),
+                    )
+                    handoff_request = _take_handoff(
+                        fallback_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
+                        review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
+                    )
+                    handoff_source = fallback_workspace
+                session = None
+            else:
+                # Preserve same-thread steering while a turn is active. A request for
+                # another thread waits for bounded turn capacity instead of being
+                # discarded when every live session is busy.
                 with _live_sessions_lock:
-                    _handoff_stops.discard(thread_ts)
-                if session.workspace:
-                    cleanup_stale_delegate_pid(session.workspace.delegate_pid_file)
-                    discard_handoff_claim(session.workspace.handoff_claim_file)
-                    discard_handoff_claim(bundle_release_file(session.workspace.bundle_claim_file))
-
-                _send_to_claude(session, text)
-
-                if not wait_for_turn_completion(
-                    session._turn_done,
-                    inactivity_timeout=CLAUDE_TIMEOUT,
-                    activity_at=lambda: session.turn_activity,
-                    delegate_active=lambda: _owner_turn_busy(session),
-                    max_duration=max(0.001, turn_deadline - time.monotonic()),
-                ):
-                    timeout_limit = "hard" if time.monotonic() >= turn_deadline else "inactivity"
-                    try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-                    except Exception: pass
-                    while session.pending_reactions:
-                        ch, ts = session.pending_reactions.pop(0)
-                        try:
-                            slack_client.reactions_remove(channel=ch, name="eyes", timestamp=ts)
-                        except Exception:
-                            pass
-                    if session.reporter:
-                        session.reporter.finish(state="stopped")
-                    stop_outcome = stop_timed_out_session(session, _stop_review if review else _interrupt_session)
-                    minutes = CLAUDE_TIMEOUT // 60
-                    # A review that already posted its reply and completion line needs no timeout note.
-                    if not (review and session.review_done):
-                        slack_client.chat_postMessage(
-                            channel=channel, thread_ts=thread_ts,
-                            text=(
-                                (f"Turn went {minutes} minutes with no output and no tool running; stopped. "
-                                 if timeout_limit == "inactivity" else
-                                 f"Turn reached its {format_elapsed(turn_limit)} hard limit; stopped. ")
-                                + ("The review never confirmed it finished; check the PR for its comments, "
-                                   "or ask again to rerun it." if review else
-                                   "Working files and thread continuity were preserved; "
-                                   "tell me to resume when ready.")
-                                + ("" if stop_outcome != "still running"
-                                   else f" But I {_STILL_RUNNING_NOTE.format(pid=session.proc.pid)}.")
-                            ),
-                        )
-                    logger.warning(
-                        "TURN_TIMEOUT | USER:%s | CHANNEL:%s | THREAD:%s | "
-                        "LIMIT:%s | STOP:%s | SESSION:%s",
-                        user_id, channel, thread_ts,
-                        timeout_limit,
-                        stop_outcome,
-                        session.session_id or "none",
+                    session = _live_sessions.get(thread_ts)
+                if session and session.stop_done:
+                    # Never steer into a process being killed; once the stop ends, start a fresh one.
+                    session.stop_done.wait(timeout=STOP_WAIT_SECONDS)
+                    session = None
+                if session and session.proc.poll() is not None:
+                    session = None
+                if woken is not None and session is not woken:
+                    session = None
+                if review and session and session.turn_lock.locked():
+                    # A review is never steered into a running process, and that process is not ours.
+                    session = None
+                    raise _ReviewBusy()
+                if review_notice and session is None:
+                    # A notice only wakes a live session; a fresh process would run as the peer bot.
+                    _clear_eyes(reaction_channel, reaction_msg_ts)
+                    slack_client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
                     )
                     return
-
-                audit_session_id = session.session_id
-                fallback_workspace = None
-                if fallback_requested and review:
-                    # A review that already posted its reply is finished; otherwise it moves to Codex.
-                    if not session.review_done:
-                        _continue_review_after_limit(
+                if not (session and session.turn_lock.locked()):
+                    if not review and _thread_turn_running(thread_ts):
+                        # A Codex turn (or a Claude turn finishing) holds the thread; take no slot while it runs.
+                        raise _RerouteAfterTurn()
+                    if review:
+                        slot = _review_slots.acquire(
+                            REVIEW_QUEUE_WAIT, lambda: _post_queue_notice(channel, thread_ts, REVIEW_QUEUE_NOTE),
+                        )
+                        if slot in ("full", "timeout"):
+                            _clear_eyes(reaction_channel, reaction_msg_ts)
+                            review_admission.refuse("refused_queue", REVIEW_QUEUE_FULL_REPLY)
+                            return
+                        review_slot_held = True
+                        if slot == "queued" and not _review_still_runnable(review_admission, room_policy, thread_ts):
+                            _clear_eyes(reaction_channel, reaction_msg_ts)
+                            return
+                        review_on_codex = _review_provider(thread_ts) == "codex"
+                        if review_on_codex and not _codex_review_ready():
+                            # Deferred before its cap is charged; a replay re-admits it.
+                            _clear_eyes(reaction_channel, reaction_msg_ts)
+                            _defer_review(review_admission)
+                            return
+                    # A review already said it was queued, so it waits for a turn without a second note.
+                    _turn_admission.acquire(
+                        None if review else lambda: _post_queue_notice(channel, thread_ts)
+                    )
+                    turn_admitted = True
+                    if not review:
+                        held_thread_lock = _take_thread_turn(thread_ts)
+                    if review_on_codex:
+                        if not review_admission.start():
+                            _clear_eyes(reaction_channel, reaction_msg_ts)
+                            return
+                        outcome = _run_codex_review(
                             review_admission, room_policy, channel=channel, thread_ts=thread_ts,
                             user_id=user_id, envelope=envelope, on_text=on_text,
+                            max_duration=min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME),
                         )
-                        review_continued = True
-                elif fallback_requested and review_notice:
-                    # A notice replays only by resuming the person's own Codex session; otherwise it says so.
-                    try:
+                        if outcome == "unavailable":
+                            _defer_review(review_admission)
+                        raise _CodexReviewDone()
+                    session = _get_or_create_live_session(
+                        thread_ts, channel, user_id=user_id,
+                        review_policy=room_policy if review else None,
+                        review_pr=review_admission.pr if review else "",
+                        review_plan=review_admission.plan if review else None,
+                        existing_only=bool(review_notice),
+                        # A forwarded reply or a handoff is one-shot: refusing it would lose it.
+                        evict_waiting=bool(forward or handoff_from),
+                    )
+                    # The cap is charged, and the request audited as accepted, only once its turn starts.
+                    if review and not review_admission.start():
+                        _clear_eyes(reaction_channel, reaction_msg_ts)
+                        return
+
+            # Real-time steering: a Claude turn is already running in this thread — don't
+            # hold the message until it finishes. Write it to stdin now; the CLI
+            # delivers it at the next tool-call boundary inside the running turn,
+            # exactly like typing without Esc in interactive Claude Code. The
+            # running turn's on_text posts to this same thread, so replies route
+            # correctly. If the turn ends in the race window the message simply
+            # starts the next turn, and its eyes reaction is still drained by the
+            # reader on that turn's result. `stop`/`esc` remains the hard
+            # interrupt for aborting a slow tool call outright.
+            if session and session.turn_lock.locked():
+                if handoff_from:
+                    # A person already started a turn in the new thread; the brief is its opening message.
+                    _clear_eyes(reaction_channel, reaction_msg_ts)
+                    return
+                session.turn_senders.add(user_id)
+                _send_to_claude(session, text)
+                session.pending_reactions.append((reaction_channel, reaction_msg_ts))
+                audit_interaction(event, "(steered into running turn)", 0.0, session.session_id)
+                logger.info(f"Steering message injected mid-turn in thread {thread_ts}")
+                return
+
+            # Acquire turn_lock — this serializes the send→wait cycle.
+            # If another message is already being processed, we block here.
+            if session:
+                if not review and held_thread_lock is None:
+                    # The turn this meant to steer into ended in between.
+                    held_thread_lock = _take_thread_turn(thread_ts)
+                with session.turn_lock:
+                    turn_limit = min(MAX_TURN_RUNTIME, REVIEW_MAX_RUNTIME) if review else MAX_TURN_RUNTIME
+                    turn_deadline = time.monotonic() + turn_limit
+                    session._on_text = on_text
+                    if session.reporter and session.reporter.active:
+                        session.reporter.finish(state="stopped")
+                    session.after_turn_noticed = False
+                    session.reporter = TurnReporter(
+                        post=on_text,
+                        post_notice=lambda note: _post_progress_notice(channel, thread_ts, note),
+                        post_status=lambda line: _post_status_line(channel, thread_ts, line),
+                        update_status=lambda ts, line: _update_status_line(channel, ts, line),
+                    )
+                    session.reporter.begin()
+                    session.pending_tools.clear()
+                    session._turn_done.clear()
+                    session.turn_senders = {user_id}
+                    session.limit_notices.clear()
+                    session.waking = False
+                    with _live_sessions_lock:
+                        _handoff_stops.discard(thread_ts)
+                    if session.workspace:
+                        cleanup_stale_delegate_pid(session.workspace.delegate_pid_file)
+                        discard_handoff_claim(session.workspace.handoff_claim_file)
+                        discard_handoff_claim(bundle_release_file(session.workspace.bundle_claim_file))
+
+                    _send_to_claude(session, text)
+
+                    if not wait_for_turn_completion(
+                        session._turn_done,
+                        inactivity_timeout=CLAUDE_TIMEOUT,
+                        activity_at=lambda: session.turn_activity,
+                        delegate_active=lambda: _owner_turn_busy(session),
+                        max_duration=max(0.001, turn_deadline - time.monotonic()),
+                    ):
+                        timeout_limit = "hard" if time.monotonic() >= turn_deadline else "inactivity"
+                        try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
+                        except Exception: pass
+                        while session.pending_reactions:
+                            ch, ts = session.pending_reactions.pop(0)
+                            try:
+                                slack_client.reactions_remove(channel=ch, name="eyes", timestamp=ts)
+                            except Exception:
+                                pass
+                        if session.reporter:
+                            session.reporter.finish(state="stopped")
+                        stop_outcome = stop_timed_out_session(session, _stop_review if review else _interrupt_session)
+                        minutes = CLAUDE_TIMEOUT // 60
+                        # A review that already posted its reply and completion line needs no timeout note.
+                        if not (review and session.review_done):
+                            slack_client.chat_postMessage(
+                                channel=channel, thread_ts=thread_ts,
+                                text=(
+                                    (f"Turn went {minutes} minutes with no output and no tool running; stopped. "
+                                     if timeout_limit == "inactivity" else
+                                     f"Turn reached its {format_elapsed(turn_limit)} hard limit; stopped. ")
+                                    + ("The review never confirmed it finished; check the PR for its comments, "
+                                       "or ask again to rerun it." if review else
+                                       "Working files and thread continuity were preserved; "
+                                       "tell me to resume when ready.")
+                                    + ("" if stop_outcome != "still running"
+                                       else f" But I {_STILL_RUNNING_NOTE.format(pid=session.proc.pid)}.")
+                                ),
+                            )
+                        logger.warning(
+                            "TURN_TIMEOUT | USER:%s | CHANNEL:%s | THREAD:%s | "
+                            "LIMIT:%s | STOP:%s | SESSION:%s",
+                            user_id, channel, thread_ts,
+                            timeout_limit,
+                            stop_outcome,
+                            session.session_id or "none",
+                        )
+                        return
+
+                    audit_session_id = session.session_id
+                    fallback_workspace = None
+                    if fallback_requested and review:
+                        # A review that already posted its reply is finished; otherwise it moves to Codex.
+                        if not session.review_done:
+                            _continue_review_after_limit(
+                                review_admission, room_policy, channel=channel, thread_ts=thread_ts,
+                                user_id=user_id, envelope=envelope, on_text=on_text,
+                            )
+                            review_continued = True
+                    elif fallback_requested and review_notice:
+                        # A notice replays only by resuming the person's own Codex session; otherwise it says so.
+                        try:
+                            with contextlib.nullcontext() if held_thread_lock else _openai_turn_lock(thread_ts):
+                                audit_session_id, fallback_workspace = _run_openai_fallback(
+                                    policy=room_policy,
+                                    channel=channel,
+                                    thread_ts=thread_ts,
+                                    user_id=process_user,
+                                    prompt=text,
+                                    on_text=on_text,
+                                    max_duration=max(0.001, turn_deadline - time.monotonic()),
+                                    resume_only=True,
+                                )
+                        except _NoLiveSession:
+                            note = (REVIEW_REFUSED_LIMIT.format(pr=review_notice["pr"], reason=review_notice["refused"])
+                                    if review_notice.get("refused") else REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"]))
+                            all_texts.append(note)
+                            post_response(channel, note, thread_ts=thread_ts)
+                    elif fallback_requested:
+                        fallback_context = _fetch_thread_context(channel, thread_ts, msg_ts)
+                        fallback_prompt = text
+                        if fallback_context:
+                            fallback_prompt += (
+                                "\n\n[UNTRUSTED_FAILOVER_THREAD_CONTEXT]\n"
+                                f"{fallback_context}\n[/UNTRUSTED_FAILOVER_THREAD_CONTEXT]"
+                            )
                         with contextlib.nullcontext() if held_thread_lock else _openai_turn_lock(thread_ts):
                             audit_session_id, fallback_workspace = _run_openai_fallback(
                                 policy=room_policy,
                                 channel=channel,
                                 thread_ts=thread_ts,
-                                user_id=process_user,
-                                prompt=text,
+                                user_id=user_id,
+                                prompt=fallback_prompt,
                                 on_text=on_text,
                                 max_duration=max(0.001, turn_deadline - time.monotonic()),
-                                resume_only=True,
+                                record_user=not forward,
                             )
-                    except _NoLiveSession:
-                        note = (REVIEW_REFUSED_LIMIT.format(pr=review_notice["pr"], reason=review_notice["refused"])
-                                if review_notice.get("refused") else REVIEW_NOTICE_LIMIT.format(pr=review_notice["pr"]))
-                        all_texts.append(note)
-                        post_response(channel, note, thread_ts=thread_ts)
-                elif fallback_requested:
-                    fallback_context = _fetch_thread_context(channel, thread_ts, msg_ts)
-                    fallback_prompt = text
-                    if fallback_context:
-                        fallback_prompt += (
-                            "\n\n[UNTRUSTED_FAILOVER_THREAD_CONTEXT]\n"
-                            f"{fallback_context}\n[/UNTRUSTED_FAILOVER_THREAD_CONTEXT]"
+
+                    # Check if the process died without producing a response
+                    if (not all_texts and not skip_detected and session.proc.poll() is not None
+                            and not (review and session.stop_done) and not review_continued
+                            and not (session.reporter and session.reporter.noticed_no_reply)):
+                        try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
+                        except Exception: pass
+                        logger.error(f"Claude process died without responding in thread {thread_ts}")
+                        slack_client.chat_postMessage(
+                            channel=channel, thread_ts=thread_ts,
+                            text="Sorry, I lost my train of thought. Could you try sending that again?",
                         )
-                    with contextlib.nullcontext() if held_thread_lock else _openai_turn_lock(thread_ts):
-                        audit_session_id, fallback_workspace = _run_openai_fallback(
-                            policy=room_policy,
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            user_id=user_id,
-                            prompt=fallback_prompt,
-                            on_text=on_text,
-                            max_duration=max(0.001, turn_deadline - time.monotonic()),
-                            record_user=not forward,
+                        return
+
+                    # Take the claim before turn_lock releases, so the next turn can neither discard nor supply it.
+                    handoff_workspace = fallback_workspace if fallback_requested and not review else session.workspace
+                    if handoff_workspace:
+                        with _live_sessions_lock:
+                            stopped = thread_ts in _handoff_stops
+                            _handoff_stops.discard(thread_ts)
+                        handoff_request = _take_handoff(
+                            handoff_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
+                            review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
+                            stopped=stopped, senders=len(session.turn_senders),
                         )
+                        handoff_source = handoff_workspace
 
-                # Check if the process died without producing a response
-                if (not all_texts and not skip_detected and session.proc.poll() is not None
-                        and not (review and session.stop_done) and not review_continued
-                        and not (session.reporter and session.reporter.noticed_no_reply)):
-                    try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-                    except Exception: pass
-                    logger.error(f"Claude process died without responding in thread {thread_ts}")
-                    slack_client.chat_postMessage(
-                        channel=channel, thread_ts=thread_ts,
-                        text="Sorry, I lost my train of thought. Could you try sending that again?",
-                    )
-                    return
-
-                # Take the claim before turn_lock releases, so the next turn can neither discard nor supply it.
-                handoff_workspace = fallback_workspace if fallback_requested and not review else session.workspace
-                if handoff_workspace:
-                    with _live_sessions_lock:
-                        stopped = thread_ts in _handoff_stops
-                        _handoff_stops.discard(thread_ts)
-                    handoff_request = _take_handoff(
-                        handoff_workspace, user_id=user_id, channel=channel, thread_ts=thread_ts,
-                        review=review, from_handoff=bool(handoff_from or review_notice), forwarded=bool(forward),
-                        stopped=stopped, senders=len(session.turn_senders),
-                    )
-                    handoff_source = handoff_workspace
-
-    except _ReviewBusy:
-        _clear_eyes(reaction_channel, reaction_msg_ts)
-        review_admission.refuse("refused_busy", BUSY_REPLY)
-        return
-    except _CodexReviewDone:
-        pass
-    except _RerouteAfterTurn:
-        reroute = True
-    except _SessionsFull:
-        _clear_eyes(reaction_channel, reaction_msg_ts)
-        logger.info(f"Refused new session for thread {thread_ts}: every work session is busy or waiting")
-        try:
-            slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=SESSIONS_FULL_REPLY)
-        except Exception as exc:
-            logger.warning(f"Could not post the busy reply in {thread_ts}: {type(exc).__name__}")
-        return
-    except _NoLiveSession:
-        _clear_eyes(reaction_channel, reaction_msg_ts)
-        try:
-            slack_client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
-            )
-        except Exception as exc:
-            logger.warning(f"Could not post the review notice note in {thread_ts}: {type(exc).__name__}")
-        return
-    except Exception as e:
-        try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
-        except Exception: pass
-        logger.error(f"Error processing message in thread {thread_ts}: {e}")
-        if review and not review_admission.started:
-            review_admission.refuse("refused_error", ERROR_REPLY)
+        except _ReviewBusy:
+            _clear_eyes(reaction_channel, reaction_msg_ts)
+            review_admission.refuse("refused_busy", BUSY_REPLY)
             return
-        slack_client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text=f"Something went wrong: {e}",
-        )
-        return
-    finally:
-        if held_thread_lock is not None:
-            held_thread_lock.release()
-        if review and session is not None:
-            _close_review_session(session)
-        if turn_admitted:
-            _turn_admission.release()
-        if review_slot_held:
-            _review_slots.release()
-        if review_notice and session is not None and not reroute:
-            session.waking = False
-        if woken is not None and woken is not session:
-            woken.waking = False
+        except _CodexReviewDone:
+            pass
+        except _RerouteAfterTurn:
+            reroute = True
+        except _SessionsFull:
+            _clear_eyes(reaction_channel, reaction_msg_ts)
+            logger.info(f"Refused new session for thread {thread_ts}: every work session is busy or waiting")
+            try:
+                slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=SESSIONS_FULL_REPLY)
+            except Exception as exc:
+                logger.warning(f"Could not post the busy reply in {thread_ts}: {type(exc).__name__}")
+            return
+        except _NoLiveSession:
+            _clear_eyes(reaction_channel, reaction_msg_ts)
+            try:
+                slack_client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts, text=_notice_idle_text(review_notice),
+                )
+            except Exception as exc:
+                logger.warning(f"Could not post the review notice note in {thread_ts}: {type(exc).__name__}")
+            return
+        except Exception as e:
+            try: slack_client.reactions_remove(channel=reaction_channel, name="eyes", timestamp=reaction_msg_ts)
+            except Exception: pass
+            logger.error(f"Error processing message in thread {thread_ts}: {e}")
+            if review and not review_admission.started:
+                review_admission.refuse("refused_error", ERROR_REPLY)
+                return
+            slack_client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f"Something went wrong: {e}",
+            )
+            return
+        finally:
+            if held_thread_lock is not None:
+                held_thread_lock.release()
+            if review and session is not None:
+                _close_review_session(session)
+            if turn_admitted:
+                _turn_admission.release()
+            if review_slot_held:
+                _review_slots.release()
+            if review_notice and session is not None and not reroute:
+                session.waking = False
+            if not reroute and woken is not None and woken is not session:
+                woken.waking = False
 
-    if reroute:
-        _wait_for_thread_turn(thread_ts, queue_notice)
-        if review_notice and session is not None:
-            review_notice = {**review_notice, "woken": session}
-        process_message_async(
-            event, review_admission=review_admission, handoff_from=handoff_from, review_notice=review_notice,
-            rerouted_forward=forward,
-        )
-        return
+        if reroute:
+            _wait_for_thread_turn(thread_ts, queue_notice)
+            if review_notice and woken is None:
+                woken = session
+            first_route = False
+            continue
+        break
 
     duration = time.time() - start
 

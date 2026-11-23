@@ -619,12 +619,13 @@ engineering, Terra/high for mechanical or high-volume work, and Luna/medium for 
 One provider works a Slack thread at a time. A Codex turn and a non-review Claude turn each hold
 the thread's turn lock while they run, so a Claude turn never starts beside a running Codex turn,
 whether it was started by a message, a provider switch or a review hand-back notice. A message that
-finds the other provider's turn running waits for it without taking a work slot, then is routed
-again from the start, so its provider and session are chosen after the wait; a rerouted notice
-wakes only the session it was sent to. The Claude path keeps its live mid-turn steering. A Codex
+finds the other provider's turn running waits for it without holding a work slot, then is routed
+again, so its provider and session are chosen after the wait. A review hand-back notice stays on
+the provider, and for Claude the session, it was first sent to; if that is gone it leaves the
+usual note. The Claude path keeps its live mid-turn steering. A Codex
 turn cannot take input mid-run, so a message that arrives during one waits for it and then gets
 its own full turn runtime. A person's message to the bot (a 1:1 DM, or an @mention in a shared
-room) waiting on a Codex turn also gets a one-line queued note (`FALLBACK_TURN_QUEUE_NOTE`, naming
+room) that has to wait also gets a one-line queued note, once (`FALLBACK_TURN_QUEUE_NOTE`, naming
 `stop`). Unaddressed
 shared-room messages, forwarded escalation replies, handoff briefs and review hand-back notices
 queue silently.
