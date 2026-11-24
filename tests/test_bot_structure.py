@@ -1,4 +1,5 @@
 import ast
+import re
 import inspect
 from pathlib import Path
 import sys
@@ -63,6 +64,80 @@ class BotTurnStructureTest(unittest.TestCase):
         )
         self.assertIn("hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice)", source)
 
+    def _flat(self, name):
+        return re.sub(r"\s+", " ", ast.unparse(self._function(name)))
+
+    def test_a_claude_work_turn_takes_the_thread_lock_before_any_session_and_before_it_runs(self):
+        source = self._flat("process_message_async")
+        take = "if not review: held_thread_lock = _take_thread_turn(thread_ts)"
+        self.assertIn(take, source)
+        self.assertLess(source.index("_turn_admission.acquire("), source.index(take))
+        self.assertLess(source.index(take), source.index("session = _get_or_create_live_session("))
+        race = "if not review and held_thread_lock is None: held_thread_lock = _take_thread_turn(thread_ts)"
+        self.assertIn(race, source)
+        self.assertLess(source.index(race), source.index("with session.turn_lock:"))
+        helper = self._flat("_take_thread_turn")
+        self.assertIn("if not lock.acquire(blocking=False): raise _RerouteAfterTurn()", helper)
+        self.assertIn("try: moved = _thread_uses_openai(thread_ts) except BaseException: lock.release() raise", helper)
+        self.assertIn("if moved: lock.release() raise _RerouteAfterTurn()", helper)
+
+    def test_a_claude_turn_takes_no_work_slot_while_another_turn_holds_the_thread(self):
+        source = self._flat("process_message_async")
+        check = "if not review and _thread_turn_running(thread_ts): raise _RerouteAfterTurn()"
+        self.assertIn(check, source)
+        self.assertLess(source.index(check), source.index("_turn_admission.acquire("))
+
+    def test_the_thread_lock_is_released_first_in_finally(self):
+        function = self._function("process_message_async")
+        outer = next(node for node in ast.walk(function) if isinstance(node, ast.Try) and node.finalbody
+                     and "held_thread_lock" in ast.unparse(node.finalbody[0]))
+        self.assertEqual(
+            "if held_thread_lock is not None:\n    held_thread_lock.release()", ast.unparse(outer.finalbody[0])
+        )
+
+    def test_a_codex_turn_rechecks_the_provider_after_waiting_and_a_notice_never_moves(self):
+        source = self._flat("process_message_async")
+        hold = "with hold_thread_turn(_openai_turn_lock(thread_ts), queue_notice):"
+        recheck = "if not _thread_uses_openai(thread_ts): if review_notice: raise _NoLiveSession() raise _RerouteAfterTurn()"
+        self.assertIn(recheck, source)
+        self.assertLess(source.index(hold), source.index(recheck))
+        self.assertIn("if review_notice and use_openai != notice_on_codex:", source)
+
+    def test_limit_replays_inside_a_claude_turn_reuse_the_held_lock(self):
+        source = self._flat("process_message_async")
+        self.assertEqual(
+            2, source.count("with contextlib.nullcontext() if held_thread_lock else _openai_turn_lock(thread_ts):")
+        )
+
+    def test_a_rerouted_message_routes_again_inside_the_function(self):
+        function = self._function("process_message_async")
+        loop = next(node for node in function.body if isinstance(node, ast.While))
+        body = re.sub(r"\s+", " ", ast.unparse(loop))
+        self.assertIn("if reroute: _wait_for_thread_turn(thread_ts, queue_notice)", body)
+        self.assertIn("continue break", body)
+        # The one-time work (route claim, attachments, envelope) happens before the loop, once.
+        before = re.sub(r"\s+", " ", ast.unparse(ast.Module(body=function.body[:function.body.index(loop)], type_ignores=[])))
+        for once in ("_reply_routes.claim(", "download_slack_files(event)", "build_authority_envelope("):
+            self.assertIn(once, before)
+            self.assertNotIn(once, body)
+        self.assertIn("if review_notice and session is not None and (not reroute):", body)
+        self.assertIn("if woken is not None and session is not woken:", body)
+        self.assertIn("if not reroute and woken is not None and (woken is not session): woken.waking = False", body)
+
+    def test_the_wait_notes_only_a_codex_turn_and_only_once(self):
+        self.assertIn(
+            "if queue_notice is not None and _codex_turn_running(thread_ts):", self._flat("_wait_for_thread_turn")
+        )
+        self.assertIn("if not noted.is_set(): noted.set()", self._flat("process_message_async"))
+
+    def test_a_provider_switch_says_when_a_turn_is_still_running(self):
+        source = ast.unparse(self._function("_maybe_provider_command"))
+        self.assertIn("before = _get_provider_override(thread_ts)", source)
+        self.assertIn(
+            "if (action == 'openai new' or (action != 'status' and before != _get_provider_override(thread_ts)))"
+            " and _thread_turn_running(thread_ts):", source,
+        )
+
     def test_claude_stop_paths_stop_the_whole_process_tree(self):
         for name in ("_stop_unread_process", "_interrupt_session", "_stop_background_delegates"):
             source = ast.unparse(self._function(name))
@@ -104,13 +179,13 @@ class BotTurnStructureTest(unittest.TestCase):
         self.assertIn("review_admission.refuse('refused_queue', REVIEW_QUEUE_FULL_REPLY)", process)
         self.assertIn("slot == 'queued' and (not _review_still_runnable(", process)
         self.assertIn("_turn_admission.acquire(None if review else", process)
-        self.assertIn("if review_slot_held:\n            _review_slots.release()", process)
+        self.assertIn("if review_slot_held:\n                _review_slots.release()", process)
 
     def test_a_woken_thread_is_unevictable_until_its_turn_runs(self):
         notice = ast.unparse(self._function("_start_review_notice"))
         self.assertLess(notice.index("session.waking = True"), notice.index("process_message_async("))
         process = ast.unparse(self._function("process_message_async"))
-        self.assertIn("if review_notice and session is not None:\n            session.waking = False", process)
+        self.assertIn("if review_notice and session is not None and (not reroute):\n                session.waking = False", process)
 
     def test_owner_inactivity_waits_on_the_busy_check_and_logs_the_limit(self):
         source = ast.unparse(self._function("process_message_async"))
@@ -192,8 +267,10 @@ class BotTurnStructureTest(unittest.TestCase):
         )
 
         self.assertIs(parents[steering], parents[normal])
-        self.assertIsInstance(normal.body[0], ast.With)
-        turn_body = normal.body[0].body
+        # A non-review turn first takes the thread's turn lock; the turn itself is the With.
+        turn = next(statement for statement in normal.body if isinstance(statement, ast.With))
+        self.assertIn("session.turn_lock", ast.unparse(turn.items[0]))
+        turn_body = turn.body
         calls = {node.func.id for statement in turn_body for node in ast.walk(statement)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertIn("_send_to_claude", calls)
