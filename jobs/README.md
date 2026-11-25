@@ -7,6 +7,7 @@ Scheduled background jobs your AI runs on its own — no human in the loop. Each
 | Job | Schedule | What it does |
 |-----|----------|--------------|
 | [`daily-diary/`](daily-diary/) | Nightly 3:30 AM | Reviews the day's conversations and writes an introspective diary entry; optionally evolves `identity.md` and shares an insight to Slack |
+| [`daily-status/`](daily-status/) | Weekdays 6:00 AM | Posts a privacy-checked summary of the previous working day, what finished, what is open, and what waits on the operator to a team status channel |
 
 (The [`../trust-battery/`](../trust-battery/) judge + reflection jobs follow the same pattern and are documented separately.)
 

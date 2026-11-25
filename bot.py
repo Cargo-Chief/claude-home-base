@@ -100,6 +100,13 @@ from agent_status import (
     configured_status_channel,
     reboot_request_is_exact,
 )
+from daily_status import (
+    StatusError,
+    build_post,
+    configured_team_status,
+    post_request_is_exact,
+    validate_run_dir,
+)
 from delegation_observability import DelegationTracker, format_delegation_audit
 from turn_reporter import TurnReporter, format_elapsed, tick_all
 from thread_handoff import (
@@ -4648,6 +4655,27 @@ def register_forward_endpoint():
 # ---------------------------------------------------------------------------
 
 
+def _post_daily_status(raw_dir: str) -> None:
+    """Post one day's team status; a thread session never may, only the scheduled job."""
+    if os.environ.get("CARGO_CHIEF_THREAD_WORK_DIR"):
+        raise SystemExit("refused: the daily status is posted only by the scheduled job")
+    try:
+        config = configured_team_status()
+        run_dir = validate_run_dir(raw_dir, WORKSPACE_ROOT)
+    except StatusError as exc:
+        raise SystemExit(f"daily status refused: {exc}") from exc
+    marker = run_dir / "posted"
+    if marker.exists():
+        print("daily status already posted")
+        return
+    outcome, text = build_post(run_dir, config.mention_user)
+    QuietWebClient(token=SLACK_BOT_TOKEN, timeout=10, retry_handlers=[]).chat_postMessage(
+        channel=config.channel, text=text, unfurl_links=False, unfurl_media=False,
+    )
+    marker.write_text(outcome + "\n")
+    print(f"daily status {outcome}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Employee — Slack Bot powered by Claude Code")
     parser.add_argument(
@@ -4703,6 +4731,10 @@ def main():
         help="List the live worktree bundle bindings (least recently active first) to choose one to release.",
     )
     parser.add_argument(
+        "--post-daily-status", metavar="RUN_DIR", dest="post_daily_status",
+        help="Post the daily team status from a reviewed run directory (the daily-status job only)",
+    )
+    parser.add_argument(
         "--request-review", metavar="PR_URL", dest="request_review",
         help="Ask the configured peer agent to review this agent's own open Cargo-Chief PR",
     )
@@ -4714,8 +4746,13 @@ def main():
 
     if args.request_reboot_status and not reboot_request_is_exact(sys.argv[1:]):
         parser.error("--request-reboot-status accepts no other argument")
+    if args.post_daily_status is not None and not post_request_is_exact(sys.argv[1:]):
+        parser.error("--post-daily-status accepts only the run directory")
 
     # CLI modes — send and exit
+    if args.post_daily_status is not None:
+        _post_daily_status(args.post_daily_status)
+        return
     if args.list_bundles:
         print(_list_bundles_text(os.environ, time.time()))
         return
