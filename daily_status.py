@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 import re
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -31,6 +33,7 @@ MAX_TEXT = 240
 MAX_LINKS = 3
 MAX_FILE_BYTES = 64 * 1024
 CHANNEL_ID_RE = re.compile(r"[CG][A-Z0-9]+")
+CHANNEL_OR_DM_RE = re.compile(r"[CGD][A-Z0-9]+")
 USER_ID_RE = re.compile(r"[UW][A-Z0-9]+")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # Slack auto-links a URL in plain text, so item text carries none; links go in the links list.
@@ -41,6 +44,11 @@ LINK_RULES = (
     (re.compile(r"https://cargochief\.slack\.com/archives/[CGD][A-Z0-9]+/p\d{16}"), lambda m: "thread"),
 )
 UNAVAILABLE_TEXT = "Daily status unavailable today: the status job did not produce a draft."
+THREAD_LINK_SECTIONS = ("blocked", "waiting_on_operator")
+NO_THREAD_NOTE = "(no thread link)"
+SLACK_WORKSPACE_URL = "https://cargochief.slack.com"
+THREAD_WORK_DIR = ("work", "home-base")
+THREAD_TS_RE = re.compile(r"(\d{10})\.(\d{6})")
 WITHHELD_TEXT = "Daily status withheld today: its privacy check did not clear the draft."
 
 
@@ -162,7 +170,10 @@ def render(covers: str, sections: dict[str, list[dict]], mention_user: str) -> s
             lines.append("• nothing")
         for item in sections[key]:
             links = " ".join(f"<{url}|{_link_label(url)}>" for url in item["links"])
-            lines.append(f"• {slack_escape(item['text'])}" + (f" ({links})" if links else ""))
+            line = f"• {slack_escape(item['text'])}" + (f" ({links})" if links else "")
+            if key in THREAD_LINK_SECTIONS and not any("slack.com/archives/" in url for url in item["links"]):
+                line += f" {NO_THREAD_NOTE}"
+            lines.append(line)
     return "\n".join(lines)
 
 
@@ -181,3 +192,74 @@ def build_post(run_dir: Path, mention_user: str) -> tuple[str, str]:
     if not cleared:
         return "withheld", WITHHELD_TEXT
     return "posted", render(draft["covers"], sections, mention_user)
+
+
+def thread_permalink(channel: str, thread: str) -> str | None:
+    match = THREAD_TS_RE.fullmatch(thread or "")
+    if not CHANNEL_OR_DM_RE.fullmatch(channel or "") or not match:
+        return None
+    return f"{SLACK_WORKSPACE_URL}/archives/{channel}/p{match[1]}{match[2]}"
+
+
+def _task_status(directory: Path) -> str:
+    task = directory / "TASK.md"
+    try:
+        if task.is_symlink() or not task.is_file():
+            return ""
+        for line in task.read_text(encoding="utf-8", errors="replace").splitlines()[:80]:
+            if line.lower().lstrip("*# -").startswith("status:"):
+                return line.strip()[:160]
+    except OSError:
+        return ""
+    return ""
+
+
+def thread_index(workspace_root: Path) -> list[dict]:
+    """Every live Slack thread workspace of this principal, newest first, with its permalink.
+
+    The status job hands this to the author pass so blocked and waiting items can link the
+    thread they live in; transcripts alone carry no thread id.
+    """
+    base = workspace_root.joinpath(*THREAD_WORK_DIR)
+    threads = []
+    if not base.is_dir():
+        return threads
+    for state_file in base.glob("*/state.json"):
+        try:
+            if state_file.is_symlink() or state_file.parent.is_symlink():
+                continue
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        permalink = thread_permalink(str(state.get("channel", "")), str(state.get("thread", "")))
+        if not permalink:
+            continue
+        bundle = state.get("bundle")
+        bundle_path = Path(bundle) if isinstance(bundle, str) and bundle else None
+        cwd = bundle_path or state_file.parent
+        try:
+            updated = float(state.get("updated_at") or state_file.stat().st_mtime)
+        except (TypeError, ValueError, OSError):
+            continue
+        threads.append((updated, {
+            "permalink": permalink,
+            "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(updated)),
+            "bundle": bundle_path.name if bundle_path else "",
+            "task_status": _task_status(bundle_path) if bundle_path else _task_status(state_file.parent),
+            "transcript_dir": "~/.claude/projects/" + re.sub(r"[^A-Za-z0-9-]", "-", str(cwd)),
+        }))
+    threads.sort(key=lambda pair: pair[0], reverse=True)
+    return [entry for _, entry in threads]
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3 or argv[0] != "threads":
+        print("usage: daily_status.py threads <workspace root> <output json>", file=sys.stderr)
+        return 2
+    out = Path(argv[2])
+    out.write_text(json.dumps(thread_index(Path(argv[1])), indent=1) + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

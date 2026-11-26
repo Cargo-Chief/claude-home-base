@@ -14,6 +14,8 @@ from daily_status import (  # noqa: E402
     build_post,
     configured_team_status,
     post_request_is_exact,
+    thread_index,
+    thread_permalink,
     validate_run_dir,
 )
 
@@ -116,6 +118,44 @@ class DailyStatusTest(unittest.TestCase):
         self.assertTrue(post_request_is_exact(["--post-daily-status", "/x"]))
         self.assertFalse(post_request_is_exact(["--post-daily-status", "/x", "--channel"]))
         self.assertFalse(post_request_is_exact(["--channel", "C1", "--post-daily-status", "/x"]))
+
+    def test_blocked_and_waiting_items_without_a_thread_link_are_marked(self):
+        thread = "https://cargochief.slack.com/archives/C0BTN8L6G7P/p1764000000123456"
+        self._write(_draft(
+            blocked=[{"text": "has thread", "links": [thread]}, {"text": "no thread", "links": []}],
+            waiting_on_operator=[{"text": "pr only", "links": ["https://github.com/Cargo-Chief/c4/pull/1"]}],
+            finished=[{"text": "finished item", "links": []}],
+        ))
+        _, text = build_post(self.run, "U8PP6NP8D")
+        self.assertIn("has thread (<" + thread + "|thread>)\n", text)
+        self.assertIn("• no thread (no thread link)", text)
+        self.assertIn("pr only (<https://github.com/Cargo-Chief/c4/pull/1|c4#1>) (no thread link)", text)
+        self.assertIn("• finished item\n", text)
+
+    def test_thread_index_lists_live_threads_with_permalinks(self):
+        base = self.root / "work" / "home-base"
+        bundle = self.root / "worktrees" / "CN-1-x"
+        bundle.mkdir(parents=True)
+        (bundle / "TASK.md").write_text("# CN-1\n\nStatus: blocked\nDisposition: parked\n")
+        entries = {
+            "a": {"channel": "C0BTN8L6G7P", "thread": "1764000000.123456", "bundle": str(bundle), "updated_at": 2},
+            "b": {"channel": "D0BTVV3EKFW", "thread": "1764000001.000001", "updated_at": 1},
+            "c": {"channel": "#bad", "thread": "1764000002.000002"},
+            "d": "not json",
+        }
+        for name, state in entries.items():
+            (base / name).mkdir(parents=True)
+            (base / name / "state.json").write_text(state if isinstance(state, str) else json.dumps(state))
+        threads = thread_index(self.root)
+        self.assertEqual([t["permalink"] for t in threads], [
+            "https://cargochief.slack.com/archives/C0BTN8L6G7P/p1764000000123456",
+            "https://cargochief.slack.com/archives/D0BTVV3EKFW/p1764000001000001",
+        ])
+        self.assertEqual(threads[0]["bundle"], "CN-1-x")
+        self.assertEqual(threads[0]["task_status"], "Status: blocked")
+        self.assertTrue(threads[0]["transcript_dir"].endswith("-worktrees-CN-1-x"))
+        self.assertIsNone(thread_permalink("C1", "not-a-ts"))
+        self.assertEqual(thread_index(self.root / "missing"), [])
 
 
 if __name__ == "__main__":

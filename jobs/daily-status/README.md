@@ -11,6 +11,10 @@ Each weekday at 6:00 AM local time, this job posts the agent's status to a team 
 
 1. `daily-status.sh` runs as the agent's own principal, from the agent's home-base clone. It works
    out the window and creates `work/daily-status/<date>/`.
+   It writes `threads.json` (`daily_status.py threads`), which lists the agent's live Slack thread
+   workspaces with their permalinks, bundles and `TASK.md` status lines. Transcripts carry no thread
+   ID, so this is how blocked and waiting items get a link to their thread. The renderer marks any
+   such item that has no thread link.
 2. **Author pass.** `claude -p` gathers facts from records:
    - GitHub, through the App wrapper;
    - Jira, through `jira_service.py`;
