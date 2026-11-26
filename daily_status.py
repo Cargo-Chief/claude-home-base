@@ -33,6 +33,8 @@ MAX_FILE_BYTES = 64 * 1024
 CHANNEL_ID_RE = re.compile(r"[CG][A-Z0-9]+")
 USER_ID_RE = re.compile(r"[UW][A-Z0-9]+")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Slack auto-links a URL in plain text, so item text carries none; links go in the links list.
+TEXT_URL_RE = re.compile(r"(?i)\b(?:https?|ftp|mailto|slack):|\bwww\.")
 LINK_RULES = (
     (re.compile(r"https://github\.com/Cargo-Chief/([A-Za-z0-9._-]+)/pull/(\d+)"), lambda m: f"{m[1]}#{m[2]}"),
     (re.compile(r"https://cargochief\.atlassian\.net/browse/(CN-\d+)"), lambda m: m[1]),
@@ -127,6 +129,8 @@ def validate_draft(data: dict, *, date: str) -> dict[str, list[dict]]:
             links = item.get("links", [])
             if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT or "\n" in text:
                 raise StatusError(f"section {key} has an empty, multi-line or overlong item")
+            if TEXT_URL_RE.search(text):
+                raise StatusError(f"section {key} has a URL in its text")
             if not isinstance(links, list) or len(links) > MAX_LINKS or not all(isinstance(u, str) for u in links):
                 raise StatusError(f"section {key} has more than {MAX_LINKS} links or a non-string link")
             for url in links:

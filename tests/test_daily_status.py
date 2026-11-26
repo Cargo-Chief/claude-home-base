@@ -84,6 +84,8 @@ class DailyStatusTest(unittest.TestCase):
         bad = [
             _draft(finished=[{"text": "x", "links": ["https://evil.example/x"]}]),
             _draft(finished=[{"text": "two\nlines", "links": []}]),
+            _draft(finished=[{"text": "see https://evil.example/x", "links": []}]),
+            _draft(finished=[{"text": "see www.evil.example", "links": []}]),
             _draft(finished=[{"text": "x" * 241, "links": []}]),
             _draft(finished=[{"text": "x", "links": [], "extra": 1}]),
             _draft(finished=[{"text": "x"}] * 11),

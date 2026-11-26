@@ -4670,7 +4670,7 @@ def _post_daily_status(raw_dir: str) -> None:
         return
     outcome, text = build_post(run_dir, config.mention_user)
     QuietWebClient(token=SLACK_BOT_TOKEN, timeout=10, retry_handlers=[]).chat_postMessage(
-        channel=config.channel, text=text, unfurl_links=False, unfurl_media=False,
+        channel=config.channel, text=text,
     )
     marker.write_text(outcome + "\n")
     print(f"daily status {outcome}")
