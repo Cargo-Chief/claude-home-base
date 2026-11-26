@@ -45,6 +45,23 @@
       "role": "eng"
     }
   },
+  "_readme_default_channel": "Optional. Serves any channel the app is invited to that has no entry above: mention to start, then reply in that thread. Never DMs, never review-only.",
+  "default_channel": {
+    "name": "any other channel",
+    "root": "/Users/YOUR_USERNAME/Code/cargo_chief",
+    "permission_mode": "auto",
+    "autonomous_overlay": "agent-kit/modes/autonomous.md",
+    "private_escalation_channel": "D0APPROVER",
+    "backend": "claude",
+    "model": "claude-opus-5-5",
+    "effort": "high",
+    "fallback": {
+      "backend": "codex",
+      "model": "gpt-6-sol",
+      "effort": "high"
+    },
+    "role": "eng"
+  },
   "dm_users": {
     "U0EXAMPLE01": {
       "name": "Alice",

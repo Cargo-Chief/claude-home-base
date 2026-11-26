@@ -48,6 +48,8 @@ from cargo_chief_safety import (
     build_authority_envelope,
     channel_message_action,
     room_channel_ids,
+    room_entry,
+    is_default_room,
     LAUNCHER_ENV_KEYS,
     SLACK_REPORTING_PROMPT,
     auto_memory_directory,
@@ -144,6 +146,18 @@ class ChannelMessageActionTest(unittest.TestCase):
             sender_authorized=authorized,
         )
 
+    def test_known_default_thread_reply_is_processed(self):
+        known = channel_message_action(
+            channel_id="CSHARED", channel_type="channel", text="hello", bot_user_id="UBOT",
+            configured_channels={"C1": {}}, sender_authorized=True, known_thread=True,
+        )
+        self.assertEqual("process", known)
+        stranger = channel_message_action(
+            channel_id="CSHARED", channel_type="channel", text="hello", bot_user_id="UBOT",
+            configured_channels={"C1": {}}, sender_authorized=False, known_thread=True,
+        )
+        self.assertEqual("log", stranger)
+
     def test_unconfigured_channel_stays_silent_for_everyone(self):
         self.assertEqual("ignore", self.action("channel", channel="CSHARED"))
         self.assertEqual("ignore", self.action("channel", channel="CSHARED", authorized=False))
@@ -211,6 +225,25 @@ class RoomPolicyTest(unittest.TestCase):
         }
         value.update(overrides)
         return value
+
+    def test_default_channel_serves_unlisted_channels_only(self):
+        config = self.config(self.entry(), default_channel=self.entry(effort="medium"))
+        self.assertEqual("medium", resolve_room_policy(config, "CNEW", "U1").effort)
+        self.assertEqual("high", resolve_room_policy(config, "C1", "U1").effort)
+        self.assertTrue(is_default_room(config, "CNEW"))
+        self.assertFalse(is_default_room(config, "C1"))
+        for channel in ("D123", "", "not-an-id"):
+            with self.subTest(channel=channel):
+                self.assertEqual({}, room_entry(config, channel))
+                self.assertFalse(is_default_room(config, channel))
+
+    def test_default_channel_is_never_review_only_and_absent_means_unconfigured(self):
+        config = self.config(self.entry(), default_channel=self.entry(review_only=True))
+        with self.assertRaisesRegex(SafetyError, "not Cargo Chief configured"):
+            resolve_room_policy(config, "CNEW", "U1")
+        with self.assertRaisesRegex(SafetyError, "not Cargo Chief configured"):
+            resolve_room_policy(self.config(self.entry()), "CNEW", "U1")
+        self.assertFalse(is_review_only_room(config, "CNEW"))
 
     def test_requires_complete_room_entry(self):
         with self.assertRaisesRegex(SafetyError, "missing"):

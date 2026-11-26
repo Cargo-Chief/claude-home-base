@@ -37,6 +37,10 @@ preflight. Keep broadly useful transport improvements separable so they can be p
 - This repo uses `bot.py`, not `luoji_bot.py` (that's the cc-home-base variant)
 - The `CLAUDE.md.example` here is a template with placeholders — don't fill them in, they're for end users
 - Plugin changes need version bumps or the auto-updater won't pick them up
+- `default_channel` (`room_entry`) serves any unlisted C/G channel: `resolve_room_policy` and
+  `_resolve_entry` read it, `handle_message` admits plain replies only in a thread the agent
+  already has a workspace for (`_known_default_thread`, `known_thread`), and mentions go through
+  `handle_mention` as usual. It is never review-only and never a DM
 - A `channels` entry with `"review_only": true` is mention-only and runs review turns for any member
   or listed peer bot (`review_requests.py`); it needs a top-level `peer_review` block with a valid
   `self_github_login`. `peer_bot_user_ids` (default empty) and `max_reviews_per_pr` (default 3,

@@ -272,6 +272,31 @@ def _flags_review_only(entry: object) -> bool:
     return isinstance(entry, Mapping) and entry.get("review_only", False) is not False
 
 
+def room_entry(config: object, channel_id: str) -> dict:
+    """A channel's own entry, else the `default_channel` entry for any other channel it is in.
+
+    The default never applies to DMs (they use `dm_users`) and never makes a review-only room.
+    """
+    if not isinstance(config, Mapping):
+        return {}
+    channels = config.get("channels")
+    if isinstance(channels, Mapping) and channel_id in channels:
+        entry = channels[channel_id]
+        return dict(entry) if isinstance(entry, Mapping) else {}
+    default = config.get("default_channel")
+    if (re.fullmatch(r"[CG][A-Z0-9]+", channel_id or "") and isinstance(default, Mapping)
+            and not _flags_review_only(default)):
+        return dict(default)
+    return {}
+
+
+def is_default_room(config: object, channel_id: str) -> bool:
+    """True when a channel has no entry of its own and the default entry serves it."""
+    channels = config.get("channels") if isinstance(config, Mapping) else None
+    listed = isinstance(channels, Mapping) and channel_id in channels
+    return not listed and bool(room_entry(config, channel_id))
+
+
 def is_review_only_room(config: object, channel_id: str) -> bool:
     if not isinstance(config, Mapping):
         return False
@@ -1019,17 +1044,20 @@ def channel_message_action(
     bot_user_id: str,
     configured_channels: Container[str],
     sender_authorized: bool,
+    known_thread: bool = False,
 ) -> str:
     """Decide a plain `message` event: "process", "refuse" (log and reply), "log", or "ignore".
 
     Outside DMs the bot acts only in its configured rooms, and never answers a sender it won't
     serve, so a broad event subscription can't make it talk over people in shared channels.
-    Mentions are left to the app_mention handler.
+    Mentions are left to the app_mention handler. In a channel served only by the default entry,
+    a plain message is acted on only as a reply in a thread this agent already works in
+    (`known_thread`), so the agent never talks over people it was not asked to join.
     """
     direct = channel_type in ("im", "mpim")
     if channel_type != "im" and bot_user_id and f"<@{bot_user_id}>" in text:
         return "ignore"
-    if not direct and channel_id not in configured_channels:
+    if not direct and channel_id not in configured_channels and not known_thread:
         return "ignore"
     if sender_authorized:
         return "process"
@@ -1037,7 +1065,7 @@ def channel_message_action(
 
 
 def resolve_room_policy(config: dict, channel_id: str, user_id: str) -> RoomPolicy:
-    entry = dict(config.get("channels", {}).get(channel_id, {}))
+    entry = room_entry(config, channel_id)
     if channel_id.startswith("D"):
         entry.update(config.get("dm_users", {}).get(user_id, {}))
 

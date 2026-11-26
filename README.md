@@ -12,6 +12,14 @@ generated `AGENTS.md`, and a `CLAUDE.md` symlink to it. Room entries must explic
 root, permission mode, overlay, private escalation channel, primary model/effort, explicit OpenAI
 fallback, and role.
 
+A top-level `default_channel` entry, with the same required keys, serves every channel the app is
+invited to that has no `channels` entry of its own. It never applies to DMs, which use `dm_users`,
+and a default marked `review_only` is ignored. In a default-served channel the agent acts only on
+an authorized sender's mention, and on that sender's plain replies in a thread the agent already
+works in (an existing thread workspace for that channel and thread). It never acts on plain
+channel posts, so it does not talk over people it was not asked to join. Without `default_channel`,
+an unlisted channel refuses with "not Cargo Chief configured", as before.
+
 A room entry may add `"review_only": true` (for example `#pr-reviews`, with
 `autonomous_overlay` pointing at the kit's `modes/review-only.md`). Plain posts there are ignored;
 a mention from any human member, or from a bot listed in `peer_review.peer_bot_user_ids`, carrying
