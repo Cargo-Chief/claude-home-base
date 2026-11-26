@@ -84,6 +84,9 @@ class DailyStatusTest(unittest.TestCase):
         (self.run / "review.json").unlink()
         (self.run / "review.out").write_text(limit)
         self.assertEqual(build_post(self.run, ""), ("unavailable", LIMIT_TEXT))
+        (self.run / "review.out").unlink()
+        (self.run / "review-2.out").write_text(limit)
+        self.assertEqual(build_post(self.run, ""), ("unavailable", LIMIT_TEXT))
 
     def test_withheld_verdict_missing_review_or_edited_draft_withhold(self):
         self._write(_draft(), verdict="withhold")

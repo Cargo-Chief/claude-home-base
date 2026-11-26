@@ -25,6 +25,9 @@ Each weekday at 6:00 AM local time, this job posts the agent's status to a team 
    three links.
 3. **Review pass.** A second `claude -p` checks the draft against the rules for a public channel. It
    writes `review.json` with the draft's SHA-256, which the script computes and passes in.
+   If it withholds the draft, a revision pass (`status-revise-prompt.md`) rewrites or drops only
+   the items its reasons name, and a fresh review checks the new draft. That happens once: a second
+   withhold stands. The first verdict is kept as `review-1.json`.
 4. **Post.** `bot.py --post-daily-status <run dir>` posts exactly one message:
    - the rendered status, when the draft validates and the verdict is `clear` for that exact hash;
    - otherwise a fixed withheld notice, or a fixed unavailable notice when there is no draft.
