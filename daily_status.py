@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from openai_fallback import is_claude_limit_notice
 from thread_handoff import slack_escape
 
 
@@ -50,6 +51,8 @@ SLACK_WORKSPACE_URL = "https://cargochief.slack.com"
 THREAD_WORK_DIR = ("work", "home-base")
 THREAD_TS_RE = re.compile(r"(\d{10})\.(\d{6})")
 WITHHELD_TEXT = "Daily status withheld today: its privacy check did not clear the draft."
+LIMIT_TEXT = "Daily status unavailable today: Claude usage limit reached."
+MODEL_OUTPUTS = ("author.out", "review.out")  # each pass's CLI stdout, written by the status job
 
 
 class StatusError(ValueError):
@@ -177,14 +180,33 @@ def render(covers: str, sections: dict[str, list[dict]], mention_user: str) -> s
     return "\n".join(lines)
 
 
+def _hit_usage_limit(run_dir: Path) -> bool:
+    """Whether a model pass stopped on a Claude usage-limit notice."""
+    for name in MODEL_OUTPUTS:
+        path = run_dir / name
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - MAX_FILE_BYTES))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        if is_claude_limit_notice(text):
+            return True
+    return False
+
+
 def build_post(run_dir: Path, mention_user: str) -> tuple[str, str]:
     """Return (outcome, text) for a run directory: posted, withheld or unavailable."""
     draft_path = run_dir / "draft.json"
     if not draft_path.exists():
-        return "unavailable", UNAVAILABLE_TEXT
+        return "unavailable", LIMIT_TEXT if _hit_usage_limit(run_dir) else UNAVAILABLE_TEXT
     try:
         draft, draft_raw = _read_json(draft_path)
         sections = validate_draft(draft, date=run_dir.name)
+        if not (run_dir / "review.json").exists() and _hit_usage_limit(run_dir):
+            return "unavailable", LIMIT_TEXT
         review, _ = _read_json(run_dir / "review.json")
         cleared = validate_review(review, draft_raw)
     except StatusError:
