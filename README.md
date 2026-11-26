@@ -263,6 +263,15 @@ an agent can post the fixed reboot-needed notice with `bot.py --request-reboot-s
 messages never accept task text, customer data, exception messages, or tracebacks. With the setting
 empty, home-base sends no lifecycle messages.
 
+The optional daily status job (`jobs/daily-status/`) posts a weekday summary of the agent's work to
+`TEAM_STATUS_CHANNEL_ID`, mentioning `TEAM_STATUS_MENTION_USER_ID` when something waits on that
+person. One Claude pass drafts it as structured JSON from GitHub, Jira and the agent's own bundles
+and transcripts; a second pass checks it for a public channel and writes a verdict bound to the
+draft's hash; then `bot.py --post-daily-status <run dir>` validates, renders and posts it. Claude
+never posts: links are limited to Cargo-Chief PRs, CN tickets and Slack threads, text is escaped so
+it cannot mention or broadcast, and a thread session is refused. A missing or uncleared draft posts
+a fixed unavailable or withheld notice instead, so a failed run is visible.
+
 ## Per-principal identity
 
 Cargo Chief does not use the upstream singleton `~/identity.md` design. Each Unix service principal
