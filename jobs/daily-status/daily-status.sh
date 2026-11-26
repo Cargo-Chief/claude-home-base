@@ -21,7 +21,8 @@ HOME_BASE_DIR="${CARGO_CHIEF_HOME_BASE_DIR:-$WORKSPACE_ROOT/claude-home-base}"
 JOB_DIR="$HOME_BASE_DIR/jobs/daily-status"
 HOME_BASE_PYTHON="$HOME/.local/share/cargo-chief/home-base-venv/bin/python"
 CREDENTIAL_WRAPPER="$HOME_BASE_DIR/with_harness_credential.py"
-LOG_DIR="$HOME/scripts"
+# The home-base logs folder, so the operator account that reads the service logs reads this too.
+LOG_DIR="$HOME/.local/state/cargo-chief/home-base/logs"
 LOG_FILE="$LOG_DIR/daily-status.log"
 TIMEOUT=1500  # 25 minutes per model pass
 
@@ -85,12 +86,13 @@ if [[ -f "$RUN_DIR/posted" ]]; then
 fi
 mkdir -p "$RUN_DIR"
 chmod 700 "$RUN_DIR"
-rm -f "$RUN_DIR/draft.json" "$RUN_DIR/review.json" "$RUN_DIR/threads.json"
+rm -f "$RUN_DIR/draft.json" "$RUN_DIR/review.json" "$RUN_DIR/threads.json" "$RUN_DIR/author.out" "$RUN_DIR/review.out"
 
 run_model() {
-	local phase="$1" prompt="$2"
+	local phase="$1" out="$2" prompt="$3"
+	# claude -p prints its errors, a usage limit included, on stdout; bot.py reads the file for one.
 	(cd "$WORKSPACE_ROOT" && exec "$HOME_BASE_PYTHON" "$CREDENTIAL_WRAPPER" -- \
-		claude -p --permission-mode auto "$prompt" >/dev/null 2>> "$LOG_FILE") &
+		claude -p --permission-mode auto "$prompt" > "$out" 2>> "$LOG_FILE") &
 	local model_pid=$!
 	(sleep "$TIMEOUT" && kill -TERM "$model_pid" 2>/dev/null && \
 		log "[$DATE] TIMEOUT: $phase killed after ${TIMEOUT}s") &
@@ -100,7 +102,7 @@ run_model() {
 	kill "$watchdog_pid" 2>/dev/null
 	wait "$watchdog_pid" 2>/dev/null
 	if [[ $status -ne 0 ]]; then
-		log "[$DATE] ERROR: $phase exited with status $status"
+		log "[$DATE] ERROR: $phase exited with status $status: $(tail -n 1 "$out" 2>/dev/null | cut -c1-200)"
 	fi
 	return "$status"
 }
@@ -118,9 +120,9 @@ if ! python3 "$HOME_BASE_DIR/daily_status.py" threads "$WORKSPACE_ROOT" "$RUN_DI
 	echo "[]" > "$RUN_DIR/threads.json"
 fi
 log "[$DATE] drafting status since $SINCE"
-if run_model "status author" "$(render_prompt "$JOB_DIR/status-prompt.md")" && [[ -f "$RUN_DIR/draft.json" ]]; then
+if run_model "status author" "$RUN_DIR/author.out" "$(render_prompt "$JOB_DIR/status-prompt.md")" && [[ -f "$RUN_DIR/draft.json" ]]; then
 	DRAFT_SHA=$(shasum -a 256 "$RUN_DIR/draft.json" | cut -d' ' -f1)
-	run_model "status reviewer" "$(render_prompt "$JOB_DIR/status-review-prompt.md")" || true
+	run_model "status reviewer" "$RUN_DIR/review.out" "$(render_prompt "$JOB_DIR/status-review-prompt.md")" || true
 else
 	log "[$DATE] ERROR: no draft produced"
 	rm -f "$RUN_DIR/draft.json"

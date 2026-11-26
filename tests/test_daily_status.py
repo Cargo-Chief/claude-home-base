@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from daily_status import (  # noqa: E402
+    LIMIT_TEXT,
     UNAVAILABLE_TEXT,
     WITHHELD_TEXT,
     StatusError,
@@ -72,6 +73,17 @@ class DailyStatusTest(unittest.TestCase):
 
     def test_missing_draft_is_unavailable(self):
         self.assertEqual(build_post(self.run, ""), ("unavailable", UNAVAILABLE_TEXT))
+
+    def test_usage_limit_is_named(self):
+        limit = "You've hit your weekly limit · resets Nov 28 at 2am (America/Los_Angeles)\n"
+        (self.run / "author.out").write_text(limit)
+        self.assertEqual(build_post(self.run, ""), ("unavailable", LIMIT_TEXT))
+        (self.run / "author.out").write_text("some other failure\n")
+        self.assertEqual(build_post(self.run, ""), ("unavailable", UNAVAILABLE_TEXT))
+        self._write(_draft())
+        (self.run / "review.json").unlink()
+        (self.run / "review.out").write_text(limit)
+        self.assertEqual(build_post(self.run, ""), ("unavailable", LIMIT_TEXT))
 
     def test_withheld_verdict_missing_review_or_edited_draft_withhold(self):
         self._write(_draft(), verdict="withhold")

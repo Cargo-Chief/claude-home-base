@@ -67,4 +67,9 @@ model or posting.
 
 For a live run, use `sudo launchctl kickstart system/com.cargo-chief.daily-status.<user>`. It posts
 today's status, unless a status for today was already posted. The log is
-`~/scripts/daily-status.log` (mode 0600). It records only process status, never draft text.
+`~/.local/state/cargo-chief/home-base/logs/daily-status.log` (mode 0600), beside the service logs,
+so the operator account that reads those reads it too. It records process status and, for a failed
+model pass, the last line of that pass's output, which is normally the CLI's error. Each pass's full
+output is in the run directory (`author.out`, `review.out`). When a pass stopped on a Claude usage
+limit, the post says so instead of the generic unavailable line. The job runs on Claude only; it
+has no Codex fallback.

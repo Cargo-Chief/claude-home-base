@@ -70,8 +70,8 @@
         </dict>
     </array>
     <key>StandardOutPath</key>
-    <string>/Users/YOUR_USERNAME/scripts/daily-status-launchd-stdout.log</string>
+    <string>/Users/YOUR_USERNAME/.local/state/cargo-chief/home-base/logs/daily-status-launchd-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USERNAME/scripts/daily-status-launchd-stderr.log</string>
+    <string>/Users/YOUR_USERNAME/.local/state/cargo-chief/home-base/logs/daily-status-launchd-stderr.log</string>
 </dict>
 </plist>
