@@ -85,7 +85,7 @@ if [[ -f "$RUN_DIR/posted" ]]; then
 fi
 mkdir -p "$RUN_DIR"
 chmod 700 "$RUN_DIR"
-rm -f "$RUN_DIR/draft.json" "$RUN_DIR/review.json"
+rm -f "$RUN_DIR/draft.json" "$RUN_DIR/review.json" "$RUN_DIR/threads.json"
 
 run_model() {
 	local phase="$1" prompt="$2"
@@ -112,6 +112,11 @@ render_prompt() {
 		-e "s|DRAFT_SHA_PLACEHOLDER|${DRAFT_SHA:-}|g" "$1"
 }
 
+# Thread permalinks for the author pass: transcripts carry no Slack thread id.
+if ! python3 "$HOME_BASE_DIR/daily_status.py" threads "$WORKSPACE_ROOT" "$RUN_DIR/threads.json" 2>> "$LOG_FILE"; then
+	log "[$DATE] WARNING: could not list thread workspaces"
+	echo "[]" > "$RUN_DIR/threads.json"
+fi
 log "[$DATE] drafting status since $SINCE"
 if run_model "status author" "$(render_prompt "$JOB_DIR/status-prompt.md")" && [[ -f "$RUN_DIR/draft.json" ]]; then
 	DRAFT_SHA=$(shasum -a 256 "$RUN_DIR/draft.json" | cut -d' ' -f1)

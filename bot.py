@@ -68,6 +68,7 @@ from cargo_chief_safety import (
     review_route_refusal,
     forward_refusal,
     github_wrapper_downscopes,
+    is_default_room,
     is_review_only_room,
     peer_review_config,
     preflight_room,
@@ -75,6 +76,7 @@ from cargo_chief_safety import (
     resolve_room_policy,
     review_turn_env,
     room_channel_ids,
+    room_entry,
     prepare_thread_workspace,
     ticket_keys,
     transfer_bundle,
@@ -352,7 +354,7 @@ def _resolve_entry(channel_id: str, user_id: str) -> dict:
     """The merged model-config entry for a room: channel entry, with a DM
     per-user entry layered on top (its non-empty keys win)."""
     cfg = _load_model_config()
-    entry = dict(cfg.get("channels", {}).get(channel_id, {}))
+    entry = room_entry(cfg, channel_id)
     if channel_id.startswith("D"):
         entry.update({k: v for k, v in cfg.get("dm_users", {}).get(user_id, {}).items() if v})
     return entry
@@ -4374,6 +4376,21 @@ _review_requests = ReviewRequestHandler(
 # ---------------------------------------------------------------------------
 
 
+def _known_default_thread(channel: str, thread_ts: str, channel_type: str) -> bool:
+    """A reply in a default-served channel's thread that this agent already works in."""
+    if not thread_ts:
+        return False
+    config = _load_model_config()
+    if not is_default_room(config, channel) or not _channel_allowed(channel, channel_type):
+        return False
+    try:
+        root = resolve_room_policy(config, channel, "").root
+        validate_existing_thread_workspace(root, channel=channel, thread=thread_ts)
+    except SafetyError:
+        return False
+    return True
+
+
 @app.event("message")
 def handle_message(event, say):
     """Handle DMs and channel messages."""
@@ -4382,6 +4399,7 @@ def handle_message(event, say):
         return
 
     # Channel @mentions arrive again as app_mention; unconfigured channels stay silent.
+    channel = event.get("channel", "")
     action = channel_message_action(
         channel_id=event.get("channel", ""),
         channel_type=event.get("channel_type", ""),
@@ -4389,6 +4407,7 @@ def handle_message(event, say):
         bot_user_id=BOT_USER_ID,
         configured_channels=room_channel_ids(_load_model_config()),
         sender_authorized=is_authorized(event.get("user", "")),
+        known_thread=_known_default_thread(channel, event.get("thread_ts", ""), event.get("channel_type", "")),
     )
     if action == "ignore":
         return

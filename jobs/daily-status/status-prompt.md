@@ -18,10 +18,17 @@ Work from the workspace root ROOT_PLACEHOLDER. Use only read-only commands.
    issues assigned to you updated since SINCE_PLACEHOLDER, and the ones you have in progress:
    `assignee = currentUser() AND (updated >= "SINCE_PLACEHOLDER" OR statusCategory = "In Progress")`.
 3. **Open work.** Every `ROOT_PLACEHOLDER/worktrees/*/TASK.md`: what each bundle is for and its status.
-4. **Your own conversations in the window** (your Claude transcripts under `~/.claude/projects/`).
-   Use them only to find what is blocked, parked, or waiting on a person, and the Slack thread
-   each one lives in. A `TASK.md` with `Status: blocked` and `Disposition: parked` is waiting on
-   someone by definition.
+4. **Your Slack threads.** `RUN_DIR_PLACEHOLDER/threads.json` lists every live thread you work in,
+   newest first. Each entry has:
+   - `permalink`: the Slack link to the thread;
+   - `updated`: when you last worked in it;
+   - `bundle`: the ticket worktree bound to it, if any;
+   - `task_status`: its `TASK.md` status line;
+   - `transcript_dir`: where that thread's Claude transcripts are.
+
+   Read the transcripts of the threads updated in the window, and of any thread whose status is
+   blocked or parked. Use them only to find what is blocked, parked, or waiting on a person. A
+   `TASK.md` with `Status: blocked` and `Disposition: parked` is waiting on someone by definition.
 
 ## Write the draft
 
@@ -57,8 +64,13 @@ Each section takes at most 10 items:
 - **`blocked`:** work that cannot move, and on what. This covers things blocked on tools, other
   systems, or the peer agent.
 - **`waiting_on_operator`:** anything that needs Kirk: an approval, a decision, a merge, an access
-  grant. Link the Slack thread where the ask is. The harness mentions him in this section's
-  heading, so do not name him in the text.
+  grant. The harness mentions him in this section's heading, so do not name him in the text.
+
+Every `blocked` and `waiting_on_operator` item must include the `permalink` of the thread where
+that work lives, taken from `threads.json`, so the reader can go straight to it and answer there.
+Put it first in `links`, ahead of the ticket or PR. If an item has no thread, for example a PR
+waiting on a merge that no thread asked for, give its PR link. The harness marks an item with no
+thread link, so never invent one.
 
 ## Rules for a public channel
 
