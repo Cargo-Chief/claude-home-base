@@ -52,7 +52,7 @@ THREAD_WORK_DIR = ("work", "home-base")
 THREAD_TS_RE = re.compile(r"(\d{10})\.(\d{6})")
 WITHHELD_TEXT = "Daily status withheld today: its privacy check did not clear the draft."
 LIMIT_TEXT = "Daily status unavailable today: Claude usage limit reached."
-MODEL_OUTPUTS = ("author.out", "review.out")  # each pass's CLI stdout, written by the status job
+MODEL_OUTPUTS = ("author.out", "review.out", "revise.out", "review-2.out")  # each pass's CLI stdout, written by the status job
 
 
 class StatusError(ValueError):

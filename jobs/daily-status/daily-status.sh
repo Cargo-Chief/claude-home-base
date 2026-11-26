@@ -38,6 +38,7 @@ fi
 RUN_DIR="$WORKSPACE_ROOT/work/daily-status/$DATE"
 
 for required in "$JOB_DIR/status-prompt.md" "$JOB_DIR/status-review-prompt.md" \
+	"$JOB_DIR/status-revise-prompt.md" \
 	"$HOME_BASE_DIR/bot.py" "$CREDENTIAL_WRAPPER"; do
 	if [[ ! -r "$required" ]]; then
 		echo "Daily status file is missing or unreadable: $required" >&2
@@ -86,7 +87,8 @@ if [[ -f "$RUN_DIR/posted" ]]; then
 fi
 mkdir -p "$RUN_DIR"
 chmod 700 "$RUN_DIR"
-rm -f "$RUN_DIR/draft.json" "$RUN_DIR/review.json" "$RUN_DIR/threads.json" "$RUN_DIR/author.out" "$RUN_DIR/review.out"
+rm -f "$RUN_DIR/draft.json" "$RUN_DIR/review.json" "$RUN_DIR/threads.json" "$RUN_DIR/author.out" "$RUN_DIR/review.out" \
+	"$RUN_DIR/review-1.json" "$RUN_DIR/revise.out" "$RUN_DIR/review-2.out"
 
 run_model() {
 	local phase="$1" out="$2" prompt="$3"
@@ -114,6 +116,17 @@ render_prompt() {
 		-e "s|DRAFT_SHA_PLACEHOLDER|${DRAFT_SHA:-}|g" "$1"
 }
 
+# True when review.json withholds exactly the current draft.
+withheld_this_draft() {
+	python3 -c 'import json,sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if r.get("verdict") == "withhold" and r.get("draft_sha256") == sys.argv[2] else 1)' \
+		"$RUN_DIR/review.json" "$DRAFT_SHA"
+}
+
 # Thread permalinks for the author pass: transcripts carry no Slack thread id.
 if ! python3 "$HOME_BASE_DIR/daily_status.py" threads "$WORKSPACE_ROOT" "$RUN_DIR/threads.json" 2>> "$LOG_FILE"; then
 	log "[$DATE] WARNING: could not list thread workspaces"
@@ -123,6 +136,23 @@ log "[$DATE] drafting status since $SINCE"
 if run_model "status author" "$RUN_DIR/author.out" "$(render_prompt "$JOB_DIR/status-prompt.md")" && [[ -f "$RUN_DIR/draft.json" ]]; then
 	DRAFT_SHA=$(shasum -a 256 "$RUN_DIR/draft.json" | cut -d' ' -f1)
 	run_model "status reviewer" "$RUN_DIR/review.out" "$(render_prompt "$JOB_DIR/status-review-prompt.md")" || true
+	# One revision for a withheld draft: fix the named items, then a fresh review of the new draft.
+	if withheld_this_draft; then
+		cp "$RUN_DIR/review.json" "$RUN_DIR/review-1.json"
+		log "[$DATE] review withheld the draft; revising once"
+		if run_model "status reviser" "$RUN_DIR/revise.out" "$(render_prompt "$JOB_DIR/status-revise-prompt.md")" \
+			&& [[ -f "$RUN_DIR/draft.json" ]]; then
+			REVISED_SHA=$(shasum -a 256 "$RUN_DIR/draft.json" | cut -d' ' -f1)
+			if [[ "$REVISED_SHA" != "$DRAFT_SHA" ]]; then
+				DRAFT_SHA="$REVISED_SHA"
+				rm -f "$RUN_DIR/review.json"
+				run_model "status reviewer (revised)" "$RUN_DIR/review-2.out" \
+					"$(render_prompt "$JOB_DIR/status-review-prompt.md")" || true
+			else
+				log "[$DATE] revision left the draft unchanged"
+			fi
+		fi
+	fi
 else
 	log "[$DATE] ERROR: no draft produced"
 	rm -f "$RUN_DIR/draft.json"
